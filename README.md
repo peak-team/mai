@@ -1,2 +1,1 @@
-# mai
-MAI (Memory Allocation Interception)
+# MAI (Memory Allocation Interception)
