@@ -14,12 +14,6 @@ typedef struct {
     char* filename;  // Store filename for mmap allocations
 } AllocationEntry;
 
-typedef struct {
-    AllocationEntry** entries;
-    size_t capacity;
-    size_t used;
-} TrackTable;
-
 // Global variables
 static GumInterceptor* malloc_interceptor;
 static pthread_mutex_t track_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -89,6 +83,10 @@ static void remove_tracking_entry(void* ptr) {
     current_memory-=entry->size;
 
     pthread_mutex_unlock(&track_mutex);
+    if (entry->filename) {
+        remove(entry->filename);
+        internal_free(entry->filename);
+    }
 }
 
 // Internal versions of malloc/free for our own use
@@ -121,7 +119,7 @@ static void* mmap_fallback(size_t size) {
     char* filename = NULL;
     int fd = -1;
     void* ptr = NULL;
-    
+    // fprintf(stderr, "mmap_fallback: %lu\n", size);
     // Generate unique filename with PID, TID, timestamp, and random number
     pid_t pid = getpid();
     pthread_t tid = pthread_self();
@@ -148,8 +146,6 @@ static void* mmap_fallback(size_t size) {
     ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (ptr == MAP_FAILED) goto error;
     
-    // We can unlink the file now - it will be deleted when the file is closed
-    unlink(filename);
     close(fd);
     
     // Track this allocation
