@@ -2,7 +2,7 @@
 MAI is a library that transparently intercepts memory allocation functions in any applications to provide fallback mechanisms when standard allocations fail. When a program runs out of heap memory, MAI automatically falls back to using memory-mapped files, ensuring the application continues running even under memory pressure.
 
 ## Key Features
-- Intercepts standard memory functions (malloc, free, calloc, realloc, aligned_alloc, posix_memalign)
+- Intercepts standard memory functions (`malloc`, `calloc`, `realloc`, `aligned_alloc`, `posix_memalign`, `free`)
 - Provides seamless mmap-based fallback when heap allocations fail
 - Maintains memory usage statistics
 - Configurable mmap directory via environment variables
