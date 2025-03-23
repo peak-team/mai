@@ -5,7 +5,7 @@
 #define GROWTH_FACTOR 2
 #define MMAP_DIR_ENV "MAI_MALLOC_PATH"
 #define DEFAULT_MMAP_DIR "./"
-#define MMAP_FILE_FORMAT "%s/mai_%d_%lu_%lu_%x"
+#define MMAP_FILE_FORMAT "%s/mai_%x_%lx_%lx_%x"
 
 typedef struct {
     void* ptr;
