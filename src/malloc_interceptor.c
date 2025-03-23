@@ -1,7 +1,6 @@
 #include "malloc_interceptor.h"
 
 // Configuration
-#define GROWTH_FACTOR 2
 #define MMAP_DIR_ENV "MAI_MMAP_PATH"
 #define DEFAULT_MMAP_DIR "./"
 #define MMAP_FILE_FORMAT "%s/mai_%x_%lx_%lx_%x"
