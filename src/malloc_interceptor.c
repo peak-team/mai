@@ -324,8 +324,37 @@ int malloc_interceptor_attach() {
     calloc_addr = gum_find_function("calloc");
     realloc_addr = gum_find_function("realloc");
     aligned_alloc_addr = gum_find_function("aligned_alloc");
-    posix_memalign_addr = gum_find_function("posix_memalign");
-    
+    posix_memalign_addr = gum_find_function("posix_memalign"); //(void*)posix_memalign; 
+    //fprintf(stderr, "posix_memalign_addr: %p\n", posix_memalign_addr);
+    /*
+    GumDebugSymbolDetails details;
+
+    if (gum_symbol_details_from_address(posix_memalign_addr, &details)) {
+        printf("Symbol Details:\n");
+        printf("  Address: %p\n", (void*) details.address);
+        printf("  Module Name: %s\n", details.module_name);
+        printf("  Symbol Name: %s\n", details.symbol_name);
+        printf("  File Name: %s\n", details.file_name);
+        printf("  Line Number: %u\n", details.line_number);
+        printf("  Column: %u\n", details.column);
+    } else {
+        fprintf(stderr, "Failed to retrieve symbol details for address: %p\n", posix_memalign_addr);
+    }
+
+    GArray *function_addresses;
+
+    function_addresses = gum_find_functions_matching("*posix_mem*");
+    if (function_addresses == NULL) {
+        fprintf(stderr, "Failed to find functions matching: %s\n", "posix_memalign");
+    }
+
+    fprintf(stderr, "Found %u matching function addresses:\n", function_addresses->len);
+    for (guint i = 0; i < function_addresses->len; i++) {
+        gpointer address = g_array_index(function_addresses, gpointer, i);
+        gchar* func_name = gum_symbol_name_from_address(address);
+        fprintf(stderr, "  %p   %s\n", address, func_name);
+    }
+    */ 
     // Replace functions with our custom implementations
     if (malloc_addr) {
         replace_check = gum_interceptor_replace_fast(malloc_interceptor, 
@@ -378,9 +407,9 @@ int malloc_interceptor_attach() {
     }
     
     if (posix_memalign_addr) {
-        replace_check = gum_interceptor_replace_fast(malloc_interceptor, 
+        replace_check = gum_interceptor_replace(malloc_interceptor, 
                                                   posix_memalign_addr, 
-                                                  custom_posix_memalign,
+                                                  custom_posix_memalign, NULL,
                                                   (gpointer*)(&original_posix_memalign));
         if (replace_check != GUM_REPLACE_OK) {
             fprintf(stderr, "Failed to replace posix_memalign: %d\n", replace_check);
