@@ -334,7 +334,6 @@ int malloc_interceptor_attach() {
                                                   (gpointer*)(&original_malloc));
         if (replace_check != GUM_REPLACE_OK) {
             fprintf(stderr, "Failed to replace malloc\n");
-            return -1;
         }
     }
     
@@ -345,7 +344,6 @@ int malloc_interceptor_attach() {
                                                   (gpointer*)(&original_free));
         if (replace_check != GUM_REPLACE_OK) {
             fprintf(stderr, "Failed to replace free\n");
-            return -1;
         }
     }
     
@@ -356,7 +354,6 @@ int malloc_interceptor_attach() {
                                                   (gpointer*)(&original_calloc));
         if (replace_check != GUM_REPLACE_OK) {
             fprintf(stderr, "Failed to replace calloc\n");
-            return -1;
         }
     }
     
@@ -367,7 +364,6 @@ int malloc_interceptor_attach() {
                                                   (gpointer*)(&original_realloc));
         if (replace_check != GUM_REPLACE_OK) {
             fprintf(stderr, "Failed to replace realloc\n");
-            return -1;
         }
     }
     
@@ -378,7 +374,6 @@ int malloc_interceptor_attach() {
                                                   (gpointer*)(&original_aligned_alloc));
         if (replace_check != GUM_REPLACE_OK) {
             fprintf(stderr, "Failed to replace aligned_alloc\n");
-            return -1;
         }
     }
     
@@ -389,7 +384,6 @@ int malloc_interceptor_attach() {
                                                   (gpointer*)(&original_posix_memalign));
         if (replace_check != GUM_REPLACE_OK) {
             fprintf(stderr, "Failed to replace posix_memalign\n");
-            return -1;
         }
     }
     
