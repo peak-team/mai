@@ -62,7 +62,9 @@ int exit_interceptor_attach() {
     exit_interceptor = gum_interceptor_obtain();
 
     gum_interceptor_begin_transaction(exit_interceptor);
-    exit_address = gum_find_function("exit");
+    // gum_find_function causes seg faults with running within apptainer. This needs further investigation
+    //exit_address = gum_find_function("exit");
+    exit_address = (void*)exit;
     if (exit_address) {
         replace_check = gum_interceptor_replace_fast(exit_interceptor,
                                       exit_address, (gpointer*)&peak_exit,

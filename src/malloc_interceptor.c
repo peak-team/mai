@@ -21,6 +21,12 @@ static unsigned int random_seed;
 static int cleanup_in_progress = 0;
 static gulong max_memory = 0;
 static gulong current_memory = 0;
+static gpointer malloc_addr = NULL; 
+static gpointer free_addr = NULL;
+static gpointer calloc_addr = NULL;
+static gpointer realloc_addr = NULL;
+static gpointer aligned_alloc_addr = NULL;
+static gpointer posix_memalign_addr = NULL;
 
 // Original function pointers
 static void* (*original_malloc)(size_t size);
@@ -312,19 +318,25 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
 // Main function to attach interceptors
 int malloc_interceptor_attach() {
     GumReplaceReturn replace_check;
-    gpointer malloc_addr, free_addr, calloc_addr, realloc_addr, aligned_alloc_addr, posix_memalign_addr;
     
     // Initialize Frida interceptor
     malloc_interceptor = gum_interceptor_obtain();
     gum_interceptor_begin_transaction(malloc_interceptor);
     
     // Find function addresses
-    malloc_addr = gum_find_function("malloc");
-    free_addr = gum_find_function("free");
-    calloc_addr = gum_find_function("calloc");
-    realloc_addr = gum_find_function("realloc");
-    aligned_alloc_addr = gum_find_function("aligned_alloc");
-    posix_memalign_addr = gum_find_function("posix_memalign"); //(void*)posix_memalign; 
+    malloc_addr = (void*)malloc;
+    free_addr = (void*)free;
+    calloc_addr = (void*)calloc;
+    realloc_addr = (void*)realloc;
+    aligned_alloc_addr = (void*)aligned_alloc;
+    posix_memalign_addr = (void*)posix_memalign;
+
+    // malloc_addr = gum_find_function("malloc");
+    // free_addr = gum_find_function("free");
+    // calloc_addr = gum_find_function("calloc");
+    // realloc_addr = gum_find_function("realloc");
+    // aligned_alloc_addr = gum_find_function("aligned_alloc");
+    // posix_memalign_addr = gum_find_function("posix_memalign"); //(void*)posix_memalign; 
     //fprintf(stderr, "posix_memalign_addr: %p\n", posix_memalign_addr);
     /*
     GumDebugSymbolDetails details;
@@ -429,16 +441,6 @@ int malloc_interceptor_attach() {
 // Function to detach interceptors and clean up
 void malloc_interceptor_dettach() {
     cleanup_in_progress = 1;
-    
-    gpointer malloc_addr, free_addr, calloc_addr, realloc_addr, aligned_alloc_addr, posix_memalign_addr;
-    
-    // Find function addresses
-    malloc_addr = gum_find_function("malloc");
-    free_addr = gum_find_function("free");
-    calloc_addr = gum_find_function("calloc");
-    realloc_addr = gum_find_function("realloc");
-    aligned_alloc_addr = gum_find_function("aligned_alloc");
-    posix_memalign_addr = gum_find_function("posix_memalign");
     
     // Revert all interceptors
     if (malloc_addr) gum_interceptor_revert(malloc_interceptor, malloc_addr);
