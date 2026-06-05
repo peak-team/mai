@@ -58,8 +58,6 @@ def main():
     runtime.mai_get_stats.argtypes = [ctypes.POINTER(MaiStats)]
     runtime.mai_get_stats.restype = ctypes.c_int
 
-    before = load_stats(runtime)
-
     plugin = ctypes.CDLL(plugin_path)
     plugin.mai_plugin_alloc.argtypes = [ctypes.c_size_t]
     plugin.mai_plugin_alloc.restype = ctypes.c_void_p
@@ -67,6 +65,8 @@ def main():
     plugin.mai_plugin_usable.restype = ctypes.c_size_t
     plugin.mai_plugin_free.argtypes = [ctypes.c_void_p]
     plugin.mai_plugin_free.restype = None
+
+    before = load_stats(runtime)
 
     ptr = plugin.mai_plugin_alloc(alloc_size)
     if not ptr:
@@ -80,13 +80,21 @@ def main():
             return fail("Python-loaded plugin allocation contents were wrong")
 
         after = load_stats(runtime)
-        if after.managed_allocations <= before.managed_allocations:
+        if (
+            after.managed_allocations <= before.managed_allocations
+            or after.managed_bytes_total < before.managed_bytes_total + alloc_size
+            or after.live_managed_bytes < before.live_managed_bytes + alloc_size
+            or after.arena_segments == 0
+        ):
             return fail("Python-loaded plugin allocation was not managed")
     finally:
         plugin.mai_plugin_free(ptr)
 
     final = load_stats(runtime)
-    if final.live_managed_bytes != before.live_managed_bytes:
+    if (
+        final.managed_frees <= before.managed_frees
+        or final.live_managed_bytes != before.live_managed_bytes
+    ):
         return fail("Python-loaded plugin free leaked managed bytes")
 
     return 0

@@ -64,6 +64,19 @@ static int aligned_ptr(void* ptr, size_t alignment) {
     return ((uintptr_t)ptr & (alignment - 1)) == 0;
 }
 
+static int stats_show_managed_alloc(const MaiStats* before, const MaiStats* after, size_t size) {
+    return after->managed_allocations > before->managed_allocations &&
+           after->managed_bytes_total >= before->managed_bytes_total + size &&
+           after->live_managed_bytes >= before->live_managed_bytes + size &&
+           after->arena_segments > 0;
+}
+
+static int stats_show_managed_free(const MaiStats* before, const MaiStats* after_alloc,
+                                   const MaiStats* after_free, size_t size) {
+    return after_free->managed_frees > before->managed_frees &&
+           after_alloc->live_managed_bytes >= after_free->live_managed_bytes + size;
+}
+
 static int mode_disabled(void) {
     MaiStats stats;
     void* ptr = malloc(8192);
@@ -154,6 +167,13 @@ static int mode_large(void) {
 }
 
 static int mode_calloc(void) {
+    MaiStats before;
+    MaiStats after_alloc;
+    MaiStats after_free;
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before calloc test");
+    }
+
     unsigned char* ptr = calloc(1, 8192);
     if (!ptr) {
         return fail("large calloc failed");
@@ -164,7 +184,22 @@ static int mode_calloc(void) {
             return fail("calloc memory was not zeroed");
         }
     }
+    if (load_stats(&after_alloc) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after calloc allocation");
+    }
+    if (!stats_show_managed_alloc(&before, &after_alloc, 8192)) {
+        free(ptr);
+        return fail("large calloc was not routed to MAI arena");
+    }
     free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after calloc free");
+    }
+    if (!stats_show_managed_free(&before, &after_alloc, &after_free, 8192) ||
+        after_free.live_managed_bytes != before.live_managed_bytes) {
+        return fail("large calloc free did not release MAI-managed bytes");
+    }
 
     volatile size_t overflow_nmemb = (SIZE_MAX / 2) + 1;
     volatile size_t overflow_size = 3;
@@ -179,6 +214,13 @@ static int mode_calloc(void) {
 }
 
 static int mode_realloc(void) {
+    MaiStats before;
+    MaiStats after_grow;
+    MaiStats after_free;
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before realloc test");
+    }
+
     unsigned char* ptr = malloc(128);
     if (!ptr) {
         return fail("initial malloc failed");
@@ -197,6 +239,14 @@ static int mode_realloc(void) {
             free(grown);
             return fail("realloc to managed did not preserve contents");
         }
+    }
+    if (load_stats(&after_grow) != 0) {
+        free(grown);
+        return fail("mai_get_stats failed after realloc to managed allocation");
+    }
+    if (!stats_show_managed_alloc(&before, &after_grow, 8192)) {
+        free(grown);
+        return fail("realloc growth was not routed to MAI arena");
     }
 
     unsigned char* grown_again = realloc(grown, 16384);
@@ -224,6 +274,13 @@ static int mode_realloc(void) {
     }
 
     free(shrunk);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after realloc free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.managed_frees <= before.managed_frees) {
+        return fail("managed realloc free did not release MAI-managed bytes");
+    }
     free(NULL);
     return 0;
 }
@@ -607,6 +664,11 @@ static int mode_dlopen(void) {
         dlclose(handle);
         return fail("dlopened plugin allocation was not managed");
     }
+    if (!stats_show_managed_alloc(&before, &after_alloc, 8192)) {
+        plugin_free(ptr);
+        dlclose(handle);
+        return fail("dlopened plugin allocation did not increase MAI managed bytes");
+    }
 
     plugin_free(ptr);
     if (load_stats(&after_free) != 0) {
@@ -616,6 +678,83 @@ static int mode_dlopen(void) {
     if (after_free.live_managed_bytes != before.live_managed_bytes) {
         dlclose(handle);
         return fail("dlopened plugin free leaked managed bytes");
+    }
+    if (!stats_show_managed_free(&before, &after_alloc, &after_free, 8192)) {
+        dlclose(handle);
+        return fail("dlopened plugin free did not release MAI-managed bytes");
+    }
+
+    dlclose(handle);
+    return 0;
+}
+
+static int mode_dlopen_local_allocator(void) {
+    const char* plugin_path = getenv("MAI_TEST_LOCAL_ALLOCATOR_PLUGIN");
+    if (!plugin_path || plugin_path[0] == '\0') {
+        return fail("MAI_TEST_LOCAL_ALLOCATOR_PLUGIN is not set");
+    }
+
+    void* handle = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        fprintf(stderr, "%s\n", dlerror());
+        return fail("dlopen local allocator plugin failed");
+    }
+
+    plugin_alloc_fn plugin_alloc = NULL;
+    plugin_usable_fn plugin_usable = NULL;
+    plugin_free_fn plugin_free = NULL;
+    *(void**)(&plugin_alloc) = dlsym(handle, "mai_local_alloc");
+    *(void**)(&plugin_usable) = dlsym(handle, "mai_local_usable");
+    *(void**)(&plugin_free) = dlsym(handle, "mai_local_free");
+    if (!plugin_alloc || !plugin_usable || !plugin_free) {
+        dlclose(handle);
+        return fail("dlsym local allocator plugin functions failed");
+    }
+
+    MaiStats before;
+    MaiStats after_alloc;
+    MaiStats after_free;
+    if (load_stats(&before) != 0) {
+        dlclose(handle);
+        return fail("mai_get_stats failed before local allocator plugin test");
+    }
+
+    unsigned char* ptr = plugin_alloc(8192);
+    if (!ptr) {
+        dlclose(handle);
+        return fail("local allocator plugin allocation failed");
+    }
+    if (ptr[0] != 0x7d || ptr[8191] != 0x7d) {
+        plugin_free(ptr);
+        dlclose(handle);
+        return fail("local allocator plugin contents were not initialized");
+    }
+    if (plugin_usable(ptr) < 8192) {
+        plugin_free(ptr);
+        dlclose(handle);
+        return fail("dlopen refresh did not hook plugin-local malloc_usable_size");
+    }
+
+    if (load_stats(&after_alloc) != 0) {
+        plugin_free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after local allocator plugin allocation");
+    }
+    if (!stats_show_managed_alloc(&before, &after_alloc, 8192)) {
+        plugin_free(ptr);
+        dlclose(handle);
+        return fail("dlopen refresh did not hook plugin-local malloc");
+    }
+
+    plugin_free(ptr);
+    if (load_stats(&after_free) != 0) {
+        dlclose(handle);
+        return fail("mai_get_stats failed after local allocator plugin free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        !stats_show_managed_free(&before, &after_alloc, &after_free, 8192)) {
+        dlclose(handle);
+        return fail("dlopen refresh did not hook plugin-local free");
     }
 
     dlclose(handle);
@@ -713,6 +852,7 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "profile") == 0) return mode_profile();
     if (strcmp(argv[1], "diagnostics") == 0) return mode_diagnostics();
     if (strcmp(argv[1], "dlopen") == 0) return mode_dlopen();
+    if (strcmp(argv[1], "dlopen_local_allocator") == 0) return mode_dlopen_local_allocator();
     if (strcmp(argv[1], "backing_failure") == 0) return mode_backing_failure();
     if (strcmp(argv[1], "unprivileged") == 0) return mode_unprivileged();
 

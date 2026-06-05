@@ -29,6 +29,9 @@ diagnostics, and profiling support:
   are available.
 - `dlopen`/`dlmopen` are monitored so newly loaded shared objects, including
   Python extension modules, get a best-effort allocator hook refresh.
+  This is mainly for DSOs that introduce their own exported allocator entry
+  points after MAI starts. Normal calls from a dlopened DSO into the already
+  patched libc allocator do not need a dlopen refresh.
 
 MAI currently intercepts:
 

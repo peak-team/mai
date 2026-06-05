@@ -26,6 +26,12 @@ target_link_libraries(mai_runtime_test PRIVATE Threads::Threads ${DL_LIBRARY})
 add_library(mai_runtime_plugin SHARED runtime_plugin.c)
 target_compile_features(mai_runtime_plugin PRIVATE c_std_11)
 
+add_library(mai_local_allocator_plugin SHARED local_allocator_plugin.c)
+target_compile_features(mai_local_allocator_plugin PRIVATE c_std_11)
+set_target_properties(mai_local_allocator_plugin PROPERTIES
+    LINK_FLAGS "-Wl,-Bsymbolic-functions"
+)
+
 add_executable(mai_cxx_runtime_test cxx_runtime_test.cpp)
 target_compile_features(mai_cxx_runtime_test PRIVATE cxx_std_17)
 target_include_directories(mai_cxx_runtime_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
@@ -97,6 +103,19 @@ add_test(
         "LD_PRELOAD=$<TARGET_FILE:mai>"
         $<TARGET_FILE:mai_runtime_test>
         dlopen
+)
+
+add_test(
+    NAME mai_dlopen_local_allocator_symbols
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_TEST_LOCAL_ALLOCATOR_PLUGIN=$<TARGET_FILE:mai_local_allocator_plugin>"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        dlopen_local_allocator
 )
 
 add_test(

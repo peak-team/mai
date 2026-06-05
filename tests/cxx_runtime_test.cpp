@@ -68,7 +68,9 @@ int main() {
     MaiStats after_vector{};
     if (load_stats(&after_vector) != 0 ||
         after_vector.managed_allocations <= before_vector.managed_allocations ||
-        after_vector.managed_frees <= before_vector.managed_frees) {
+        after_vector.managed_frees <= before_vector.managed_frees ||
+        after_vector.managed_bytes_total < before_vector.managed_bytes_total + 8192 ||
+        after_vector.live_managed_bytes != before_vector.live_managed_bytes) {
         return 1;
     }
 
@@ -76,7 +78,9 @@ int main() {
         return 1;
     }
     if (after.managed_allocations <= before.managed_allocations ||
-        after.managed_frees <= before.managed_frees) {
+        after.managed_frees <= before.managed_frees ||
+        after.managed_bytes_total < before.managed_bytes_total + 8192 * 4 ||
+        after.live_managed_bytes != before.live_managed_bytes) {
         return 1;
     }
 

@@ -54,6 +54,7 @@ typedef struct ArenaBlock ArenaBlock;
 typedef struct AllocationRecord AllocationRecord;
 typedef struct ProfileRecord ProfileRecord;
 typedef struct DynamicReplacement DynamicReplacement;
+typedef struct DynamicHandleRecord DynamicHandleRecord;
 
 struct ArenaBlock {
     size_t offset;
@@ -103,9 +104,16 @@ struct ProfileRecord {
 struct DynamicReplacement {
     HookKind kind;
     const char* symbol;
+    void* handle;
     void* address;
     void* original;
     DynamicReplacement* next;
+};
+
+struct DynamicHandleRecord {
+    void* handle;
+    size_t refs;
+    DynamicHandleRecord* next;
 };
 
 static GumInterceptor* malloc_interceptor = NULL;
@@ -136,6 +144,7 @@ static AllocationRecord* allocation_buckets[MAI_TRACK_BUCKETS];
 static AllocationRecord* live_head = NULL;
 static ProfileRecord* profile_buckets[MAI_PROFILE_BUCKETS];
 static DynamicReplacement* dynamic_replacements = NULL;
+static DynamicHandleRecord* dynamic_handles = NULL;
 static size_t allocation_sequence = 0;
 static size_t reclaim_epoch = 0;
 
@@ -153,6 +162,7 @@ static gpointer pvalloc_addr = NULL;
 static gpointer malloc_usable_size_addr = NULL;
 static gpointer dlopen_addr = NULL;
 static gpointer dlmopen_addr = NULL;
+static gpointer dlclose_addr = NULL;
 static gpointer mmap_addr = NULL;
 static gpointer munmap_addr = NULL;
 static gpointer mremap_addr = NULL;
@@ -171,6 +181,7 @@ static int pvalloc_replaced = 0;
 static int malloc_usable_size_replaced = 0;
 static int dlopen_replaced = 0;
 static int dlmopen_replaced = 0;
+static int dlclose_replaced = 0;
 static int mmap_replaced = 0;
 static int munmap_replaced = 0;
 static int mremap_replaced = 0;
@@ -189,6 +200,7 @@ static void* (*original_pvalloc)(size_t size) = NULL;
 static size_t (*original_malloc_usable_size)(void* ptr) = NULL;
 static void* (*original_dlopen)(const char* filename, int flags) = NULL;
 static void* (*original_dlmopen)(Lmid_t nsid, const char* filename, int flags) = NULL;
+static int (*original_dlclose)(void* handle) = NULL;
 static void* (*original_mmap)(void* addr, size_t length, int prot, int flags, int fd, off_t offset) = NULL;
 static int (*original_munmap)(void* addr, size_t length) = NULL;
 static void* (*original_mremap)(void* old_address, size_t old_size, size_t new_size, int flags, ...) = NULL;
@@ -207,6 +219,7 @@ static void* custom_pvalloc(size_t size);
 static size_t custom_malloc_usable_size(void* ptr);
 static void* custom_dlopen(const char* filename, int flags);
 static void* custom_dlmopen(Lmid_t nsid, const char* filename, int flags);
+static int custom_dlclose(void* handle);
 static void* custom_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset);
 static int custom_munmap(void* addr, size_t length);
 static void* custom_mremap(void* old_address, size_t old_size, size_t new_size, int flags, void* new_address);
@@ -1695,6 +1708,7 @@ static int hook_address_is_known(gpointer address) {
         address == malloc_usable_size_addr ||
         address == dlopen_addr ||
         address == dlmopen_addr ||
+        address == dlclose_addr ||
         address == mmap_addr ||
         address == munmap_addr ||
         address == mremap_addr ||
@@ -1714,7 +1728,87 @@ static int hook_address_is_known(gpointer address) {
     return 0;
 }
 
-static int replace_dynamic_symbol(gpointer address, const DynamicHookSpec* spec) {
+static DynamicHandleRecord* find_dynamic_handle(void* handle) {
+    for (DynamicHandleRecord* record = dynamic_handles; record; record = record->next) {
+        if (record->handle == handle) {
+            return record;
+        }
+    }
+
+    return NULL;
+}
+
+static int note_dynamic_handle(void* handle) {
+    DynamicHandleRecord* record = find_dynamic_handle(handle);
+    if (record) {
+        record->refs++;
+        return 0;
+    }
+
+    record = meta_alloc(sizeof(*record));
+    if (!record) {
+        return -1;
+    }
+
+    record->handle = handle;
+    record->refs = 1;
+    record->next = dynamic_handles;
+    dynamic_handles = record;
+    return 0;
+}
+
+static int dynamic_handle_will_unload(void* handle) {
+    DynamicHandleRecord* previous = NULL;
+    DynamicHandleRecord* record = dynamic_handles;
+
+    while (record) {
+        if (record->handle != handle) {
+            previous = record;
+            record = record->next;
+            continue;
+        }
+
+        if (record->refs > 1) {
+            record->refs--;
+            return 0;
+        }
+
+        if (previous) {
+            previous->next = record->next;
+        } else {
+            dynamic_handles = record->next;
+        }
+        meta_free(record);
+        return 1;
+    }
+
+    return 0;
+}
+
+static void revert_dynamic_replacements_for_handle(void* handle) {
+    DynamicReplacement* previous = NULL;
+    DynamicReplacement* replacement = dynamic_replacements;
+
+    while (replacement) {
+        DynamicReplacement* next = replacement->next;
+        if (replacement->handle != handle) {
+            previous = replacement;
+            replacement = next;
+            continue;
+        }
+
+        gum_interceptor_revert(malloc_interceptor, replacement->address);
+        if (previous) {
+            previous->next = next;
+        } else {
+            dynamic_replacements = next;
+        }
+        meta_free(replacement);
+        replacement = next;
+    }
+}
+
+static int replace_dynamic_symbol(void* handle, gpointer address, const DynamicHookSpec* spec) {
     if (hook_address_is_known(address)) {
         return 0;
     }
@@ -1726,6 +1820,7 @@ static int replace_dynamic_symbol(gpointer address, const DynamicHookSpec* spec)
 
     replacement->kind = spec->kind;
     replacement->symbol = spec->symbol;
+    replacement->handle = handle;
     replacement->address = address;
     replacement->original = NULL;
     replacement->next = NULL;
@@ -1769,10 +1864,17 @@ static void refresh_hooks_for_handle(void* handle) {
     gum_interceptor_ignore_current_thread(malloc_interceptor);
     gum_interceptor_begin_transaction(malloc_interceptor);
 
+    if (note_dynamic_handle(handle) != 0) {
+        gum_interceptor_end_transaction(malloc_interceptor);
+        gum_interceptor_unignore_current_thread(malloc_interceptor);
+        in_mai_hook = saved_hook_depth;
+        return;
+    }
+
     for (size_t i = 0; i < sizeof(dynamic_hook_specs) / sizeof(dynamic_hook_specs[0]); i++) {
         void* symbol_address = dlsym(handle, dynamic_hook_specs[i].symbol);
         if (symbol_address) {
-            replace_dynamic_symbol((gpointer)symbol_address, &dynamic_hook_specs[i]);
+            replace_dynamic_symbol(handle, (gpointer)symbol_address, &dynamic_hook_specs[i]);
         }
     }
 
@@ -1806,6 +1908,27 @@ static void* custom_dlmopen(Lmid_t nsid, const char* filename, int flags) {
     }
 
     return handle;
+}
+
+static int custom_dlclose(void* handle) {
+    int saved_hook_depth = in_mai_hook;
+
+    if (handle && malloc_interceptor && !cleanup_in_progress) {
+        in_mai_hook++;
+        gum_interceptor_ignore_current_thread(malloc_interceptor);
+        gum_interceptor_begin_transaction(malloc_interceptor);
+        if (dynamic_handle_will_unload(handle)) {
+            revert_dynamic_replacements_for_handle(handle);
+        }
+        gum_interceptor_end_transaction(malloc_interceptor);
+        gum_interceptor_unignore_current_thread(malloc_interceptor);
+        in_mai_hook = saved_hook_depth;
+    }
+
+    in_mai_hook++;
+    int rc = original_dlclose(handle);
+    in_mai_hook = saved_hook_depth;
+    return rc;
 }
 
 static int replace_fast(gpointer address, gpointer replacement, gpointer* original,
@@ -1877,6 +2000,7 @@ static void revert_replacements(void) {
     if (malloc_usable_size_replaced) gum_interceptor_revert(malloc_interceptor, malloc_usable_size_addr);
     if (dlopen_replaced) gum_interceptor_revert(malloc_interceptor, dlopen_addr);
     if (dlmopen_replaced) gum_interceptor_revert(malloc_interceptor, dlmopen_addr);
+    if (dlclose_replaced) gum_interceptor_revert(malloc_interceptor, dlclose_addr);
     if (mmap_replaced) gum_interceptor_revert(malloc_interceptor, mmap_addr);
     if (munmap_replaced) gum_interceptor_revert(malloc_interceptor, munmap_addr);
     if (mremap_replaced) gum_interceptor_revert(malloc_interceptor, mremap_addr);
@@ -1889,6 +2013,11 @@ static void revert_replacements(void) {
         DynamicReplacement* next = dynamic_replacements->next;
         meta_free(dynamic_replacements);
         dynamic_replacements = next;
+    }
+    while (dynamic_handles) {
+        DynamicHandleRecord* next = dynamic_handles->next;
+        meta_free(dynamic_handles);
+        dynamic_handles = next;
     }
 
     malloc_replaced = 0;
@@ -1903,6 +2032,7 @@ static void revert_replacements(void) {
     malloc_usable_size_replaced = 0;
     dlopen_replaced = 0;
     dlmopen_replaced = 0;
+    dlclose_replaced = 0;
     mmap_replaced = 0;
     munmap_replaced = 0;
     mremap_replaced = 0;
@@ -1958,6 +2088,7 @@ int malloc_interceptor_attach(void) {
     malloc_usable_size_addr = (void*)malloc_usable_size;
     dlopen_addr = (void*)dlopen;
     dlmopen_addr = (void*)dlmopen;
+    dlclose_addr = (void*)dlclose;
     mmap_addr = (void*)mmap;
     munmap_addr = (void*)munmap;
     mremap_addr = (void*)mremap;
@@ -1993,6 +2124,8 @@ int malloc_interceptor_attach(void) {
                            (gpointer*)&original_dlopen, &dlopen_replaced, "dlopen");
     failed |= replace_fast(dlmopen_addr, (gpointer)custom_dlmopen,
                            (gpointer*)&original_dlmopen, &dlmopen_replaced, "dlmopen");
+    failed |= replace_fast(dlclose_addr, (gpointer)custom_dlclose,
+                           (gpointer*)&original_dlclose, &dlclose_replaced, "dlclose");
     failed |= replace_fast(mmap_addr, (gpointer)custom_mmap,
                            (gpointer*)&original_mmap, &mmap_replaced, "mmap");
     failed |= replace_fast(munmap_addr, (gpointer)custom_munmap,

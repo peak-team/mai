@@ -81,7 +81,10 @@ program mai_fortran_runtime_test
         call c_free(raw)
         error stop 4
     end if
-    if (after_alloc%managed_allocations <= before%managed_allocations) then
+    if (after_alloc%managed_allocations <= before%managed_allocations .or. &
+        after_alloc%managed_bytes_total < before%managed_bytes_total + bytes .or. &
+        after_alloc%live_managed_bytes < before%live_managed_bytes + bytes .or. &
+        after_alloc%arena_segments == 0_c_size_t) then
         call c_free(raw)
         error stop 5
     end if
@@ -89,5 +92,6 @@ program mai_fortran_runtime_test
     call c_free(raw)
     rc = mai_get_stats(after_free)
     if (rc /= 0) error stop 6
-    if (after_free%live_managed_bytes /= before%live_managed_bytes) error stop 7
+    if (after_free%managed_frees <= before%managed_frees .or. &
+        after_free%live_managed_bytes /= before%live_managed_bytes) error stop 7
 end program mai_fortran_runtime_test
