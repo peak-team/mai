@@ -287,6 +287,7 @@ if(MPI_C_FOUND)
             "MAI_PATH=${MAI_TEST_SCRATCH}"
             "MAI_THRESHOLD=4K"
             "MAI_ARENA_SIZE=1M"
+            "UCX_TLS=self"
             "LD_PRELOAD=$<TARGET_FILE:mai>"
             $<TARGET_FILE:mai_mpi_runtime_test>
     )

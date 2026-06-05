@@ -133,9 +133,40 @@ MAI_TEST_EXPORT void* ibv_reg_mr_iova(void* pd, void* addr, size_t length, uint6
     return ibv_reg_mr(pd, addr, length, access);
 }
 
+MAI_TEST_EXPORT int ibv_rereg_mr(void* mr, int flags, void* pd, void* addr,
+                                 size_t length, int access) {
+    (void)flags;
+    (void)pd;
+    (void)access;
+    if (!mr || !addr || length == 0) {
+        return 1;
+    }
+
+    FakeMr* fake = (FakeMr*)mr;
+    fake->addr = addr;
+    fake->length = length;
+    return 0;
+}
+
 MAI_TEST_EXPORT int ibv_dereg_mr(void* mr) {
     free(mr);
     return 0;
+}
+
+MAI_TEST_EXPORT void* rdma_reg_msgs(void* id, void* addr, size_t length) {
+    return ibv_reg_mr(id, addr, length, 0);
+}
+
+MAI_TEST_EXPORT void* rdma_reg_read(void* id, void* addr, size_t length) {
+    return ibv_reg_mr(id, addr, length, 0);
+}
+
+MAI_TEST_EXPORT void* rdma_reg_write(void* id, void* addr, size_t length) {
+    return ibv_reg_mr(id, addr, length, 0);
+}
+
+MAI_TEST_EXPORT int rdma_dereg_mr(void* mr) {
+    return ibv_dereg_mr(mr);
 }
 
 MAI_TEST_EXPORT int MPI_Alloc_mem(intptr_t size, void* info, void* baseptr) {
@@ -224,8 +255,44 @@ MAI_TEST_EXPORT int mai_exclusion_plugin_rdma_register_iova(void* ptr, size_t si
     return *out_mr ? 0 : 2;
 }
 
+MAI_TEST_EXPORT int mai_exclusion_plugin_rdma_reregister(void* mr, void* ptr,
+                                                         size_t size) {
+    return ibv_rereg_mr(mr, 0, NULL, ptr, size, 0);
+}
+
 MAI_TEST_EXPORT int mai_exclusion_plugin_rdma_deregister(void* mr) {
     return ibv_dereg_mr(mr);
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_rdma_cm_msgs(void* ptr, size_t size,
+                                                      void** out_mr) {
+    if (!out_mr) {
+        return 1;
+    }
+    *out_mr = rdma_reg_msgs(NULL, ptr, size);
+    return *out_mr ? 0 : 2;
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_rdma_cm_read(void* ptr, size_t size,
+                                                      void** out_mr) {
+    if (!out_mr) {
+        return 1;
+    }
+    *out_mr = rdma_reg_read(NULL, ptr, size);
+    return *out_mr ? 0 : 2;
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_rdma_cm_write(void* ptr, size_t size,
+                                                       void** out_mr) {
+    if (!out_mr) {
+        return 1;
+    }
+    *out_mr = rdma_reg_write(NULL, ptr, size);
+    return *out_mr ? 0 : 2;
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_rdma_cm_deregister(void* mr) {
+    return rdma_dereg_mr(mr);
 }
 
 MAI_TEST_EXPORT int mai_exclusion_plugin_mpi_alloc(size_t size, void** out) {

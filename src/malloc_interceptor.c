@@ -97,7 +97,12 @@ typedef enum {
     HOOK_MPI_FREE_MEM,
     HOOK_IBV_REG_MR,
     HOOK_IBV_REG_MR_IOVA,
-    HOOK_IBV_DEREG_MR
+    HOOK_IBV_REREG_MR,
+    HOOK_IBV_DEREG_MR,
+    HOOK_RDMA_REG_MSGS,
+    HOOK_RDMA_REG_READ,
+    HOOK_RDMA_REG_WRITE,
+    HOOK_RDMA_DEREG_MR
 } HookKind;
 
 typedef struct ArenaSegment ArenaSegment;
@@ -295,7 +300,12 @@ static gpointer mpi_alloc_mem_addr = NULL;
 static gpointer mpi_free_mem_addr = NULL;
 static gpointer ibv_reg_mr_addr = NULL;
 static gpointer ibv_reg_mr_iova_addr = NULL;
+static gpointer ibv_rereg_mr_addr = NULL;
 static gpointer ibv_dereg_mr_addr = NULL;
+static gpointer rdma_reg_msgs_addr = NULL;
+static gpointer rdma_reg_read_addr = NULL;
+static gpointer rdma_reg_write_addr = NULL;
+static gpointer rdma_dereg_mr_addr = NULL;
 
 static int malloc_replaced = 0;
 static int free_replaced = 0;
@@ -337,7 +347,12 @@ static int mpi_alloc_mem_replaced = 0;
 static int mpi_free_mem_replaced = 0;
 static int ibv_reg_mr_replaced = 0;
 static int ibv_reg_mr_iova_replaced = 0;
+static int ibv_rereg_mr_replaced = 0;
 static int ibv_dereg_mr_replaced = 0;
+static int rdma_reg_msgs_replaced = 0;
+static int rdma_reg_read_replaced = 0;
+static int rdma_reg_write_replaced = 0;
+static int rdma_dereg_mr_replaced = 0;
 
 static void* (*original_malloc)(size_t size) = NULL;
 static void (*original_free)(void* ptr) = NULL;
@@ -379,7 +394,12 @@ static int (*original_MPI_Alloc_mem)(intptr_t size, void* info, void* baseptr) =
 static int (*original_MPI_Free_mem)(void* base) = NULL;
 static void* (*original_ibv_reg_mr)(void* pd, void* addr, size_t length, int access) = NULL;
 static void* (*original_ibv_reg_mr_iova)(void* pd, void* addr, size_t length, uint64_t iova, int access) = NULL;
+static int (*original_ibv_rereg_mr)(void* mr, int flags, void* pd, void* addr, size_t length, int access) = NULL;
 static int (*original_ibv_dereg_mr)(void* mr) = NULL;
+static void* (*original_rdma_reg_msgs)(void* id, void* addr, size_t length) = NULL;
+static void* (*original_rdma_reg_read)(void* id, void* addr, size_t length) = NULL;
+static void* (*original_rdma_reg_write)(void* id, void* addr, size_t length) = NULL;
+static int (*original_rdma_dereg_mr)(void* mr) = NULL;
 
 extern void* __libc_malloc(size_t size) __attribute__((weak));
 extern void __libc_free(void* ptr) __attribute__((weak));
@@ -427,7 +447,12 @@ static int custom_MPI_Alloc_mem(intptr_t size, void* info, void* baseptr);
 static int custom_MPI_Free_mem(void* base);
 static void* custom_ibv_reg_mr(void* pd, void* addr, size_t length, int access);
 static void* custom_ibv_reg_mr_iova(void* pd, void* addr, size_t length, uint64_t iova, int access);
+static int custom_ibv_rereg_mr(void* mr, int flags, void* pd, void* addr, size_t length, int access);
 static int custom_ibv_dereg_mr(void* mr);
+static void* custom_rdma_reg_msgs(void* id, void* addr, size_t length);
+static void* custom_rdma_reg_read(void* id, void* addr, size_t length);
+static void* custom_rdma_reg_write(void* id, void* addr, size_t length);
+static int custom_rdma_dereg_mr(void* mr);
 
 __attribute__((visibility("default"))) int mlock2(const void* addr, size_t len,
                                                   unsigned int flags);
@@ -458,7 +483,17 @@ __attribute__((visibility("default"))) void* ibv_reg_mr(void* pd, void* addr,
 __attribute__((visibility("default"))) void* ibv_reg_mr_iova(void* pd, void* addr,
                                                              size_t length,
                                                              uint64_t iova, int access);
+__attribute__((visibility("default"))) int ibv_rereg_mr(void* mr, int flags, void* pd,
+                                                        void* addr, size_t length,
+                                                        int access);
 __attribute__((visibility("default"))) int ibv_dereg_mr(void* mr);
+__attribute__((visibility("default"))) void* rdma_reg_msgs(void* id, void* addr,
+                                                           size_t length);
+__attribute__((visibility("default"))) void* rdma_reg_read(void* id, void* addr,
+                                                           size_t length);
+__attribute__((visibility("default"))) void* rdma_reg_write(void* id, void* addr,
+                                                            size_t length);
+__attribute__((visibility("default"))) int rdma_dereg_mr(void* mr);
 static size_t record_page_range(AllocationRecord* record, void** range_start);
 
 static size_t max_size(size_t a, size_t b) {
@@ -939,6 +974,16 @@ static int remember_registration_locked(void* token, void* ptr, size_t length,
     return 0;
 }
 
+static int registration_exists_locked(void* token, ExclusionKind kind) {
+    for (RegistrationRecord* record = registration_records; record; record = record->next) {
+        if (record->token == token && record->kind == kind) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 static RegistrationRecord* take_registration_locked(void* token, ExclusionKind kind) {
     RegistrationRecord* previous = NULL;
     RegistrationRecord* record = registration_records;
@@ -1183,8 +1228,28 @@ static void resolve_original_safety_functions(void) {
             (void* (*)(void*, void*, size_t, uint64_t, int))dlsym(RTLD_NEXT,
                                                                   "ibv_reg_mr_iova");
     }
+    if (!original_ibv_rereg_mr) {
+        original_ibv_rereg_mr =
+            (int (*)(void*, int, void*, void*, size_t, int))dlsym(RTLD_NEXT,
+                                                                  "ibv_rereg_mr");
+    }
     if (!original_ibv_dereg_mr) {
         original_ibv_dereg_mr = (int (*)(void*))dlsym(RTLD_NEXT, "ibv_dereg_mr");
+    }
+    if (!original_rdma_reg_msgs) {
+        original_rdma_reg_msgs =
+            (void* (*)(void*, void*, size_t))dlsym(RTLD_NEXT, "rdma_reg_msgs");
+    }
+    if (!original_rdma_reg_read) {
+        original_rdma_reg_read =
+            (void* (*)(void*, void*, size_t))dlsym(RTLD_NEXT, "rdma_reg_read");
+    }
+    if (!original_rdma_reg_write) {
+        original_rdma_reg_write =
+            (void* (*)(void*, void*, size_t))dlsym(RTLD_NEXT, "rdma_reg_write");
+    }
+    if (!original_rdma_dereg_mr) {
+        original_rdma_dereg_mr = (int (*)(void*))dlsym(RTLD_NEXT, "rdma_dereg_mr");
     }
 }
 
@@ -3211,8 +3276,33 @@ void* ibv_reg_mr_iova(void* pd, void* addr, size_t length, uint64_t iova, int ac
 }
 
 __attribute__((visibility("default")))
+int ibv_rereg_mr(void* mr, int flags, void* pd, void* addr, size_t length, int access) {
+    return custom_ibv_rereg_mr(mr, flags, pd, addr, length, access);
+}
+
+__attribute__((visibility("default")))
 int ibv_dereg_mr(void* mr) {
     return custom_ibv_dereg_mr(mr);
+}
+
+__attribute__((visibility("default")))
+void* rdma_reg_msgs(void* id, void* addr, size_t length) {
+    return custom_rdma_reg_msgs(id, addr, length);
+}
+
+__attribute__((visibility("default")))
+void* rdma_reg_read(void* id, void* addr, size_t length) {
+    return custom_rdma_reg_read(id, addr, length);
+}
+
+__attribute__((visibility("default")))
+void* rdma_reg_write(void* id, void* addr, size_t length) {
+    return custom_rdma_reg_write(id, addr, length);
+}
+
+__attribute__((visibility("default")))
+int rdma_dereg_mr(void* mr) {
+    return custom_rdma_dereg_mr(mr);
 }
 
 void* mai_operator_new_allocate(size_t size) {
@@ -3797,6 +3887,54 @@ static int custom_MPI_Free_mem(void* base) {
     return rc;
 }
 
+static void remember_rdma_registration(void* mr, void* addr, size_t length) {
+    if (!mr || !runtime_configured || !addr || length == 0) {
+        return;
+    }
+
+    int saved_internal_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+    if (!registration_exists_locked(mr, EXCLUSION_RDMA)) {
+        add_exclusion_range_locked(addr, length, EXCLUSION_RDMA, mr);
+        remember_registration_locked(mr, addr, length, EXCLUSION_RDMA);
+    }
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_internal_depth;
+}
+
+static void replace_rdma_registration(void* mr, void* addr, size_t length) {
+    if (!mr || !runtime_configured || !addr || length == 0) {
+        return;
+    }
+
+    int saved_internal_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+    RegistrationRecord* record = take_registration_locked(mr, EXCLUSION_RDMA);
+    remove_exclusion_token_locked(mr, EXCLUSION_RDMA);
+    meta_free(record);
+    add_exclusion_range_locked(addr, length, EXCLUSION_RDMA, mr);
+    remember_registration_locked(mr, addr, length, EXCLUSION_RDMA);
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_internal_depth;
+}
+
+static void release_rdma_registration(void* mr) {
+    if (!runtime_configured || !mr) {
+        return;
+    }
+
+    int saved_internal_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+    RegistrationRecord* record = take_registration_locked(mr, EXCLUSION_RDMA);
+    remove_exclusion_token_locked(mr, EXCLUSION_RDMA);
+    meta_free(record);
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_internal_depth;
+}
+
 static void* custom_ibv_reg_mr(void* pd, void* addr, size_t length, int access) {
     DynamicReplacement* replacement = current_dynamic_replacement(HOOK_IBV_REG_MR);
     int saved_hook_depth = in_mai_hook;
@@ -3814,15 +3952,7 @@ static void* custom_ibv_reg_mr(void* pd, void* addr, size_t length, int access) 
     }
     in_mai_hook = saved_hook_depth;
 
-    if (mr && runtime_configured && addr && length > 0) {
-        int saved_internal_depth = in_mai_hook;
-        in_mai_hook++;
-        pthread_mutex_lock(&runtime_lock);
-        add_exclusion_range_locked(addr, length, EXCLUSION_RDMA, mr);
-        remember_registration_locked(mr, addr, length, EXCLUSION_RDMA);
-        pthread_mutex_unlock(&runtime_lock);
-        in_mai_hook = saved_internal_depth;
-    }
+    remember_rdma_registration(mr, addr, length);
     return mr;
 }
 
@@ -3848,16 +3978,34 @@ static void* custom_ibv_reg_mr_iova(void* pd, void* addr, size_t length, uint64_
     }
     in_mai_hook = saved_hook_depth;
 
-    if (mr && runtime_configured && addr && length > 0) {
-        int saved_internal_depth = in_mai_hook;
-        in_mai_hook++;
-        pthread_mutex_lock(&runtime_lock);
-        add_exclusion_range_locked(addr, length, EXCLUSION_RDMA, mr);
-        remember_registration_locked(mr, addr, length, EXCLUSION_RDMA);
-        pthread_mutex_unlock(&runtime_lock);
-        in_mai_hook = saved_internal_depth;
-    }
+    remember_rdma_registration(mr, addr, length);
     return mr;
+}
+
+static int custom_ibv_rereg_mr(void* mr, int flags, void* pd, void* addr, size_t length,
+                               int access) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_IBV_REREG_MR);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*, int, void*, void*, size_t, int))replacement->original)(
+            mr, flags, pd, addr, length, access);
+    } else {
+        if (!original_ibv_rereg_mr) {
+            resolve_original_safety_functions();
+        }
+        rc = original_ibv_rereg_mr ?
+            original_ibv_rereg_mr(mr, flags, pd, addr, length, access) :
+            missing_status_symbol();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        replace_rdma_registration(mr, addr, length);
+    }
+    return rc;
 }
 
 static int custom_ibv_dereg_mr(void* mr) {
@@ -3876,15 +4024,91 @@ static int custom_ibv_dereg_mr(void* mr) {
     }
     in_mai_hook = saved_hook_depth;
 
-    if (rc == 0 && runtime_configured && mr) {
-        int saved_internal_depth = in_mai_hook;
-        in_mai_hook++;
-        pthread_mutex_lock(&runtime_lock);
-        RegistrationRecord* record = take_registration_locked(mr, EXCLUSION_RDMA);
-        remove_exclusion_token_locked(mr, EXCLUSION_RDMA);
-        meta_free(record);
-        pthread_mutex_unlock(&runtime_lock);
-        in_mai_hook = saved_internal_depth;
+    if (rc == 0) {
+        release_rdma_registration(mr);
+    }
+    return rc;
+}
+
+static void* custom_rdma_reg_msgs(void* id, void* addr, size_t length) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_RDMA_REG_MSGS);
+    int saved_hook_depth = in_mai_hook;
+    void* mr;
+
+    in_mai_hook++;
+    if (replacement) {
+        mr = ((void* (*)(void*, void*, size_t))replacement->original)(id, addr, length);
+    } else {
+        if (!original_rdma_reg_msgs) {
+            resolve_original_safety_functions();
+        }
+        mr = original_rdma_reg_msgs ? original_rdma_reg_msgs(id, addr, length) : NULL;
+    }
+    in_mai_hook = saved_hook_depth;
+
+    remember_rdma_registration(mr, addr, length);
+    return mr;
+}
+
+static void* custom_rdma_reg_read(void* id, void* addr, size_t length) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_RDMA_REG_READ);
+    int saved_hook_depth = in_mai_hook;
+    void* mr;
+
+    in_mai_hook++;
+    if (replacement) {
+        mr = ((void* (*)(void*, void*, size_t))replacement->original)(id, addr, length);
+    } else {
+        if (!original_rdma_reg_read) {
+            resolve_original_safety_functions();
+        }
+        mr = original_rdma_reg_read ? original_rdma_reg_read(id, addr, length) : NULL;
+    }
+    in_mai_hook = saved_hook_depth;
+
+    remember_rdma_registration(mr, addr, length);
+    return mr;
+}
+
+static void* custom_rdma_reg_write(void* id, void* addr, size_t length) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_RDMA_REG_WRITE);
+    int saved_hook_depth = in_mai_hook;
+    void* mr;
+
+    in_mai_hook++;
+    if (replacement) {
+        mr = ((void* (*)(void*, void*, size_t))replacement->original)(id, addr, length);
+    } else {
+        if (!original_rdma_reg_write) {
+            resolve_original_safety_functions();
+        }
+        mr = original_rdma_reg_write ? original_rdma_reg_write(id, addr, length) : NULL;
+    }
+    in_mai_hook = saved_hook_depth;
+
+    remember_rdma_registration(mr, addr, length);
+    return mr;
+}
+
+static int custom_rdma_dereg_mr(void* mr) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_RDMA_DEREG_MR);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*))replacement->original)(mr);
+    } else {
+        if (!original_rdma_dereg_mr) {
+            resolve_original_safety_functions();
+        }
+        rc = original_rdma_dereg_mr ?
+            original_rdma_dereg_mr(mr) : missing_status_symbol();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        release_rdma_registration(mr);
     }
     return rc;
 }
@@ -4008,8 +4232,29 @@ static void* frida_ibv_reg_mr_iova(void* pd, void* addr, size_t length, uint64_t
     return custom_ibv_reg_mr_iova(pd, addr, length, iova, access);
 }
 
+static int frida_ibv_rereg_mr(void* mr, int flags, void* pd, void* addr, size_t length,
+                              int access) {
+    return custom_ibv_rereg_mr(mr, flags, pd, addr, length, access);
+}
+
 static int frida_ibv_dereg_mr(void* mr) {
     return custom_ibv_dereg_mr(mr);
+}
+
+static void* frida_rdma_reg_msgs(void* id, void* addr, size_t length) {
+    return custom_rdma_reg_msgs(id, addr, length);
+}
+
+static void* frida_rdma_reg_read(void* id, void* addr, size_t length) {
+    return custom_rdma_reg_read(id, addr, length);
+}
+
+static void* frida_rdma_reg_write(void* id, void* addr, size_t length) {
+    return custom_rdma_reg_write(id, addr, length);
+}
+
+static int frida_rdma_dereg_mr(void* mr) {
+    return custom_rdma_dereg_mr(mr);
 }
 
 typedef struct {
@@ -4046,7 +4291,12 @@ static const DynamicHookSpec dynamic_hook_specs[] = {
     { HOOK_MPI_FREE_MEM, "MPI_Free_mem", (gpointer)frida_MPI_Free_mem },
     { HOOK_IBV_REG_MR, "ibv_reg_mr", (gpointer)frida_ibv_reg_mr },
     { HOOK_IBV_REG_MR_IOVA, "ibv_reg_mr_iova", (gpointer)frida_ibv_reg_mr_iova },
+    { HOOK_IBV_REREG_MR, "ibv_rereg_mr", (gpointer)frida_ibv_rereg_mr },
     { HOOK_IBV_DEREG_MR, "ibv_dereg_mr", (gpointer)frida_ibv_dereg_mr },
+    { HOOK_RDMA_REG_MSGS, "rdma_reg_msgs", (gpointer)frida_rdma_reg_msgs },
+    { HOOK_RDMA_REG_READ, "rdma_reg_read", (gpointer)frida_rdma_reg_read },
+    { HOOK_RDMA_REG_WRITE, "rdma_reg_write", (gpointer)frida_rdma_reg_write },
+    { HOOK_RDMA_DEREG_MR, "rdma_dereg_mr", (gpointer)frida_rdma_dereg_mr },
 };
 
 static int hook_address_is_known(gpointer address) {
@@ -4126,8 +4376,18 @@ static int hook_address_is_known(gpointer address) {
         address == (gpointer)ibv_reg_mr ||
         address == ibv_reg_mr_iova_addr ||
         address == (gpointer)ibv_reg_mr_iova ||
+        address == ibv_rereg_mr_addr ||
+        address == (gpointer)ibv_rereg_mr ||
         address == ibv_dereg_mr_addr ||
-        address == (gpointer)ibv_dereg_mr) {
+        address == (gpointer)ibv_dereg_mr ||
+        address == rdma_reg_msgs_addr ||
+        address == (gpointer)rdma_reg_msgs ||
+        address == rdma_reg_read_addr ||
+        address == (gpointer)rdma_reg_read ||
+        address == rdma_reg_write_addr ||
+        address == (gpointer)rdma_reg_write ||
+        address == rdma_dereg_mr_addr ||
+        address == (gpointer)rdma_dereg_mr) {
         return 1;
     }
 
@@ -4474,7 +4734,12 @@ static void revert_replacements(void) {
     if (mpi_free_mem_replaced) gum_interceptor_revert(malloc_interceptor, mpi_free_mem_addr);
     if (ibv_reg_mr_replaced) gum_interceptor_revert(malloc_interceptor, ibv_reg_mr_addr);
     if (ibv_reg_mr_iova_replaced) gum_interceptor_revert(malloc_interceptor, ibv_reg_mr_iova_addr);
+    if (ibv_rereg_mr_replaced) gum_interceptor_revert(malloc_interceptor, ibv_rereg_mr_addr);
     if (ibv_dereg_mr_replaced) gum_interceptor_revert(malloc_interceptor, ibv_dereg_mr_addr);
+    if (rdma_reg_msgs_replaced) gum_interceptor_revert(malloc_interceptor, rdma_reg_msgs_addr);
+    if (rdma_reg_read_replaced) gum_interceptor_revert(malloc_interceptor, rdma_reg_read_addr);
+    if (rdma_reg_write_replaced) gum_interceptor_revert(malloc_interceptor, rdma_reg_write_addr);
+    if (rdma_dereg_mr_replaced) gum_interceptor_revert(malloc_interceptor, rdma_dereg_mr_addr);
 
     gum_interceptor_end_transaction(malloc_interceptor);
 
@@ -4530,7 +4795,12 @@ static void revert_replacements(void) {
     mpi_free_mem_replaced = 0;
     ibv_reg_mr_replaced = 0;
     ibv_reg_mr_iova_replaced = 0;
+    ibv_rereg_mr_replaced = 0;
     ibv_dereg_mr_replaced = 0;
+    rdma_reg_msgs_replaced = 0;
+    rdma_reg_read_replaced = 0;
+    rdma_reg_write_replaced = 0;
+    rdma_dereg_mr_replaced = 0;
 }
 
 int malloc_interceptor_attach(void) {
@@ -4613,7 +4883,12 @@ int malloc_interceptor_attach(void) {
     mpi_free_mem_addr = (void*)original_MPI_Free_mem;
     ibv_reg_mr_addr = (void*)original_ibv_reg_mr;
     ibv_reg_mr_iova_addr = (void*)original_ibv_reg_mr_iova;
+    ibv_rereg_mr_addr = (void*)original_ibv_rereg_mr;
     ibv_dereg_mr_addr = (void*)original_ibv_dereg_mr;
+    rdma_reg_msgs_addr = (void*)original_rdma_reg_msgs;
+    rdma_reg_read_addr = (void*)original_rdma_reg_read;
+    rdma_reg_write_addr = (void*)original_rdma_reg_write;
+    rdma_dereg_mr_addr = (void*)original_rdma_dereg_mr;
 
     gum_interceptor_begin_transaction(malloc_interceptor);
 
@@ -4710,7 +4985,12 @@ int malloc_interceptor_attach(void) {
         (size_t)mpi_free_mem_replaced +
         (size_t)ibv_reg_mr_replaced +
         (size_t)ibv_reg_mr_iova_replaced +
-        (size_t)ibv_dereg_mr_replaced;
+        (size_t)ibv_rereg_mr_replaced +
+        (size_t)ibv_dereg_mr_replaced +
+        (size_t)rdma_reg_msgs_replaced +
+        (size_t)rdma_reg_read_replaced +
+        (size_t)rdma_reg_write_replaced +
+        (size_t)rdma_dereg_mr_replaced;
     if (verbose_logging) {
         fprintf(stderr,
                 "MAI: enabled path=%s threshold=%zu arena_size=%zu reclaim=%d "

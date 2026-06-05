@@ -25,10 +25,14 @@ typedef int (*plugin_unregister_fn)(void*);
 typedef int (*plugin_alloc_out_fn)(size_t, void**);
 typedef int (*plugin_free_status_fn)(void*);
 typedef int (*plugin_rdma_register_fn)(void*, size_t, void**);
+typedef int (*plugin_rdma_reregister_fn)(void*, void*, size_t);
 typedef int (*runtime_register_fn)(void*, size_t, unsigned int);
 typedef int (*runtime_alloc_out_fn)(void**, size_t, unsigned int);
 typedef int (*runtime_mpi_alloc_fn)(intptr_t, void*, void*);
 typedef void* (*runtime_ibv_register_fn)(void*, void*, size_t, int);
+typedef int (*runtime_ibv_reregister_fn)(void*, int, void*, void*, size_t, int);
+typedef void* (*runtime_rdma_register_fn)(void*, void*, size_t);
+typedef int (*runtime_status_ptr_fn)(void*);
 
 static int fail(const char* message) {
     fprintf(stderr, "%s\n", message);
@@ -96,6 +100,45 @@ static int stats_show_exclusion(const MaiStats* before, const MaiStats* after, s
     return after->excluded_ranges > before->excluded_ranges &&
            after->exclusion_events > before->exclusion_events &&
            after->excluded_bytes >= before->excluded_bytes + size;
+}
+
+static int run_plugin_rdma_cycle(plugin_rdma_register_fn register_fn,
+                                 plugin_free_status_fn deregister_fn,
+                                 void* ptr,
+                                 size_t size,
+                                 const MaiStats* before,
+                                 MaiStats* after_free,
+                                 const char* register_failure,
+                                 const char* stats_register_failure,
+                                 const char* exclusion_failure,
+                                 const char* deregister_failure,
+                                 const char* stats_free_failure,
+                                 const char* release_failure) {
+    void* mr = NULL;
+    MaiStats after_register;
+
+    if (register_fn(ptr, size, &mr) != 0 || !mr) {
+        return fail(register_failure);
+    }
+    if (load_stats(&after_register) != 0) {
+        deregister_fn(mr);
+        return fail(stats_register_failure);
+    }
+    if (!stats_show_exclusion(before, &after_register, size)) {
+        deregister_fn(mr);
+        return fail(exclusion_failure);
+    }
+    if (deregister_fn(mr) != 0) {
+        return fail(deregister_failure);
+    }
+    if (load_stats(after_free) != 0) {
+        return fail(stats_free_failure);
+    }
+    if (after_free->exclusion_release_events <= after_register.exclusion_release_events) {
+        return fail(release_failure);
+    }
+
+    return 0;
 }
 
 static int mode_disabled(void) {
@@ -196,7 +239,12 @@ static int mode_preload_symbols(void) {
         "MPI_Free_mem",
         "ibv_reg_mr",
         "ibv_reg_mr_iova",
+        "ibv_rereg_mr",
         "ibv_dereg_mr",
+        "rdma_reg_msgs",
+        "rdma_reg_read",
+        "rdma_reg_write",
+        "rdma_dereg_mr",
         NULL
     };
 
@@ -231,10 +279,21 @@ static int mode_missing_safety_symbols(void) {
         (runtime_mpi_alloc_fn)dlsym(RTLD_DEFAULT, "MPI_Alloc_mem");
     runtime_ibv_register_fn ibv_register =
         (runtime_ibv_register_fn)dlsym(RTLD_DEFAULT, "ibv_reg_mr");
+    runtime_ibv_reregister_fn ibv_reregister =
+        (runtime_ibv_reregister_fn)dlsym(RTLD_DEFAULT, "ibv_rereg_mr");
+    runtime_rdma_register_fn rdma_reg_msgs =
+        (runtime_rdma_register_fn)dlsym(RTLD_DEFAULT, "rdma_reg_msgs");
+    runtime_rdma_register_fn rdma_reg_read =
+        (runtime_rdma_register_fn)dlsym(RTLD_DEFAULT, "rdma_reg_read");
+    runtime_rdma_register_fn rdma_reg_write =
+        (runtime_rdma_register_fn)dlsym(RTLD_DEFAULT, "rdma_reg_write");
+    runtime_status_ptr_fn rdma_deregister =
+        (runtime_status_ptr_fn)dlsym(RTLD_DEFAULT, "rdma_dereg_mr");
 
     if (!cuda_register || !cuda_host_alloc || !cuda_managed_alloc ||
         !hip_register || !hip_host_alloc || !hip_managed_alloc ||
-        !mpi_alloc || !ibv_register) {
+        !mpi_alloc || !ibv_register || !ibv_reregister ||
+        !rdma_reg_msgs || !rdma_reg_read || !rdma_reg_write || !rdma_deregister) {
         return fail("safety preload wrappers are not exported");
     }
 
@@ -268,7 +327,12 @@ static int mode_missing_safety_symbols(void) {
         hip_host_alloc(&out, 8192, 0) == 0 ||
         hip_managed_alloc(&out, 8192, 0) == 0 ||
         mpi_alloc((intptr_t)8192, NULL, &out) == 0 ||
-        ibv_register(NULL, ptr, 8192, 0) != NULL) {
+        ibv_register(NULL, ptr, 8192, 0) != NULL ||
+        ibv_reregister((void*)0x1, 0, NULL, ptr, 8192, 0) == 0 ||
+        rdma_reg_msgs(NULL, ptr, 8192) != NULL ||
+        rdma_reg_read(NULL, ptr, 8192) != NULL ||
+        rdma_reg_write(NULL, ptr, 8192) != NULL ||
+        rdma_deregister((void*)0x1) == 0) {
         free(ptr);
         return fail("missing safety runtime call unexpectedly succeeded");
     }
@@ -1143,7 +1207,12 @@ static int mode_dlopen_exclusions(void) {
     plugin_free_status_fn hip_managed_free = NULL;
     plugin_rdma_register_fn rdma_register = NULL;
     plugin_rdma_register_fn rdma_register_iova = NULL;
+    plugin_rdma_reregister_fn rdma_reregister = NULL;
     plugin_free_status_fn rdma_deregister = NULL;
+    plugin_rdma_register_fn rdma_cm_msgs = NULL;
+    plugin_rdma_register_fn rdma_cm_read = NULL;
+    plugin_rdma_register_fn rdma_cm_write = NULL;
+    plugin_free_status_fn rdma_cm_deregister = NULL;
     plugin_alloc_out_fn mpi_alloc = NULL;
     plugin_free_status_fn mpi_free = NULL;
 
@@ -1166,14 +1235,23 @@ static int mode_dlopen_exclusions(void) {
     *(void**)(&rdma_register) = dlsym(handle, "mai_exclusion_plugin_rdma_register");
     *(void**)(&rdma_register_iova) =
         dlsym(handle, "mai_exclusion_plugin_rdma_register_iova");
+    *(void**)(&rdma_reregister) =
+        dlsym(handle, "mai_exclusion_plugin_rdma_reregister");
     *(void**)(&rdma_deregister) = dlsym(handle, "mai_exclusion_plugin_rdma_deregister");
+    *(void**)(&rdma_cm_msgs) = dlsym(handle, "mai_exclusion_plugin_rdma_cm_msgs");
+    *(void**)(&rdma_cm_read) = dlsym(handle, "mai_exclusion_plugin_rdma_cm_read");
+    *(void**)(&rdma_cm_write) = dlsym(handle, "mai_exclusion_plugin_rdma_cm_write");
+    *(void**)(&rdma_cm_deregister) =
+        dlsym(handle, "mai_exclusion_plugin_rdma_cm_deregister");
     *(void**)(&mpi_alloc) = dlsym(handle, "mai_exclusion_plugin_mpi_alloc");
     *(void**)(&mpi_free) = dlsym(handle, "mai_exclusion_plugin_mpi_free");
     if (!cuda_register || !cuda_unregister || !cuda_alloc || !cuda_free ||
         !cuda_managed_alloc || !cuda_managed_free ||
         !hip_register || !hip_unregister || !hip_alloc || !hip_free ||
         !hip_managed_alloc || !hip_managed_free ||
-        !rdma_register || !rdma_register_iova || !rdma_deregister ||
+        !rdma_register || !rdma_register_iova || !rdma_reregister ||
+        !rdma_deregister ||
+        !rdma_cm_msgs || !rdma_cm_read || !rdma_cm_write || !rdma_cm_deregister ||
         !mpi_alloc || !mpi_free) {
         dlclose(handle);
         return fail("dlsym exclusion plugin functions failed");
@@ -1186,6 +1264,7 @@ static int mode_dlopen_exclusions(void) {
     MaiStats after_cuda_reclaim;
     MaiStats after_cuda_unregister;
     MaiStats after_rdma_register;
+    MaiStats after_rdma_reregister;
     MaiStats after_rdma_deregister;
     MaiStats after_cuda_alloc;
     MaiStats after_cuda_free;
@@ -1199,6 +1278,9 @@ static int mode_dlopen_exclusions(void) {
     MaiStats after_hip_managed_free;
     MaiStats after_rdma_iova_register;
     MaiStats after_rdma_iova_deregister;
+    MaiStats after_rdma_cm_msgs_free;
+    MaiStats after_rdma_cm_read_free;
+    MaiStats after_rdma_cm_write_free;
     MaiStats after_mpi_alloc;
     MaiStats after_mpi_free;
 
@@ -1299,6 +1381,27 @@ static int mode_dlopen_exclusions(void) {
         free(ptr);
         dlclose(handle);
         return fail("dlopen RDMA register did not mark exclusion");
+    }
+    if (rdma_reregister(mr, ptr, size / 2) != 0) {
+        rdma_deregister(mr);
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin ibv_rereg_mr failed");
+    }
+    if (load_stats(&after_rdma_reregister) != 0) {
+        rdma_deregister(mr);
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after RDMA reregister");
+    }
+    if (after_rdma_reregister.exclusion_events <= after_rdma_register.exclusion_events ||
+        after_rdma_reregister.exclusion_release_events <=
+            after_rdma_register.exclusion_release_events ||
+        after_rdma_reregister.excluded_bytes >= after_rdma_register.excluded_bytes) {
+        rdma_deregister(mr);
+        free(ptr);
+        dlclose(handle);
+        return fail("RDMA reregister did not replace exclusion range");
     }
     if (rdma_deregister(mr) != 0) {
         free(ptr);
@@ -1534,6 +1637,43 @@ static int mode_dlopen_exclusions(void) {
         return fail("RDMA iova deregister did not release exclusion");
     }
 
+    if (run_plugin_rdma_cycle(rdma_cm_msgs, rdma_cm_deregister, ptr, size,
+                              &after_rdma_iova_deregister, &after_rdma_cm_msgs_free,
+                              "plugin rdma_reg_msgs failed",
+                              "mai_get_stats failed after rdma_reg_msgs",
+                              "dlopen rdma_reg_msgs did not mark exclusion",
+                              "plugin rdma_dereg_mr failed after rdma_reg_msgs",
+                              "mai_get_stats failed after rdma_reg_msgs deregister",
+                              "rdma_reg_msgs deregister did not release exclusion") != 0) {
+        free(ptr);
+        dlclose(handle);
+        return 1;
+    }
+    if (run_plugin_rdma_cycle(rdma_cm_read, rdma_cm_deregister, ptr, size,
+                              &after_rdma_cm_msgs_free, &after_rdma_cm_read_free,
+                              "plugin rdma_reg_read failed",
+                              "mai_get_stats failed after rdma_reg_read",
+                              "dlopen rdma_reg_read did not mark exclusion",
+                              "plugin rdma_dereg_mr failed after rdma_reg_read",
+                              "mai_get_stats failed after rdma_reg_read deregister",
+                              "rdma_reg_read deregister did not release exclusion") != 0) {
+        free(ptr);
+        dlclose(handle);
+        return 1;
+    }
+    if (run_plugin_rdma_cycle(rdma_cm_write, rdma_cm_deregister, ptr, size,
+                              &after_rdma_cm_read_free, &after_rdma_cm_write_free,
+                              "plugin rdma_reg_write failed",
+                              "mai_get_stats failed after rdma_reg_write",
+                              "dlopen rdma_reg_write did not mark exclusion",
+                              "plugin rdma_dereg_mr failed after rdma_reg_write",
+                              "mai_get_stats failed after rdma_reg_write deregister",
+                              "rdma_reg_write deregister did not release exclusion") != 0) {
+        free(ptr);
+        dlclose(handle);
+        return 1;
+    }
+
     void* mpi_ptr = NULL;
     if (mpi_alloc(size, &mpi_ptr) != 0 || !mpi_ptr) {
         free(ptr);
@@ -1546,9 +1686,9 @@ static int mode_dlopen_exclusions(void) {
         dlclose(handle);
         return fail("mai_get_stats failed after MPI alloc");
     }
-    if (!stats_show_exclusion(&after_rdma_iova_deregister, &after_mpi_alloc, size) ||
+    if (!stats_show_exclusion(&after_rdma_cm_write_free, &after_mpi_alloc, size) ||
         after_mpi_alloc.managed_allocations !=
-            after_rdma_iova_deregister.managed_allocations) {
+            after_rdma_cm_write_free.managed_allocations) {
         mpi_free(mpi_ptr);
         free(ptr);
         dlclose(handle);
