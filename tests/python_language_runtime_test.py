@@ -41,6 +41,13 @@ class MaiStats(ctypes.Structure):
         ("allocator_libc_patches", ctypes.c_size_t),
         ("allocator_preload_calls", ctypes.c_size_t),
         ("allocator_frida_calls", ctypes.c_size_t),
+        ("excluded_ranges", ctypes.c_size_t),
+        ("excluded_bytes", ctypes.c_size_t),
+        ("exclusion_events", ctypes.c_size_t),
+        ("exclusion_release_events", ctypes.c_size_t),
+        ("reclaim_skipped_excluded", ctypes.c_size_t),
+        ("reclaim_skipped_excluded_bytes", ctypes.c_size_t),
+        ("safety_hook_patches", ctypes.c_size_t),
     ]
 
 

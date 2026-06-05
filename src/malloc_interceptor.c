@@ -7,6 +7,7 @@
 #include <malloc.h>
 #include <stddef.h>
 #include <stdatomic.h>
+#include <sys/syscall.h>
 
 #include "frida-gum.h"
 
@@ -53,6 +54,17 @@ typedef enum {
 } BackendType;
 
 typedef enum {
+    EXCLUSION_MLOCK = 0,
+    EXCLUSION_MLOCKALL,
+    EXCLUSION_CUDA_HOST,
+    EXCLUSION_CUDA_MANAGED,
+    EXCLUSION_HIP_HOST,
+    EXCLUSION_HIP_MANAGED,
+    EXCLUSION_MPI,
+    EXCLUSION_RDMA
+} ExclusionKind;
+
+typedef enum {
     HOOK_MALLOC = 0,
     HOOK_FREE,
     HOOK_CALLOC,
@@ -62,7 +74,30 @@ typedef enum {
     HOOK_MEMALIGN,
     HOOK_VALLOC,
     HOOK_PVALLOC,
-    HOOK_MALLOC_USABLE_SIZE
+    HOOK_MALLOC_USABLE_SIZE,
+    HOOK_MLOCK,
+    HOOK_MLOCK2,
+    HOOK_MLOCKALL,
+    HOOK_MUNLOCK,
+    HOOK_MUNLOCKALL,
+    HOOK_CUDA_HOST_ALLOC,
+    HOOK_CUDA_MALLOC_HOST,
+    HOOK_CUDA_HOST_REGISTER,
+    HOOK_CUDA_HOST_UNREGISTER,
+    HOOK_CUDA_FREE_HOST,
+    HOOK_CUDA_MALLOC_MANAGED,
+    HOOK_CUDA_FREE,
+    HOOK_HIP_HOST_MALLOC,
+    HOOK_HIP_HOST_REGISTER,
+    HOOK_HIP_HOST_UNREGISTER,
+    HOOK_HIP_HOST_FREE,
+    HOOK_HIP_MALLOC_MANAGED,
+    HOOK_HIP_FREE,
+    HOOK_MPI_ALLOC_MEM,
+    HOOK_MPI_FREE_MEM,
+    HOOK_IBV_REG_MR,
+    HOOK_IBV_REG_MR_IOVA,
+    HOOK_IBV_DEREG_MR
 } HookKind;
 
 typedef struct ArenaSegment ArenaSegment;
@@ -72,6 +107,8 @@ typedef struct ProfileRecord ProfileRecord;
 typedef struct PassThroughCounter PassThroughCounter;
 typedef struct DynamicReplacement DynamicReplacement;
 typedef struct DynamicHandleRecord DynamicHandleRecord;
+typedef struct ExclusionRange ExclusionRange;
+typedef struct RegistrationRecord RegistrationRecord;
 
 struct ArenaBlock {
     size_t offset;
@@ -149,6 +186,22 @@ struct DynamicHandleRecord {
     DynamicHandleRecord* next;
 };
 
+struct ExclusionRange {
+    uintptr_t start;
+    uintptr_t end;
+    ExclusionKind kind;
+    void* token;
+    ExclusionRange* next;
+};
+
+struct RegistrationRecord {
+    void* token;
+    uintptr_t start;
+    uintptr_t end;
+    ExclusionKind kind;
+    RegistrationRecord* next;
+};
+
 static GumInterceptor* malloc_interceptor = NULL;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -185,8 +238,11 @@ static ProfileRecord* profile_buckets[MAI_PROFILE_BUCKETS];
 static DynamicReplacement* dynamic_replacements = NULL;
 static atomic_int dynamic_replacements_active;
 static DynamicHandleRecord* dynamic_handles = NULL;
+static ExclusionRange* exclusion_ranges = NULL;
+static RegistrationRecord* registration_records = NULL;
 static size_t allocation_sequence = 0;
 static size_t reclaim_epoch = 0;
+static int mlockall_future_active = 0;
 static _Atomic(uintptr_t) managed_range_low;
 static _Atomic(uintptr_t) managed_range_high;
 
@@ -217,6 +273,29 @@ static gpointer munmap_addr = NULL;
 static gpointer mremap_addr = NULL;
 static gpointer brk_addr = NULL;
 static gpointer sbrk_addr = NULL;
+static gpointer mlock_addr = NULL;
+static gpointer mlock2_addr = NULL;
+static gpointer mlockall_addr = NULL;
+static gpointer munlock_addr = NULL;
+static gpointer munlockall_addr = NULL;
+static gpointer cuda_host_alloc_addr = NULL;
+static gpointer cuda_malloc_host_addr = NULL;
+static gpointer cuda_host_register_addr = NULL;
+static gpointer cuda_host_unregister_addr = NULL;
+static gpointer cuda_free_host_addr = NULL;
+static gpointer cuda_malloc_managed_addr = NULL;
+static gpointer cuda_free_addr = NULL;
+static gpointer hip_host_malloc_addr = NULL;
+static gpointer hip_host_register_addr = NULL;
+static gpointer hip_host_unregister_addr = NULL;
+static gpointer hip_host_free_addr = NULL;
+static gpointer hip_malloc_managed_addr = NULL;
+static gpointer hip_free_addr = NULL;
+static gpointer mpi_alloc_mem_addr = NULL;
+static gpointer mpi_free_mem_addr = NULL;
+static gpointer ibv_reg_mr_addr = NULL;
+static gpointer ibv_reg_mr_iova_addr = NULL;
+static gpointer ibv_dereg_mr_addr = NULL;
 
 static int malloc_replaced = 0;
 static int free_replaced = 0;
@@ -236,6 +315,29 @@ static int munmap_replaced = 0;
 static int mremap_replaced = 0;
 static int brk_replaced = 0;
 static int sbrk_replaced = 0;
+static int mlock_replaced = 0;
+static int mlock2_replaced = 0;
+static int mlockall_replaced = 0;
+static int munlock_replaced = 0;
+static int munlockall_replaced = 0;
+static int cuda_host_alloc_replaced = 0;
+static int cuda_malloc_host_replaced = 0;
+static int cuda_host_register_replaced = 0;
+static int cuda_host_unregister_replaced = 0;
+static int cuda_free_host_replaced = 0;
+static int cuda_malloc_managed_replaced = 0;
+static int cuda_free_replaced = 0;
+static int hip_host_malloc_replaced = 0;
+static int hip_host_register_replaced = 0;
+static int hip_host_unregister_replaced = 0;
+static int hip_host_free_replaced = 0;
+static int hip_malloc_managed_replaced = 0;
+static int hip_free_replaced = 0;
+static int mpi_alloc_mem_replaced = 0;
+static int mpi_free_mem_replaced = 0;
+static int ibv_reg_mr_replaced = 0;
+static int ibv_reg_mr_iova_replaced = 0;
+static int ibv_dereg_mr_replaced = 0;
 
 static void* (*original_malloc)(size_t size) = NULL;
 static void (*original_free)(void* ptr) = NULL;
@@ -255,6 +357,29 @@ static int (*original_munmap)(void* addr, size_t length) = NULL;
 static void* (*original_mremap)(void* old_address, size_t old_size, size_t new_size, int flags, ...) = NULL;
 static int (*original_brk)(void* addr) = NULL;
 static void* (*original_sbrk)(intptr_t increment) = NULL;
+static int (*original_mlock)(const void* addr, size_t len) = NULL;
+static int (*original_mlock2)(const void* addr, size_t len, unsigned int flags) = NULL;
+static int (*original_mlockall)(int flags) = NULL;
+static int (*original_munlock)(const void* addr, size_t len) = NULL;
+static int (*original_munlockall)(void) = NULL;
+static int (*original_cudaHostAlloc)(void** ptr, size_t size, unsigned int flags) = NULL;
+static int (*original_cudaMallocHost)(void** ptr, size_t size) = NULL;
+static int (*original_cudaHostRegister)(void* ptr, size_t size, unsigned int flags) = NULL;
+static int (*original_cudaHostUnregister)(void* ptr) = NULL;
+static int (*original_cudaFreeHost)(void* ptr) = NULL;
+static int (*original_cudaMallocManaged)(void** ptr, size_t size, unsigned int flags) = NULL;
+static int (*original_cudaFree)(void* ptr) = NULL;
+static int (*original_hipHostMalloc)(void** ptr, size_t size, unsigned int flags) = NULL;
+static int (*original_hipHostRegister)(void* ptr, size_t size, unsigned int flags) = NULL;
+static int (*original_hipHostUnregister)(void* ptr) = NULL;
+static int (*original_hipHostFree)(void* ptr) = NULL;
+static int (*original_hipMallocManaged)(void** ptr, size_t size, unsigned int flags) = NULL;
+static int (*original_hipFree)(void* ptr) = NULL;
+static int (*original_MPI_Alloc_mem)(intptr_t size, void* info, void* baseptr) = NULL;
+static int (*original_MPI_Free_mem)(void* base) = NULL;
+static void* (*original_ibv_reg_mr)(void* pd, void* addr, size_t length, int access) = NULL;
+static void* (*original_ibv_reg_mr_iova)(void* pd, void* addr, size_t length, uint64_t iova, int access) = NULL;
+static int (*original_ibv_dereg_mr)(void* mr) = NULL;
 
 extern void* __libc_malloc(size_t size) __attribute__((weak));
 extern void __libc_free(void* ptr) __attribute__((weak));
@@ -280,6 +405,60 @@ static int custom_munmap(void* addr, size_t length);
 static void* custom_mremap(void* old_address, size_t old_size, size_t new_size, int flags, void* new_address);
 static int custom_brk(void* addr);
 static void* custom_sbrk(intptr_t increment);
+static int custom_mlock(const void* addr, size_t len);
+static int custom_mlock2(const void* addr, size_t len, unsigned int flags);
+static int custom_mlockall(int flags);
+static int custom_munlock(const void* addr, size_t len);
+static int custom_munlockall(void);
+static int custom_cudaHostAlloc(void** ptr, size_t size, unsigned int flags);
+static int custom_cudaMallocHost(void** ptr, size_t size);
+static int custom_cudaHostRegister(void* ptr, size_t size, unsigned int flags);
+static int custom_cudaHostUnregister(void* ptr);
+static int custom_cudaFreeHost(void* ptr);
+static int custom_cudaMallocManaged(void** ptr, size_t size, unsigned int flags);
+static int custom_cudaFree(void* ptr);
+static int custom_hipHostMalloc(void** ptr, size_t size, unsigned int flags);
+static int custom_hipHostRegister(void* ptr, size_t size, unsigned int flags);
+static int custom_hipHostUnregister(void* ptr);
+static int custom_hipHostFree(void* ptr);
+static int custom_hipMallocManaged(void** ptr, size_t size, unsigned int flags);
+static int custom_hipFree(void* ptr);
+static int custom_MPI_Alloc_mem(intptr_t size, void* info, void* baseptr);
+static int custom_MPI_Free_mem(void* base);
+static void* custom_ibv_reg_mr(void* pd, void* addr, size_t length, int access);
+static void* custom_ibv_reg_mr_iova(void* pd, void* addr, size_t length, uint64_t iova, int access);
+static int custom_ibv_dereg_mr(void* mr);
+
+__attribute__((visibility("default"))) int mlock2(const void* addr, size_t len,
+                                                  unsigned int flags);
+__attribute__((visibility("default"))) int cudaHostAlloc(void** ptr, size_t size,
+                                                         unsigned int flags);
+__attribute__((visibility("default"))) int cudaMallocHost(void** ptr, size_t size);
+__attribute__((visibility("default"))) int cudaHostRegister(void* ptr, size_t size,
+                                                            unsigned int flags);
+__attribute__((visibility("default"))) int cudaHostUnregister(void* ptr);
+__attribute__((visibility("default"))) int cudaFreeHost(void* ptr);
+__attribute__((visibility("default"))) int cudaMallocManaged(void** ptr, size_t size,
+                                                             unsigned int flags);
+__attribute__((visibility("default"))) int cudaFree(void* ptr);
+__attribute__((visibility("default"))) int hipHostMalloc(void** ptr, size_t size,
+                                                         unsigned int flags);
+__attribute__((visibility("default"))) int hipHostRegister(void* ptr, size_t size,
+                                                           unsigned int flags);
+__attribute__((visibility("default"))) int hipHostUnregister(void* ptr);
+__attribute__((visibility("default"))) int hipHostFree(void* ptr);
+__attribute__((visibility("default"))) int hipMallocManaged(void** ptr, size_t size,
+                                                            unsigned int flags);
+__attribute__((visibility("default"))) int hipFree(void* ptr);
+__attribute__((visibility("default"))) int MPI_Alloc_mem(intptr_t size, void* info,
+                                                         void* baseptr);
+__attribute__((visibility("default"))) int MPI_Free_mem(void* base);
+__attribute__((visibility("default"))) void* ibv_reg_mr(void* pd, void* addr,
+                                                        size_t length, int access);
+__attribute__((visibility("default"))) void* ibv_reg_mr_iova(void* pd, void* addr,
+                                                             size_t length,
+                                                             uint64_t iova, int access);
+__attribute__((visibility("default"))) int ibv_dereg_mr(void* mr);
 static size_t record_page_range(AllocationRecord* record, void** range_start);
 
 static size_t max_size(size_t a, size_t b) {
@@ -531,6 +710,255 @@ static size_t update_observed_rss_locked(void) {
     return rss;
 }
 
+static int make_range(void* ptr, size_t length, uintptr_t* start, uintptr_t* end) {
+    if (!ptr || length == 0) {
+        return -1;
+    }
+
+    uintptr_t range_start = (uintptr_t)ptr;
+    if (range_start > UINTPTR_MAX - length) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    *start = range_start;
+    *end = range_start + length;
+    return 0;
+}
+
+static int ranges_overlap(uintptr_t a_start, uintptr_t a_end,
+                          uintptr_t b_start, uintptr_t b_end) {
+    return a_start < b_end && b_start < a_end;
+}
+
+static int add_exclusion_range_locked(void* ptr, size_t length, ExclusionKind kind,
+                                      void* token) {
+    uintptr_t start;
+    uintptr_t end;
+    if (make_range(ptr, length, &start, &end) != 0) {
+        return -1;
+    }
+
+    ExclusionRange* range = meta_alloc(sizeof(*range));
+    if (!range) {
+        return -1;
+    }
+
+    range->start = start;
+    range->end = end;
+    range->kind = kind;
+    range->token = token;
+    range->next = exclusion_ranges;
+    exclusion_ranges = range;
+
+    stats_snapshot.excluded_ranges++;
+    stats_snapshot.excluded_bytes += length;
+    stats_snapshot.exclusion_events++;
+    return 0;
+}
+
+static void remove_exclusion_node_locked(ExclusionRange* previous,
+                                         ExclusionRange* range) {
+    if (previous) {
+        previous->next = range->next;
+    } else {
+        exclusion_ranges = range->next;
+    }
+
+    size_t length = (size_t)(range->end - range->start);
+    if (stats_snapshot.excluded_ranges > 0) {
+        stats_snapshot.excluded_ranges--;
+    }
+    if (stats_snapshot.excluded_bytes >= length) {
+        stats_snapshot.excluded_bytes -= length;
+    } else {
+        stats_snapshot.excluded_bytes = 0;
+    }
+    stats_snapshot.exclusion_release_events++;
+    meta_free(range);
+}
+
+static void remove_exclusion_range_locked(void* ptr, size_t length,
+                                          ExclusionKind kind) {
+    uintptr_t start;
+    uintptr_t end;
+    if (make_range(ptr, length, &start, &end) != 0) {
+        return;
+    }
+
+    ExclusionRange* previous = NULL;
+    ExclusionRange* range = exclusion_ranges;
+    while (range) {
+        ExclusionRange* next = range->next;
+        if (range->kind != kind || !ranges_overlap(range->start, range->end, start, end)) {
+            previous = range;
+            range = next;
+            continue;
+        }
+
+        if (start <= range->start && end >= range->end) {
+            remove_exclusion_node_locked(previous, range);
+            range = next;
+            continue;
+        }
+
+        if (start <= range->start) {
+            size_t old_length = (size_t)(range->end - range->start);
+            range->start = end < range->end ? end : range->end;
+            size_t new_length = (size_t)(range->end - range->start);
+            stats_snapshot.excluded_bytes -= old_length - new_length;
+            stats_snapshot.exclusion_release_events++;
+            previous = range;
+            range = next;
+            continue;
+        }
+
+        if (end >= range->end) {
+            size_t old_length = (size_t)(range->end - range->start);
+            range->end = start > range->start ? start : range->start;
+            size_t new_length = (size_t)(range->end - range->start);
+            stats_snapshot.excluded_bytes -= old_length - new_length;
+            stats_snapshot.exclusion_release_events++;
+            previous = range;
+            range = next;
+            continue;
+        }
+
+        ExclusionRange* tail = meta_alloc(sizeof(*tail));
+        if (tail) {
+            tail->start = end;
+            tail->end = range->end;
+            tail->kind = range->kind;
+            tail->token = range->token;
+            tail->next = range->next;
+            range->next = tail;
+            range->end = start;
+            stats_snapshot.excluded_ranges++;
+            stats_snapshot.excluded_bytes -= (size_t)(end - start);
+            stats_snapshot.exclusion_release_events++;
+            previous = tail;
+            range = next;
+        } else {
+            previous = range;
+            range = next;
+        }
+    }
+}
+
+static void remove_exclusion_start_locked(void* ptr, ExclusionKind kind) {
+    uintptr_t start = (uintptr_t)ptr;
+    ExclusionRange* previous = NULL;
+    ExclusionRange* range = exclusion_ranges;
+
+    while (range) {
+        ExclusionRange* next = range->next;
+        if (range->kind == kind && range->start == start) {
+            remove_exclusion_node_locked(previous, range);
+            range = next;
+            continue;
+        }
+        previous = range;
+        range = next;
+    }
+}
+
+static void remove_exclusion_token_locked(void* token, ExclusionKind kind) {
+    ExclusionRange* previous = NULL;
+    ExclusionRange* range = exclusion_ranges;
+
+    while (range) {
+        ExclusionRange* next = range->next;
+        if (range->kind == kind && range->token == token) {
+            remove_exclusion_node_locked(previous, range);
+            range = next;
+            continue;
+        }
+        previous = range;
+        range = next;
+    }
+}
+
+static int record_overlaps_exclusion_locked(AllocationRecord* record) {
+    uintptr_t start;
+    uintptr_t end;
+    if (make_range(record->user_ptr, record->user_size, &start, &end) != 0) {
+        return 0;
+    }
+
+    for (ExclusionRange* range = exclusion_ranges; range; range = range->next) {
+        if (ranges_overlap(start, end, range->start, range->end)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void mark_all_live_excluded_locked(ExclusionKind kind) {
+    for (AllocationRecord* record = live_head; record; record = record->live_next) {
+        add_exclusion_range_locked(record->user_ptr, record->user_size, kind,
+                                   record->user_ptr);
+    }
+}
+
+static void remove_exclusions_by_kind_locked(ExclusionKind kind) {
+    ExclusionRange* previous = NULL;
+    ExclusionRange* range = exclusion_ranges;
+
+    while (range) {
+        ExclusionRange* next = range->next;
+        if (range->kind == kind) {
+            remove_exclusion_node_locked(previous, range);
+            range = next;
+            continue;
+        }
+        previous = range;
+        range = next;
+    }
+}
+
+static int remember_registration_locked(void* token, void* ptr, size_t length,
+                                        ExclusionKind kind) {
+    uintptr_t start;
+    uintptr_t end;
+    if (!token || make_range(ptr, length, &start, &end) != 0) {
+        return -1;
+    }
+
+    RegistrationRecord* record = meta_alloc(sizeof(*record));
+    if (!record) {
+        return -1;
+    }
+
+    record->token = token;
+    record->start = start;
+    record->end = end;
+    record->kind = kind;
+    record->next = registration_records;
+    registration_records = record;
+    return 0;
+}
+
+static RegistrationRecord* take_registration_locked(void* token, ExclusionKind kind) {
+    RegistrationRecord* previous = NULL;
+    RegistrationRecord* record = registration_records;
+
+    while (record) {
+        if (record->token == token && record->kind == kind) {
+            if (previous) {
+                previous->next = record->next;
+            } else {
+                registration_records = record->next;
+            }
+            return record;
+        }
+        previous = record;
+        record = record->next;
+    }
+
+    return NULL;
+}
+
 static int sample_record_hotness_locked(AllocationRecord* record,
                                         size_t* sampled_pages_out,
                                         size_t* resident_pages_out,
@@ -672,6 +1100,92 @@ static void resolve_original_allocators(void) {
             (size_t (*)(void*))dlsym(RTLD_NEXT, "malloc_usable_size");
     }
     resolving_original_allocators = 0;
+}
+
+static void resolve_original_safety_functions(void) {
+    if (!original_mlock) {
+        original_mlock = (int (*)(const void*, size_t))dlsym(RTLD_NEXT, "mlock");
+    }
+    if (!original_mlock2) {
+        original_mlock2 =
+            (int (*)(const void*, size_t, unsigned int))dlsym(RTLD_NEXT, "mlock2");
+    }
+    if (!original_mlockall) {
+        original_mlockall = (int (*)(int))dlsym(RTLD_NEXT, "mlockall");
+    }
+    if (!original_munlock) {
+        original_munlock = (int (*)(const void*, size_t))dlsym(RTLD_NEXT, "munlock");
+    }
+    if (!original_munlockall) {
+        original_munlockall = (int (*)(void))dlsym(RTLD_NEXT, "munlockall");
+    }
+    if (!original_cudaHostAlloc) {
+        original_cudaHostAlloc =
+            (int (*)(void**, size_t, unsigned int))dlsym(RTLD_NEXT, "cudaHostAlloc");
+    }
+    if (!original_cudaMallocHost) {
+        original_cudaMallocHost =
+            (int (*)(void**, size_t))dlsym(RTLD_NEXT, "cudaMallocHost");
+    }
+    if (!original_cudaHostRegister) {
+        original_cudaHostRegister =
+            (int (*)(void*, size_t, unsigned int))dlsym(RTLD_NEXT, "cudaHostRegister");
+    }
+    if (!original_cudaHostUnregister) {
+        original_cudaHostUnregister =
+            (int (*)(void*))dlsym(RTLD_NEXT, "cudaHostUnregister");
+    }
+    if (!original_cudaFreeHost) {
+        original_cudaFreeHost = (int (*)(void*))dlsym(RTLD_NEXT, "cudaFreeHost");
+    }
+    if (!original_cudaMallocManaged) {
+        original_cudaMallocManaged =
+            (int (*)(void**, size_t, unsigned int))dlsym(RTLD_NEXT, "cudaMallocManaged");
+    }
+    if (!original_cudaFree) {
+        original_cudaFree = (int (*)(void*))dlsym(RTLD_NEXT, "cudaFree");
+    }
+    if (!original_hipHostMalloc) {
+        original_hipHostMalloc =
+            (int (*)(void**, size_t, unsigned int))dlsym(RTLD_NEXT, "hipHostMalloc");
+    }
+    if (!original_hipHostRegister) {
+        original_hipHostRegister =
+            (int (*)(void*, size_t, unsigned int))dlsym(RTLD_NEXT, "hipHostRegister");
+    }
+    if (!original_hipHostUnregister) {
+        original_hipHostUnregister =
+            (int (*)(void*))dlsym(RTLD_NEXT, "hipHostUnregister");
+    }
+    if (!original_hipHostFree) {
+        original_hipHostFree = (int (*)(void*))dlsym(RTLD_NEXT, "hipHostFree");
+    }
+    if (!original_hipMallocManaged) {
+        original_hipMallocManaged =
+            (int (*)(void**, size_t, unsigned int))dlsym(RTLD_NEXT, "hipMallocManaged");
+    }
+    if (!original_hipFree) {
+        original_hipFree = (int (*)(void*))dlsym(RTLD_NEXT, "hipFree");
+    }
+    if (!original_MPI_Alloc_mem) {
+        original_MPI_Alloc_mem =
+            (int (*)(intptr_t, void*, void*))dlsym(RTLD_NEXT, "MPI_Alloc_mem");
+    }
+    if (!original_MPI_Free_mem) {
+        original_MPI_Free_mem = (int (*)(void*))dlsym(RTLD_NEXT, "MPI_Free_mem");
+    }
+    if (!original_ibv_reg_mr) {
+        original_ibv_reg_mr =
+            (void* (*)(void*, void*, size_t, int))dlsym(RTLD_NEXT, "ibv_reg_mr");
+    }
+    if (!original_ibv_reg_mr_iova) {
+        original_ibv_reg_mr_iova =
+            (void* (*)(void*, void*, size_t, uint64_t, int))dlsym(RTLD_NEXT,
+                                                                  "ibv_reg_mr_iova");
+    }
+    if (!original_ibv_dereg_mr) {
+        original_ibv_dereg_mr = (int (*)(void*))dlsym(RTLD_NEXT, "ibv_dereg_mr");
+    }
 }
 
 static void* fallback_malloc(size_t size) {
@@ -1532,13 +2046,20 @@ static AllocationRecord* free_managed_pointer_locked(void* ptr) {
 }
 
 static int should_manage(size_t size) {
-    return runtime_enabled && runtime_configured && size >= threshold_bytes && size > 0;
+    return runtime_enabled && runtime_configured && !mlockall_future_active &&
+           size >= threshold_bytes && size > 0;
 }
 
 static int reclaim_record_locked(AllocationRecord* record) {
     void* range_start = NULL;
     size_t range_length = record_page_range(record, &range_start);
     int rc = 0;
+
+    if (record_overlaps_exclusion_locked(record)) {
+        stats_snapshot.reclaim_skipped_excluded++;
+        stats_snapshot.reclaim_skipped_excluded_bytes += record->user_size;
+        return 0;
+    }
 
     if (range_length == 0) {
         return 0;
@@ -1576,7 +2097,8 @@ static AllocationRecord* select_reclaim_candidate_locked(void) {
 
     if (reclaim_selection == RECLAIM_SELECT_ALL) {
         for (AllocationRecord* record = live_head; record; record = record->live_next) {
-            if (record->reclaim_epoch != reclaim_epoch) {
+            if (record->reclaim_epoch != reclaim_epoch &&
+                !record_overlaps_exclusion_locked(record)) {
                 return record;
             }
         }
@@ -1585,6 +2107,9 @@ static AllocationRecord* select_reclaim_candidate_locked(void) {
 
     for (AllocationRecord* record = live_head; record; record = record->live_next) {
         if (record->reclaim_epoch == reclaim_epoch) {
+            continue;
+        }
+        if (record_overlaps_exclusion_locked(record)) {
             continue;
         }
 
@@ -1776,7 +2301,10 @@ static void print_stats(void) {
             "mmap_calls=%zu munmap_calls=%zu mremap_calls=%zu brk_calls=%zu sbrk_calls=%zu "
             "profile_sites=%zu hotness_samples=%zu hotness_sampled_pages=%zu "
             "hotness_resident_pages=%zu allocator_hook_mode=%zu allocator_libc_patches=%zu "
-            "allocator_preload_calls=%zu allocator_frida_calls=%zu\n",
+            "allocator_preload_calls=%zu allocator_frida_calls=%zu excluded_ranges=%zu "
+            "excluded_bytes=%zu exclusion_events=%zu exclusion_release_events=%zu "
+            "reclaim_skipped_excluded=%zu reclaim_skipped_excluded_bytes=%zu "
+            "safety_hook_patches=%zu\n",
             stats.enabled, stats.configured, stats.config_error, stats.threshold,
             stats.arena_size, stats.target_rss, stats.current_rss_bytes,
             stats.high_water_rss_bytes, stats.arena_segments, stats.arena_bytes,
@@ -1789,7 +2317,10 @@ static void print_stats(void) {
             stats.profile_sites, stats.hotness_samples, stats.hotness_sampled_pages,
             stats.hotness_resident_pages, stats.allocator_hook_mode,
             stats.allocator_libc_patches, stats.allocator_preload_calls,
-            stats.allocator_frida_calls);
+            stats.allocator_frida_calls, stats.excluded_ranges, stats.excluded_bytes,
+            stats.exclusion_events, stats.exclusion_release_events,
+            stats.reclaim_skipped_excluded, stats.reclaim_skipped_excluded_bytes,
+            stats.safety_hook_patches);
 }
 
 static void print_profile_report(void) {
@@ -1966,6 +2497,9 @@ static int configure_runtime(void) {
     live_head = NULL;
     arena_segments = NULL;
     dynamic_replacements = NULL;
+    exclusion_ranges = NULL;
+    registration_records = NULL;
+    mlockall_future_active = 0;
     atomic_store_explicit(&dynamic_replacements_active, 0, memory_order_relaxed);
     atomic_store_explicit(&managed_range_low, 0, memory_order_relaxed);
     atomic_store_explicit(&managed_range_high, 0, memory_order_relaxed);
@@ -2566,6 +3100,121 @@ size_t malloc_usable_size(void* ptr) {
     return custom_malloc_usable_size(ptr);
 }
 
+__attribute__((visibility("default")))
+int mlock(const void* addr, size_t len) {
+    return custom_mlock(addr, len);
+}
+
+__attribute__((visibility("default")))
+int mlock2(const void* addr, size_t len, unsigned int flags) {
+    return custom_mlock2(addr, len, flags);
+}
+
+__attribute__((visibility("default")))
+int mlockall(int flags) {
+    return custom_mlockall(flags);
+}
+
+__attribute__((visibility("default")))
+int munlock(const void* addr, size_t len) {
+    return custom_munlock(addr, len);
+}
+
+__attribute__((visibility("default")))
+int munlockall(void) {
+    return custom_munlockall();
+}
+
+__attribute__((visibility("default")))
+int cudaHostAlloc(void** ptr, size_t size, unsigned int flags) {
+    return custom_cudaHostAlloc(ptr, size, flags);
+}
+
+__attribute__((visibility("default")))
+int cudaMallocHost(void** ptr, size_t size) {
+    return custom_cudaMallocHost(ptr, size);
+}
+
+__attribute__((visibility("default")))
+int cudaHostRegister(void* ptr, size_t size, unsigned int flags) {
+    return custom_cudaHostRegister(ptr, size, flags);
+}
+
+__attribute__((visibility("default")))
+int cudaHostUnregister(void* ptr) {
+    return custom_cudaHostUnregister(ptr);
+}
+
+__attribute__((visibility("default")))
+int cudaFreeHost(void* ptr) {
+    return custom_cudaFreeHost(ptr);
+}
+
+__attribute__((visibility("default")))
+int cudaMallocManaged(void** ptr, size_t size, unsigned int flags) {
+    return custom_cudaMallocManaged(ptr, size, flags);
+}
+
+__attribute__((visibility("default")))
+int cudaFree(void* ptr) {
+    return custom_cudaFree(ptr);
+}
+
+__attribute__((visibility("default")))
+int hipHostMalloc(void** ptr, size_t size, unsigned int flags) {
+    return custom_hipHostMalloc(ptr, size, flags);
+}
+
+__attribute__((visibility("default")))
+int hipHostRegister(void* ptr, size_t size, unsigned int flags) {
+    return custom_hipHostRegister(ptr, size, flags);
+}
+
+__attribute__((visibility("default")))
+int hipHostUnregister(void* ptr) {
+    return custom_hipHostUnregister(ptr);
+}
+
+__attribute__((visibility("default")))
+int hipHostFree(void* ptr) {
+    return custom_hipHostFree(ptr);
+}
+
+__attribute__((visibility("default")))
+int hipMallocManaged(void** ptr, size_t size, unsigned int flags) {
+    return custom_hipMallocManaged(ptr, size, flags);
+}
+
+__attribute__((visibility("default")))
+int hipFree(void* ptr) {
+    return custom_hipFree(ptr);
+}
+
+__attribute__((visibility("default")))
+int MPI_Alloc_mem(intptr_t size, void* info, void* baseptr) {
+    return custom_MPI_Alloc_mem(size, info, baseptr);
+}
+
+__attribute__((visibility("default")))
+int MPI_Free_mem(void* base) {
+    return custom_MPI_Free_mem(base);
+}
+
+__attribute__((visibility("default")))
+void* ibv_reg_mr(void* pd, void* addr, size_t length, int access) {
+    return custom_ibv_reg_mr(pd, addr, length, access);
+}
+
+__attribute__((visibility("default")))
+void* ibv_reg_mr_iova(void* pd, void* addr, size_t length, uint64_t iova, int access) {
+    return custom_ibv_reg_mr_iova(pd, addr, length, iova, access);
+}
+
+__attribute__((visibility("default")))
+int ibv_dereg_mr(void* mr) {
+    return custom_ibv_dereg_mr(mr);
+}
+
 void* mai_operator_new_allocate(size_t size) {
     if (size == 0) {
         size = 1;
@@ -2635,6 +3284,611 @@ static void* custom_sbrk(intptr_t increment) {
     return original_sbrk(increment);
 }
 
+static void note_exclusion(void* ptr, size_t length, ExclusionKind kind, void* token) {
+    if (!runtime_configured || cleanup_in_progress || !ptr || length == 0) {
+        return;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+    add_exclusion_range_locked(ptr, length, kind, token ? token : ptr);
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+}
+
+static void release_exclusion_range(void* ptr, size_t length, ExclusionKind kind) {
+    if (!runtime_configured || cleanup_in_progress || !ptr || length == 0) {
+        return;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+    remove_exclusion_range_locked(ptr, length, kind);
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+}
+
+static void release_exclusion_start(void* ptr, ExclusionKind kind) {
+    if (!runtime_configured || cleanup_in_progress || !ptr) {
+        return;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+    remove_exclusion_start_locked(ptr, kind);
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+}
+
+static int missing_status_symbol(void) {
+    errno = ENOSYS;
+    return -1;
+}
+
+static int missing_runtime_status(void) {
+    return 1;
+}
+
+static int custom_mlock(const void* addr, size_t len) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_MLOCK);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(const void*, size_t))replacement->original)(addr, len);
+    } else {
+        rc = (int)syscall(SYS_mlock, addr, len);
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        note_exclusion((void*)addr, len, EXCLUSION_MLOCK, (void*)addr);
+    }
+    return rc;
+}
+
+static int custom_mlock2(const void* addr, size_t len, unsigned int flags) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_MLOCK2);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(const void*, size_t, unsigned int))replacement->original)(addr,
+                                                                                 len,
+                                                                                 flags);
+    } else {
+#ifdef SYS_mlock2
+        rc = (int)syscall(SYS_mlock2, addr, len, flags);
+#else
+        rc = flags == 0 ? (int)syscall(SYS_mlock, addr, len) : missing_status_symbol();
+#endif
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        note_exclusion((void*)addr, len, EXCLUSION_MLOCK, (void*)addr);
+    }
+    return rc;
+}
+
+static int custom_mlockall(int flags) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_MLOCKALL);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(int))replacement->original)(flags);
+    } else {
+        rc = (int)syscall(SYS_mlockall, flags);
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0 && runtime_configured && !cleanup_in_progress) {
+        int saved_internal_depth = in_mai_hook;
+        in_mai_hook++;
+        pthread_mutex_lock(&runtime_lock);
+#ifdef MCL_CURRENT
+        if (flags & MCL_CURRENT) {
+            mark_all_live_excluded_locked(EXCLUSION_MLOCKALL);
+        }
+#endif
+#ifdef MCL_FUTURE
+        if (flags & MCL_FUTURE) {
+            mlockall_future_active = 1;
+        }
+#endif
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_internal_depth;
+    }
+    return rc;
+}
+
+static int custom_munlock(const void* addr, size_t len) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_MUNLOCK);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(const void*, size_t))replacement->original)(addr, len);
+    } else {
+        rc = (int)syscall(SYS_munlock, addr, len);
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        release_exclusion_range((void*)addr, len, EXCLUSION_MLOCK);
+    }
+    return rc;
+}
+
+static int custom_munlockall(void) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_MUNLOCKALL);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void))replacement->original)();
+    } else {
+        rc = (int)syscall(SYS_munlockall);
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0 && runtime_configured && !cleanup_in_progress) {
+        int saved_internal_depth = in_mai_hook;
+        in_mai_hook++;
+        pthread_mutex_lock(&runtime_lock);
+        remove_exclusions_by_kind_locked(EXCLUSION_MLOCK);
+        remove_exclusions_by_kind_locked(EXCLUSION_MLOCKALL);
+        mlockall_future_active = 0;
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_internal_depth;
+    }
+    return rc;
+}
+
+static int custom_cudaHostAlloc(void** ptr, size_t size, unsigned int flags) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_CUDA_HOST_ALLOC);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void**, size_t, unsigned int))replacement->original)(ptr, size, flags);
+    } else {
+        if (!original_cudaHostAlloc) {
+            resolve_original_safety_functions();
+        }
+        rc = original_cudaHostAlloc ?
+            original_cudaHostAlloc(ptr, size, flags) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0 && ptr && *ptr) {
+        note_exclusion(*ptr, size, EXCLUSION_CUDA_HOST, *ptr);
+    }
+    return rc;
+}
+
+static int custom_cudaMallocHost(void** ptr, size_t size) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_CUDA_MALLOC_HOST);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void**, size_t))replacement->original)(ptr, size);
+    } else {
+        if (!original_cudaMallocHost) {
+            resolve_original_safety_functions();
+        }
+        rc = original_cudaMallocHost ?
+            original_cudaMallocHost(ptr, size) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0 && ptr && *ptr) {
+        note_exclusion(*ptr, size, EXCLUSION_CUDA_HOST, *ptr);
+    }
+    return rc;
+}
+
+static int custom_cudaHostRegister(void* ptr, size_t size, unsigned int flags) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_CUDA_HOST_REGISTER);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*, size_t, unsigned int))replacement->original)(ptr, size, flags);
+    } else {
+        if (!original_cudaHostRegister) {
+            resolve_original_safety_functions();
+        }
+        rc = original_cudaHostRegister ?
+            original_cudaHostRegister(ptr, size, flags) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        note_exclusion(ptr, size, EXCLUSION_CUDA_HOST, ptr);
+    }
+    return rc;
+}
+
+static int custom_cudaHostUnregister(void* ptr) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_CUDA_HOST_UNREGISTER);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*))replacement->original)(ptr);
+    } else {
+        if (!original_cudaHostUnregister) {
+            resolve_original_safety_functions();
+        }
+        rc = original_cudaHostUnregister ?
+            original_cudaHostUnregister(ptr) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        release_exclusion_start(ptr, EXCLUSION_CUDA_HOST);
+    }
+    return rc;
+}
+
+static int custom_cudaFreeHost(void* ptr) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_CUDA_FREE_HOST);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*))replacement->original)(ptr);
+    } else {
+        if (!original_cudaFreeHost) {
+            resolve_original_safety_functions();
+        }
+        rc = original_cudaFreeHost ? original_cudaFreeHost(ptr) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        release_exclusion_start(ptr, EXCLUSION_CUDA_HOST);
+    }
+    return rc;
+}
+
+static int custom_cudaMallocManaged(void** ptr, size_t size, unsigned int flags) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_CUDA_MALLOC_MANAGED);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void**, size_t, unsigned int))replacement->original)(ptr, size, flags);
+    } else {
+        if (!original_cudaMallocManaged) {
+            resolve_original_safety_functions();
+        }
+        rc = original_cudaMallocManaged ?
+            original_cudaMallocManaged(ptr, size, flags) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0 && ptr && *ptr) {
+        note_exclusion(*ptr, size, EXCLUSION_CUDA_MANAGED, *ptr);
+    }
+    return rc;
+}
+
+static int custom_cudaFree(void* ptr) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_CUDA_FREE);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*))replacement->original)(ptr);
+    } else {
+        if (!original_cudaFree) {
+            resolve_original_safety_functions();
+        }
+        rc = original_cudaFree ? original_cudaFree(ptr) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        release_exclusion_start(ptr, EXCLUSION_CUDA_MANAGED);
+    }
+    return rc;
+}
+
+static int custom_hipHostMalloc(void** ptr, size_t size, unsigned int flags) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_HIP_HOST_MALLOC);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void**, size_t, unsigned int))replacement->original)(ptr, size, flags);
+    } else {
+        if (!original_hipHostMalloc) {
+            resolve_original_safety_functions();
+        }
+        rc = original_hipHostMalloc ?
+            original_hipHostMalloc(ptr, size, flags) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0 && ptr && *ptr) {
+        note_exclusion(*ptr, size, EXCLUSION_HIP_HOST, *ptr);
+    }
+    return rc;
+}
+
+static int custom_hipHostRegister(void* ptr, size_t size, unsigned int flags) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_HIP_HOST_REGISTER);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*, size_t, unsigned int))replacement->original)(ptr, size, flags);
+    } else {
+        if (!original_hipHostRegister) {
+            resolve_original_safety_functions();
+        }
+        rc = original_hipHostRegister ?
+            original_hipHostRegister(ptr, size, flags) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        note_exclusion(ptr, size, EXCLUSION_HIP_HOST, ptr);
+    }
+    return rc;
+}
+
+static int custom_hipHostUnregister(void* ptr) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_HIP_HOST_UNREGISTER);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*))replacement->original)(ptr);
+    } else {
+        if (!original_hipHostUnregister) {
+            resolve_original_safety_functions();
+        }
+        rc = original_hipHostUnregister ?
+            original_hipHostUnregister(ptr) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        release_exclusion_start(ptr, EXCLUSION_HIP_HOST);
+    }
+    return rc;
+}
+
+static int custom_hipHostFree(void* ptr) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_HIP_HOST_FREE);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*))replacement->original)(ptr);
+    } else {
+        if (!original_hipHostFree) {
+            resolve_original_safety_functions();
+        }
+        rc = original_hipHostFree ? original_hipHostFree(ptr) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        release_exclusion_start(ptr, EXCLUSION_HIP_HOST);
+    }
+    return rc;
+}
+
+static int custom_hipMallocManaged(void** ptr, size_t size, unsigned int flags) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_HIP_MALLOC_MANAGED);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void**, size_t, unsigned int))replacement->original)(ptr, size, flags);
+    } else {
+        if (!original_hipMallocManaged) {
+            resolve_original_safety_functions();
+        }
+        rc = original_hipMallocManaged ?
+            original_hipMallocManaged(ptr, size, flags) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0 && ptr && *ptr) {
+        note_exclusion(*ptr, size, EXCLUSION_HIP_MANAGED, *ptr);
+    }
+    return rc;
+}
+
+static int custom_hipFree(void* ptr) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_HIP_FREE);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*))replacement->original)(ptr);
+    } else {
+        if (!original_hipFree) {
+            resolve_original_safety_functions();
+        }
+        rc = original_hipFree ? original_hipFree(ptr) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        release_exclusion_start(ptr, EXCLUSION_HIP_MANAGED);
+    }
+    return rc;
+}
+
+static int custom_MPI_Alloc_mem(intptr_t size, void* info, void* baseptr) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_MPI_ALLOC_MEM);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(intptr_t, void*, void*))replacement->original)(size, info, baseptr);
+    } else {
+        if (!original_MPI_Alloc_mem) {
+            resolve_original_safety_functions();
+        }
+        rc = original_MPI_Alloc_mem ?
+            original_MPI_Alloc_mem(size, info, baseptr) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0 && baseptr && size > 0) {
+        void* allocated = *(void**)baseptr;
+        if (allocated) {
+            note_exclusion(allocated, (size_t)size, EXCLUSION_MPI, allocated);
+        }
+    }
+    return rc;
+}
+
+static int custom_MPI_Free_mem(void* base) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_MPI_FREE_MEM);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*))replacement->original)(base);
+    } else {
+        if (!original_MPI_Free_mem) {
+            resolve_original_safety_functions();
+        }
+        rc = original_MPI_Free_mem ? original_MPI_Free_mem(base) : missing_runtime_status();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0) {
+        release_exclusion_start(base, EXCLUSION_MPI);
+    }
+    return rc;
+}
+
+static void* custom_ibv_reg_mr(void* pd, void* addr, size_t length, int access) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_IBV_REG_MR);
+    int saved_hook_depth = in_mai_hook;
+    void* mr;
+
+    in_mai_hook++;
+    if (replacement) {
+        mr = ((void* (*)(void*, void*, size_t, int))replacement->original)(pd, addr,
+                                                                           length, access);
+    } else {
+        if (!original_ibv_reg_mr) {
+            resolve_original_safety_functions();
+        }
+        mr = original_ibv_reg_mr ? original_ibv_reg_mr(pd, addr, length, access) : NULL;
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (mr && runtime_configured && addr && length > 0) {
+        int saved_internal_depth = in_mai_hook;
+        in_mai_hook++;
+        pthread_mutex_lock(&runtime_lock);
+        add_exclusion_range_locked(addr, length, EXCLUSION_RDMA, mr);
+        remember_registration_locked(mr, addr, length, EXCLUSION_RDMA);
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_internal_depth;
+    }
+    return mr;
+}
+
+static void* custom_ibv_reg_mr_iova(void* pd, void* addr, size_t length, uint64_t iova,
+                                    int access) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_IBV_REG_MR_IOVA);
+    int saved_hook_depth = in_mai_hook;
+    void* mr;
+
+    in_mai_hook++;
+    if (replacement) {
+        mr = ((void* (*)(void*, void*, size_t, uint64_t, int))replacement->original)(pd,
+                                                                                    addr,
+                                                                                    length,
+                                                                                    iova,
+                                                                                    access);
+    } else {
+        if (!original_ibv_reg_mr_iova) {
+            resolve_original_safety_functions();
+        }
+        mr = original_ibv_reg_mr_iova ?
+            original_ibv_reg_mr_iova(pd, addr, length, iova, access) : NULL;
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (mr && runtime_configured && addr && length > 0) {
+        int saved_internal_depth = in_mai_hook;
+        in_mai_hook++;
+        pthread_mutex_lock(&runtime_lock);
+        add_exclusion_range_locked(addr, length, EXCLUSION_RDMA, mr);
+        remember_registration_locked(mr, addr, length, EXCLUSION_RDMA);
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_internal_depth;
+    }
+    return mr;
+}
+
+static int custom_ibv_dereg_mr(void* mr) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_IBV_DEREG_MR);
+    int saved_hook_depth = in_mai_hook;
+    int rc;
+
+    in_mai_hook++;
+    if (replacement) {
+        rc = ((int (*)(void*))replacement->original)(mr);
+    } else {
+        if (!original_ibv_dereg_mr) {
+            resolve_original_safety_functions();
+        }
+        rc = original_ibv_dereg_mr ? original_ibv_dereg_mr(mr) : missing_status_symbol();
+    }
+    in_mai_hook = saved_hook_depth;
+
+    if (rc == 0 && runtime_configured && mr) {
+        int saved_internal_depth = in_mai_hook;
+        in_mai_hook++;
+        pthread_mutex_lock(&runtime_lock);
+        RegistrationRecord* record = take_registration_locked(mr, EXCLUSION_RDMA);
+        remove_exclusion_token_locked(mr, EXCLUSION_RDMA);
+        meta_free(record);
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_internal_depth;
+    }
+    return rc;
+}
+
 static void* frida_malloc(size_t size) {
     NOTE_FRIDA_ALLOCATOR_PATH();
     return custom_malloc(size);
@@ -2685,6 +3939,79 @@ static size_t frida_malloc_usable_size(void* ptr) {
     return custom_malloc_usable_size(ptr);
 }
 
+static int frida_cudaHostAlloc(void** ptr, size_t size, unsigned int flags) {
+    return custom_cudaHostAlloc(ptr, size, flags);
+}
+
+static int frida_cudaMallocHost(void** ptr, size_t size) {
+    return custom_cudaMallocHost(ptr, size);
+}
+
+static int frida_cudaHostRegister(void* ptr, size_t size, unsigned int flags) {
+    return custom_cudaHostRegister(ptr, size, flags);
+}
+
+static int frida_cudaHostUnregister(void* ptr) {
+    return custom_cudaHostUnregister(ptr);
+}
+
+static int frida_cudaFreeHost(void* ptr) {
+    return custom_cudaFreeHost(ptr);
+}
+
+static int frida_cudaMallocManaged(void** ptr, size_t size, unsigned int flags) {
+    return custom_cudaMallocManaged(ptr, size, flags);
+}
+
+static int frida_cudaFree(void* ptr) {
+    return custom_cudaFree(ptr);
+}
+
+static int frida_hipHostMalloc(void** ptr, size_t size, unsigned int flags) {
+    return custom_hipHostMalloc(ptr, size, flags);
+}
+
+static int frida_hipHostRegister(void* ptr, size_t size, unsigned int flags) {
+    return custom_hipHostRegister(ptr, size, flags);
+}
+
+static int frida_hipHostUnregister(void* ptr) {
+    return custom_hipHostUnregister(ptr);
+}
+
+static int frida_hipHostFree(void* ptr) {
+    return custom_hipHostFree(ptr);
+}
+
+static int frida_hipMallocManaged(void** ptr, size_t size, unsigned int flags) {
+    return custom_hipMallocManaged(ptr, size, flags);
+}
+
+static int frida_hipFree(void* ptr) {
+    return custom_hipFree(ptr);
+}
+
+static int frida_MPI_Alloc_mem(intptr_t size, void* info, void* baseptr) {
+    return custom_MPI_Alloc_mem(size, info, baseptr);
+}
+
+static int frida_MPI_Free_mem(void* base) {
+    return custom_MPI_Free_mem(base);
+}
+
+static void* frida_ibv_reg_mr(void* pd, void* addr, size_t length, int access) {
+    return custom_ibv_reg_mr(pd, addr, length, access);
+}
+
+static void* frida_ibv_reg_mr_iova(void* pd, void* addr, size_t length, uint64_t iova,
+                                   int access) {
+    return custom_ibv_reg_mr_iova(pd, addr, length, iova, access);
+}
+
+static int frida_ibv_dereg_mr(void* mr) {
+    return custom_ibv_dereg_mr(mr);
+}
+
 typedef struct {
     HookKind kind;
     const char* symbol;
@@ -2702,6 +4029,24 @@ static const DynamicHookSpec dynamic_hook_specs[] = {
     { HOOK_VALLOC, "valloc", (gpointer)frida_valloc },
     { HOOK_PVALLOC, "pvalloc", (gpointer)frida_pvalloc },
     { HOOK_MALLOC_USABLE_SIZE, "malloc_usable_size", (gpointer)frida_malloc_usable_size },
+    { HOOK_CUDA_HOST_ALLOC, "cudaHostAlloc", (gpointer)frida_cudaHostAlloc },
+    { HOOK_CUDA_MALLOC_HOST, "cudaMallocHost", (gpointer)frida_cudaMallocHost },
+    { HOOK_CUDA_HOST_REGISTER, "cudaHostRegister", (gpointer)frida_cudaHostRegister },
+    { HOOK_CUDA_HOST_UNREGISTER, "cudaHostUnregister", (gpointer)frida_cudaHostUnregister },
+    { HOOK_CUDA_FREE_HOST, "cudaFreeHost", (gpointer)frida_cudaFreeHost },
+    { HOOK_CUDA_MALLOC_MANAGED, "cudaMallocManaged", (gpointer)frida_cudaMallocManaged },
+    { HOOK_CUDA_FREE, "cudaFree", (gpointer)frida_cudaFree },
+    { HOOK_HIP_HOST_MALLOC, "hipHostMalloc", (gpointer)frida_hipHostMalloc },
+    { HOOK_HIP_HOST_REGISTER, "hipHostRegister", (gpointer)frida_hipHostRegister },
+    { HOOK_HIP_HOST_UNREGISTER, "hipHostUnregister", (gpointer)frida_hipHostUnregister },
+    { HOOK_HIP_HOST_FREE, "hipHostFree", (gpointer)frida_hipHostFree },
+    { HOOK_HIP_MALLOC_MANAGED, "hipMallocManaged", (gpointer)frida_hipMallocManaged },
+    { HOOK_HIP_FREE, "hipFree", (gpointer)frida_hipFree },
+    { HOOK_MPI_ALLOC_MEM, "MPI_Alloc_mem", (gpointer)frida_MPI_Alloc_mem },
+    { HOOK_MPI_FREE_MEM, "MPI_Free_mem", (gpointer)frida_MPI_Free_mem },
+    { HOOK_IBV_REG_MR, "ibv_reg_mr", (gpointer)frida_ibv_reg_mr },
+    { HOOK_IBV_REG_MR_IOVA, "ibv_reg_mr_iova", (gpointer)frida_ibv_reg_mr_iova },
+    { HOOK_IBV_DEREG_MR, "ibv_dereg_mr", (gpointer)frida_ibv_dereg_mr },
 };
 
 static int hook_address_is_known(gpointer address) {
@@ -2736,7 +4081,53 @@ static int hook_address_is_known(gpointer address) {
         address == munmap_addr ||
         address == mremap_addr ||
         address == brk_addr ||
-        address == sbrk_addr) {
+        address == sbrk_addr ||
+        address == mlock_addr ||
+        address == (gpointer)mlock ||
+        address == mlock2_addr ||
+        address == (gpointer)mlock2 ||
+        address == mlockall_addr ||
+        address == (gpointer)mlockall ||
+        address == munlock_addr ||
+        address == (gpointer)munlock ||
+        address == munlockall_addr ||
+        address == (gpointer)munlockall ||
+        address == cuda_host_alloc_addr ||
+        address == (gpointer)cudaHostAlloc ||
+        address == cuda_malloc_host_addr ||
+        address == (gpointer)cudaMallocHost ||
+        address == cuda_host_register_addr ||
+        address == (gpointer)cudaHostRegister ||
+        address == cuda_host_unregister_addr ||
+        address == (gpointer)cudaHostUnregister ||
+        address == cuda_free_host_addr ||
+        address == (gpointer)cudaFreeHost ||
+        address == cuda_malloc_managed_addr ||
+        address == (gpointer)cudaMallocManaged ||
+        address == cuda_free_addr ||
+        address == (gpointer)cudaFree ||
+        address == hip_host_malloc_addr ||
+        address == (gpointer)hipHostMalloc ||
+        address == hip_host_register_addr ||
+        address == (gpointer)hipHostRegister ||
+        address == hip_host_unregister_addr ||
+        address == (gpointer)hipHostUnregister ||
+        address == hip_host_free_addr ||
+        address == (gpointer)hipHostFree ||
+        address == hip_malloc_managed_addr ||
+        address == (gpointer)hipMallocManaged ||
+        address == hip_free_addr ||
+        address == (gpointer)hipFree ||
+        address == mpi_alloc_mem_addr ||
+        address == (gpointer)MPI_Alloc_mem ||
+        address == mpi_free_mem_addr ||
+        address == (gpointer)MPI_Free_mem ||
+        address == ibv_reg_mr_addr ||
+        address == (gpointer)ibv_reg_mr ||
+        address == ibv_reg_mr_iova_addr ||
+        address == (gpointer)ibv_reg_mr_iova ||
+        address == ibv_dereg_mr_addr ||
+        address == (gpointer)ibv_dereg_mr) {
         return 1;
     }
 
@@ -2766,6 +4157,10 @@ static int should_patch_libc_allocator_symbols(void) {
     void* default_malloc = dlsym(RTLD_DEFAULT, "malloc");
     direct_allocator_interposition = default_malloc == (void*)malloc;
     return !direct_allocator_interposition;
+}
+
+static int is_safety_hook_kind(HookKind kind) {
+    return kind >= HOOK_MLOCK;
 }
 
 static DynamicHandleRecord* find_dynamic_handle(void* handle) {
@@ -2890,6 +4285,12 @@ static int replace_dynamic_symbol(void* handle, gpointer address, const DynamicH
     replacement->next = dynamic_replacements;
     dynamic_replacements = replacement;
     atomic_store_explicit(&dynamic_replacements_active, 1, memory_order_relaxed);
+
+    if (is_safety_hook_kind(spec->kind)) {
+        pthread_mutex_lock(&runtime_lock);
+        stats_snapshot.safety_hook_patches++;
+        pthread_mutex_unlock(&runtime_lock);
+    }
 
     if (verbose_logging) {
         fprintf(stderr, "MAI: hooked dlopened %s at %p\n", spec->symbol, address);
@@ -3051,6 +4452,29 @@ static void revert_replacements(void) {
     if (mremap_replaced) gum_interceptor_revert(malloc_interceptor, mremap_addr);
     if (brk_replaced) gum_interceptor_revert(malloc_interceptor, brk_addr);
     if (sbrk_replaced) gum_interceptor_revert(malloc_interceptor, sbrk_addr);
+    if (mlock_replaced) gum_interceptor_revert(malloc_interceptor, mlock_addr);
+    if (mlock2_replaced) gum_interceptor_revert(malloc_interceptor, mlock2_addr);
+    if (mlockall_replaced) gum_interceptor_revert(malloc_interceptor, mlockall_addr);
+    if (munlock_replaced) gum_interceptor_revert(malloc_interceptor, munlock_addr);
+    if (munlockall_replaced) gum_interceptor_revert(malloc_interceptor, munlockall_addr);
+    if (cuda_host_alloc_replaced) gum_interceptor_revert(malloc_interceptor, cuda_host_alloc_addr);
+    if (cuda_malloc_host_replaced) gum_interceptor_revert(malloc_interceptor, cuda_malloc_host_addr);
+    if (cuda_host_register_replaced) gum_interceptor_revert(malloc_interceptor, cuda_host_register_addr);
+    if (cuda_host_unregister_replaced) gum_interceptor_revert(malloc_interceptor, cuda_host_unregister_addr);
+    if (cuda_free_host_replaced) gum_interceptor_revert(malloc_interceptor, cuda_free_host_addr);
+    if (cuda_malloc_managed_replaced) gum_interceptor_revert(malloc_interceptor, cuda_malloc_managed_addr);
+    if (cuda_free_replaced) gum_interceptor_revert(malloc_interceptor, cuda_free_addr);
+    if (hip_host_malloc_replaced) gum_interceptor_revert(malloc_interceptor, hip_host_malloc_addr);
+    if (hip_host_register_replaced) gum_interceptor_revert(malloc_interceptor, hip_host_register_addr);
+    if (hip_host_unregister_replaced) gum_interceptor_revert(malloc_interceptor, hip_host_unregister_addr);
+    if (hip_host_free_replaced) gum_interceptor_revert(malloc_interceptor, hip_host_free_addr);
+    if (hip_malloc_managed_replaced) gum_interceptor_revert(malloc_interceptor, hip_malloc_managed_addr);
+    if (hip_free_replaced) gum_interceptor_revert(malloc_interceptor, hip_free_addr);
+    if (mpi_alloc_mem_replaced) gum_interceptor_revert(malloc_interceptor, mpi_alloc_mem_addr);
+    if (mpi_free_mem_replaced) gum_interceptor_revert(malloc_interceptor, mpi_free_mem_addr);
+    if (ibv_reg_mr_replaced) gum_interceptor_revert(malloc_interceptor, ibv_reg_mr_addr);
+    if (ibv_reg_mr_iova_replaced) gum_interceptor_revert(malloc_interceptor, ibv_reg_mr_iova_addr);
+    if (ibv_dereg_mr_replaced) gum_interceptor_revert(malloc_interceptor, ibv_dereg_mr_addr);
 
     gum_interceptor_end_transaction(malloc_interceptor);
 
@@ -3084,6 +4508,29 @@ static void revert_replacements(void) {
     mremap_replaced = 0;
     brk_replaced = 0;
     sbrk_replaced = 0;
+    mlock_replaced = 0;
+    mlock2_replaced = 0;
+    mlockall_replaced = 0;
+    munlock_replaced = 0;
+    munlockall_replaced = 0;
+    cuda_host_alloc_replaced = 0;
+    cuda_malloc_host_replaced = 0;
+    cuda_host_register_replaced = 0;
+    cuda_host_unregister_replaced = 0;
+    cuda_free_host_replaced = 0;
+    cuda_malloc_managed_replaced = 0;
+    cuda_free_replaced = 0;
+    hip_host_malloc_replaced = 0;
+    hip_host_register_replaced = 0;
+    hip_host_unregister_replaced = 0;
+    hip_host_free_replaced = 0;
+    hip_malloc_managed_replaced = 0;
+    hip_free_replaced = 0;
+    mpi_alloc_mem_replaced = 0;
+    mpi_free_mem_replaced = 0;
+    ibv_reg_mr_replaced = 0;
+    ibv_reg_mr_iova_replaced = 0;
+    ibv_dereg_mr_replaced = 0;
 }
 
 int malloc_interceptor_attach(void) {
@@ -3123,6 +4570,7 @@ int malloc_interceptor_attach(void) {
     }
 
     resolve_original_allocators();
+    resolve_original_safety_functions();
     int patch_libc_allocators = should_patch_libc_allocator_symbols();
 
     malloc_addr = (void*)original_malloc;
@@ -3143,6 +4591,29 @@ int malloc_interceptor_attach(void) {
     mremap_addr = (void*)mremap;
     brk_addr = (void*)brk;
     sbrk_addr = (void*)sbrk;
+    mlock_addr = (void*)original_mlock;
+    mlock2_addr = (void*)original_mlock2;
+    mlockall_addr = (void*)original_mlockall;
+    munlock_addr = (void*)original_munlock;
+    munlockall_addr = (void*)original_munlockall;
+    cuda_host_alloc_addr = (void*)original_cudaHostAlloc;
+    cuda_malloc_host_addr = (void*)original_cudaMallocHost;
+    cuda_host_register_addr = (void*)original_cudaHostRegister;
+    cuda_host_unregister_addr = (void*)original_cudaHostUnregister;
+    cuda_free_host_addr = (void*)original_cudaFreeHost;
+    cuda_malloc_managed_addr = (void*)original_cudaMallocManaged;
+    cuda_free_addr = (void*)original_cudaFree;
+    hip_host_malloc_addr = (void*)original_hipHostMalloc;
+    hip_host_register_addr = (void*)original_hipHostRegister;
+    hip_host_unregister_addr = (void*)original_hipHostUnregister;
+    hip_host_free_addr = (void*)original_hipHostFree;
+    hip_malloc_managed_addr = (void*)original_hipMallocManaged;
+    hip_free_addr = (void*)original_hipFree;
+    mpi_alloc_mem_addr = (void*)original_MPI_Alloc_mem;
+    mpi_free_mem_addr = (void*)original_MPI_Free_mem;
+    ibv_reg_mr_addr = (void*)original_ibv_reg_mr;
+    ibv_reg_mr_iova_addr = (void*)original_ibv_reg_mr_iova;
+    ibv_dereg_mr_addr = (void*)original_ibv_dereg_mr;
 
     gum_interceptor_begin_transaction(malloc_interceptor);
 
@@ -3187,7 +4658,6 @@ int malloc_interceptor_attach(void) {
                            (gpointer*)&original_brk, &brk_replaced, "brk");
     failed |= replace_fast(sbrk_addr, (gpointer)custom_sbrk,
                            (gpointer*)&original_sbrk, &sbrk_replaced, "sbrk");
-
     gum_interceptor_end_transaction(malloc_interceptor);
 
     if (failed) {
@@ -3217,6 +4687,30 @@ int malloc_interceptor_attach(void) {
         (size_t)valloc_replaced +
         (size_t)pvalloc_replaced +
         (size_t)malloc_usable_size_replaced;
+    stats_snapshot.safety_hook_patches =
+        (size_t)mlock_replaced +
+        (size_t)mlock2_replaced +
+        (size_t)mlockall_replaced +
+        (size_t)munlock_replaced +
+        (size_t)munlockall_replaced +
+        (size_t)cuda_host_alloc_replaced +
+        (size_t)cuda_malloc_host_replaced +
+        (size_t)cuda_host_register_replaced +
+        (size_t)cuda_host_unregister_replaced +
+        (size_t)cuda_free_host_replaced +
+        (size_t)cuda_malloc_managed_replaced +
+        (size_t)cuda_free_replaced +
+        (size_t)hip_host_malloc_replaced +
+        (size_t)hip_host_register_replaced +
+        (size_t)hip_host_unregister_replaced +
+        (size_t)hip_host_free_replaced +
+        (size_t)hip_malloc_managed_replaced +
+        (size_t)hip_free_replaced +
+        (size_t)mpi_alloc_mem_replaced +
+        (size_t)mpi_free_mem_replaced +
+        (size_t)ibv_reg_mr_replaced +
+        (size_t)ibv_reg_mr_iova_replaced +
+        (size_t)ibv_dereg_mr_replaced;
     if (verbose_logging) {
         fprintf(stderr,
                 "MAI: enabled path=%s threshold=%zu arena_size=%zu reclaim=%d "

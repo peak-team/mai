@@ -61,6 +61,13 @@ typedef struct {
     size_t allocator_libc_patches;
     size_t allocator_preload_calls;
     size_t allocator_frida_calls;
+    size_t excluded_ranges;
+    size_t excluded_bytes;
+    size_t exclusion_events;
+    size_t exclusion_release_events;
+    size_t reclaim_skipped_excluded;
+    size_t reclaim_skipped_excluded_bytes;
+    size_t safety_hook_patches;
 } MaiStats;
 
 #ifdef __cplusplus

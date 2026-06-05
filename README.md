@@ -33,6 +33,10 @@ diagnostics, profiling, and sampled hotness support:
 - Optional live-allocation hotness sampling uses `mincore()` on bounded samples
   of MAI-managed pages. This reports resident-page estimates, not exact access
   frequency.
+- Successful pinning/registration calls for visible `mlock`, CUDA/HIP host
+  memory, CUDA/HIP managed memory, MPI allocated memory, and libibverbs memory
+  regions are tracked as excluded ranges. Excluded ranges are not selected for
+  MAI reclaim.
 - `dlopen`/`dlmopen` are monitored so newly loaded shared objects, including
   Python extension modules, get a best-effort allocator hook refresh.
   This is mainly for DSOs that introduce their own exported allocator entry
@@ -74,6 +78,29 @@ MAI also hooks the following functions for diagnostics only:
 - `brk`
 - `sbrk`
 
+MAI hooks the following APIs for safety/exclusion tracking. The `mlock` family
+is exposed through normal `LD_PRELOAD` symbol interposition. CUDA/HIP, MPI, and
+libibverbs APIs are also included in MAI's best-effort `dlopen` refresh for
+newly loaded DSOs that define their own exported runtime entry points:
+
+- `mlock`, `mlock2`, `mlockall`, `munlock`, `munlockall`
+- CUDA host and managed memory APIs: `cudaHostAlloc`, `cudaMallocHost`,
+  `cudaHostRegister`, `cudaHostUnregister`, `cudaFreeHost`,
+  `cudaMallocManaged`, `cudaFree`
+- HIP host and managed memory APIs: `hipHostMalloc`, `hipHostRegister`,
+  `hipHostUnregister`, `hipHostFree`, `hipMallocManaged`, `hipFree`
+- MPI memory APIs: `MPI_Alloc_mem`, `MPI_Free_mem`
+- libibverbs registration APIs: `ibv_reg_mr`, `ibv_reg_mr_iova`,
+  `ibv_dereg_mr`
+
+These hooks are conservative. MAI marks ranges only after the underlying API
+reports success. If a driver, MPI implementation, or RDMA stack rejects a
+MAI-managed file-backed buffer, MAI cannot force that registration to succeed
+or migrate the existing allocation into libc heap memory. Once a range is
+marked excluded, MAI will skip it during manual and target-RSS reclaim.
+Successful `mlockall(MCL_FUTURE)` also prevents future large allocations from
+being routed into MAI arenas until `munlockall()` succeeds.
+
 ## Non-Goals And Exclusions
 
 MAI cannot make arbitrary programs survive all memory pressure. It helps only
@@ -86,9 +113,8 @@ MAI does not currently manage:
 - executable mappings
 - thread-local storage
 - signal stacks
-- `mlock`ed memory
-- MPI/RDMA registered buffers
-- GPU allocations or pinned host memory
+- `mlock`ed, MPI/RDMA registered, GPU, or pinned host ranges beyond marking
+  visible successful registrations as excluded from reclaim
 - allocator metadata pages
 - arbitrary stripped static binaries
 - hidden or private allocator entry points in newly loaded modules
@@ -141,7 +167,9 @@ for tests and troubleshooting; leave it disabled for performance measurements.
 `MAI_STATS=1` prints a shutdown summary and enables pass-through allocation
 byte/count counters. Managed allocation counters are always maintained, but
 small pass-through allocation counters are disabled by default to keep the
-common below-threshold path lightweight.
+common below-threshold path lightweight. The stats summary also reports
+excluded range counts/bytes, exclusion mark/release events, skipped reclaim
+counts for excluded ranges, and safety hook patch counts.
 
 `MAI_RECLAIM_POLICY` may be:
 
@@ -201,6 +229,7 @@ LD_PRELOAD=/path/to/libmai.so \
 
 ## Development Direction
 
-The next major direction is adding explicit exclusion hooks for pinned,
-`mlock`ed, MPI/RDMA, and GPU memory, plus richer optional runtime-specific
-extensions where they do not compromise the core allocator model.
+The next major direction is richer optional runtime-specific extensions where
+they do not compromise the core allocator model, including better reporting for
+which library or call site caused an exclusion and broader coverage of runtime
+APIs that privately pin or register user buffers.

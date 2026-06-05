@@ -36,6 +36,13 @@ program mai_fortran_runtime_test
         integer(c_size_t) :: allocator_libc_patches
         integer(c_size_t) :: allocator_preload_calls
         integer(c_size_t) :: allocator_frida_calls
+        integer(c_size_t) :: excluded_ranges
+        integer(c_size_t) :: excluded_bytes
+        integer(c_size_t) :: exclusion_events
+        integer(c_size_t) :: exclusion_release_events
+        integer(c_size_t) :: reclaim_skipped_excluded
+        integer(c_size_t) :: reclaim_skipped_excluded_bytes
+        integer(c_size_t) :: safety_hook_patches
     end type mai_stats
 
     interface

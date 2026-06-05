@@ -20,10 +20,20 @@ typedef int (*sample_hotness_fn)(void);
 typedef void* (*plugin_alloc_fn)(size_t);
 typedef size_t (*plugin_usable_fn)(void*);
 typedef void (*plugin_free_fn)(void*);
+typedef int (*plugin_register_fn)(void*, size_t);
+typedef int (*plugin_unregister_fn)(void*);
+typedef int (*plugin_alloc_out_fn)(size_t, void**);
+typedef int (*plugin_free_status_fn)(void*);
+typedef int (*plugin_rdma_register_fn)(void*, size_t, void**);
 
 static int fail(const char* message) {
     fprintf(stderr, "%s\n", message);
     return 1;
+}
+
+static int skip(const char* message) {
+    fprintf(stderr, "%s\n", message);
+    return 77;
 }
 
 static int has_prefix(const char* value, const char* prefix) {
@@ -76,6 +86,12 @@ static int stats_show_managed_free(const MaiStats* before, const MaiStats* after
                                    const MaiStats* after_free, size_t size) {
     return after_free->managed_frees > before->managed_frees &&
            after_alloc->live_managed_bytes >= after_free->live_managed_bytes + size;
+}
+
+static int stats_show_exclusion(const MaiStats* before, const MaiStats* after, size_t size) {
+    return after->excluded_ranges > before->excluded_ranges &&
+           after->exclusion_events > before->exclusion_events &&
+           after->excluded_bytes >= before->excluded_bytes + size;
 }
 
 static int mode_disabled(void) {
@@ -154,6 +170,19 @@ static int mode_preload_symbols(void) {
         "calloc",
         "realloc",
         "malloc_usable_size",
+        "mlock",
+        "mlock2",
+        "mlockall",
+        "munlock",
+        "munlockall",
+        "cudaHostRegister",
+        "cudaHostUnregister",
+        "cudaHostAlloc",
+        "cudaFreeHost",
+        "MPI_Alloc_mem",
+        "MPI_Free_mem",
+        "ibv_reg_mr",
+        "ibv_dereg_mr",
         NULL
     };
 
@@ -647,6 +676,10 @@ static int mode_reclaim(void) {
     return 0;
 }
 
+static int mode_mlock_exclusion(void) {
+    return skip("real mlock syscall test is environment-dependent; preload_symbols covers exported mlock wrappers");
+}
+
 static int mode_target_rss(void) {
     MaiStats before;
     MaiStats after;
@@ -991,6 +1024,250 @@ static int mode_dlopen_local_allocator(void) {
     return 0;
 }
 
+static int mode_dlopen_exclusions(void) {
+    const char* plugin_path = getenv("MAI_TEST_EXCLUSION_PLUGIN");
+    if (!plugin_path || plugin_path[0] == '\0') {
+        return fail("MAI_TEST_EXCLUSION_PLUGIN is not set");
+    }
+
+    reclaim_all_fn reclaim_all = (reclaim_all_fn)dlsym(RTLD_DEFAULT, "mai_reclaim_all");
+    if (!reclaim_all) {
+        return fail("mai_reclaim_all is unavailable");
+    }
+
+    void* handle = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        fprintf(stderr, "%s\n", dlerror());
+        return fail("dlopen exclusion plugin failed");
+    }
+
+    plugin_register_fn cuda_register = NULL;
+    plugin_unregister_fn cuda_unregister = NULL;
+    plugin_alloc_out_fn cuda_alloc = NULL;
+    plugin_free_status_fn cuda_free = NULL;
+    plugin_rdma_register_fn rdma_register = NULL;
+    plugin_free_status_fn rdma_deregister = NULL;
+    plugin_alloc_out_fn mpi_alloc = NULL;
+    plugin_free_status_fn mpi_free = NULL;
+
+    *(void**)(&cuda_register) = dlsym(handle, "mai_exclusion_plugin_cuda_register");
+    *(void**)(&cuda_unregister) = dlsym(handle, "mai_exclusion_plugin_cuda_unregister");
+    *(void**)(&cuda_alloc) = dlsym(handle, "mai_exclusion_plugin_cuda_alloc");
+    *(void**)(&cuda_free) = dlsym(handle, "mai_exclusion_plugin_cuda_free");
+    *(void**)(&rdma_register) = dlsym(handle, "mai_exclusion_plugin_rdma_register");
+    *(void**)(&rdma_deregister) = dlsym(handle, "mai_exclusion_plugin_rdma_deregister");
+    *(void**)(&mpi_alloc) = dlsym(handle, "mai_exclusion_plugin_mpi_alloc");
+    *(void**)(&mpi_free) = dlsym(handle, "mai_exclusion_plugin_mpi_free");
+    if (!cuda_register || !cuda_unregister || !cuda_alloc || !cuda_free ||
+        !rdma_register || !rdma_deregister || !mpi_alloc || !mpi_free) {
+        dlclose(handle);
+        return fail("dlsym exclusion plugin functions failed");
+    }
+
+    const size_t size = 8192;
+    MaiStats before;
+    MaiStats after_alloc;
+    MaiStats after_cuda_register;
+    MaiStats after_cuda_reclaim;
+    MaiStats after_cuda_unregister;
+    MaiStats after_rdma_register;
+    MaiStats after_rdma_deregister;
+    MaiStats after_cuda_alloc;
+    MaiStats after_cuda_free;
+    MaiStats after_mpi_alloc;
+    MaiStats after_mpi_free;
+
+    if (load_stats(&before) != 0) {
+        dlclose(handle);
+        return fail("mai_get_stats failed before dlopen exclusion test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        dlclose(handle);
+        return fail("dlopen exclusion managed allocation failed");
+    }
+    memset(ptr, 0x55, size);
+
+    if (load_stats(&after_alloc) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after exclusion allocation");
+    }
+    if (!stats_show_managed_alloc(&before, &after_alloc, size)) {
+        free(ptr);
+        dlclose(handle);
+        return fail("exclusion test allocation was not MAI-managed");
+    }
+
+    if (cuda_register(ptr, size) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin cudaHostRegister failed");
+    }
+    if (load_stats(&after_cuda_register) != 0) {
+        cuda_unregister(ptr);
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after CUDA register");
+    }
+    if (!stats_show_exclusion(&after_alloc, &after_cuda_register, size)) {
+        cuda_unregister(ptr);
+        free(ptr);
+        dlclose(handle);
+        return fail("dlopen CUDA register did not mark exclusion");
+    }
+
+    if (reclaim_all() != 0) {
+        cuda_unregister(ptr);
+        free(ptr);
+        dlclose(handle);
+        return fail("reclaim failed after CUDA register exclusion");
+    }
+    if (load_stats(&after_cuda_reclaim) != 0) {
+        cuda_unregister(ptr);
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after CUDA excluded reclaim");
+    }
+    if (after_cuda_reclaim.reclaimed_bytes != after_cuda_register.reclaimed_bytes ||
+        after_cuda_reclaim.reclaim_skipped_excluded <=
+            after_cuda_register.reclaim_skipped_excluded) {
+        cuda_unregister(ptr);
+        free(ptr);
+        dlclose(handle);
+        return fail("reclaim did not skip CUDA-registered managed range");
+    }
+
+    if (cuda_unregister(ptr) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin cudaHostUnregister failed");
+    }
+    if (load_stats(&after_cuda_unregister) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after CUDA unregister");
+    }
+    if (after_cuda_unregister.exclusion_release_events <=
+            after_cuda_register.exclusion_release_events ||
+        after_cuda_unregister.excluded_ranges >= after_cuda_register.excluded_ranges) {
+        free(ptr);
+        dlclose(handle);
+        return fail("CUDA unregister did not release exclusion");
+    }
+
+    void* mr = NULL;
+    if (rdma_register(ptr, size, &mr) != 0 || !mr) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin ibv_reg_mr failed");
+    }
+    if (load_stats(&after_rdma_register) != 0) {
+        rdma_deregister(mr);
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after RDMA register");
+    }
+    if (!stats_show_exclusion(&after_cuda_unregister, &after_rdma_register, size)) {
+        rdma_deregister(mr);
+        free(ptr);
+        dlclose(handle);
+        return fail("dlopen RDMA register did not mark exclusion");
+    }
+    if (rdma_deregister(mr) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin ibv_dereg_mr failed");
+    }
+    if (load_stats(&after_rdma_deregister) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after RDMA deregister");
+    }
+    if (after_rdma_deregister.exclusion_release_events <=
+            after_rdma_register.exclusion_release_events) {
+        free(ptr);
+        dlclose(handle);
+        return fail("RDMA deregister did not release exclusion");
+    }
+
+    void* pinned = NULL;
+    if (cuda_alloc(size, &pinned) != 0 || !pinned) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin cudaHostAlloc failed");
+    }
+    if (load_stats(&after_cuda_alloc) != 0) {
+        cuda_free(pinned);
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after CUDA host alloc");
+    }
+    if (!stats_show_exclusion(&after_rdma_deregister, &after_cuda_alloc, size) ||
+        after_cuda_alloc.managed_allocations != after_rdma_deregister.managed_allocations) {
+        cuda_free(pinned);
+        free(ptr);
+        dlclose(handle);
+        return fail("CUDA host allocation was not marked excluded pass-through memory");
+    }
+    if (cuda_free(pinned) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin cudaFreeHost failed");
+    }
+    if (load_stats(&after_cuda_free) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after CUDA host free");
+    }
+    if (after_cuda_free.exclusion_release_events <=
+            after_cuda_alloc.exclusion_release_events) {
+        free(ptr);
+        dlclose(handle);
+        return fail("CUDA host free did not release exclusion");
+    }
+
+    void* mpi_ptr = NULL;
+    if (mpi_alloc(size, &mpi_ptr) != 0 || !mpi_ptr) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin MPI_Alloc_mem failed");
+    }
+    if (load_stats(&after_mpi_alloc) != 0) {
+        mpi_free(mpi_ptr);
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after MPI alloc");
+    }
+    if (!stats_show_exclusion(&after_cuda_free, &after_mpi_alloc, size) ||
+        after_mpi_alloc.managed_allocations != after_cuda_free.managed_allocations) {
+        mpi_free(mpi_ptr);
+        free(ptr);
+        dlclose(handle);
+        return fail("MPI_Alloc_mem was not marked excluded pass-through memory");
+    }
+    if (mpi_free(mpi_ptr) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin MPI_Free_mem failed");
+    }
+    if (load_stats(&after_mpi_free) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after MPI free");
+    }
+    if (after_mpi_free.exclusion_release_events <= after_mpi_alloc.exclusion_release_events) {
+        free(ptr);
+        dlclose(handle);
+        return fail("MPI_Free_mem did not release exclusion");
+    }
+
+    free(ptr);
+    dlclose(handle);
+    return 0;
+}
+
 static int mode_backing_failure(void) {
     MaiStats before;
     MaiStats after;
@@ -1085,6 +1362,7 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "thread") == 0) return mode_thread();
     if (strcmp(argv[1], "thread_small_stats") == 0) return mode_thread_small_stats();
     if (strcmp(argv[1], "reclaim") == 0) return mode_reclaim();
+    if (strcmp(argv[1], "mlock_exclusion") == 0) return mode_mlock_exclusion();
     if (strcmp(argv[1], "target_rss") == 0) return mode_target_rss();
     if (strcmp(argv[1], "profile") == 0) return mode_profile();
     if (strcmp(argv[1], "hotness") == 0) return mode_hotness();
@@ -1092,6 +1370,7 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "diagnostics") == 0) return mode_diagnostics();
     if (strcmp(argv[1], "dlopen") == 0) return mode_dlopen();
     if (strcmp(argv[1], "dlopen_local_allocator") == 0) return mode_dlopen_local_allocator();
+    if (strcmp(argv[1], "dlopen_exclusions") == 0) return mode_dlopen_exclusions();
     if (strcmp(argv[1], "backing_failure") == 0) return mode_backing_failure();
     if (strcmp(argv[1], "unprivileged") == 0) return mode_unprivileged();
 
