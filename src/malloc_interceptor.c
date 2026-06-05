@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <malloc.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
 #include "frida-gum.h"
 
@@ -21,6 +22,7 @@
 #define MAI_FILE_TEMPLATE "mai-arena-XXXXXX"
 #define MAI_DEFAULT_HOTNESS_SAMPLE_PAGES 64
 #define MAI_MAX_HOTNESS_SAMPLE_PAGES 4096
+#define MAI_PASS_THROUGH_FLUSH_INTERVAL 1024
 
 typedef enum {
     RECLAIM_NONE = 0,
@@ -55,6 +57,7 @@ typedef struct ArenaSegment ArenaSegment;
 typedef struct ArenaBlock ArenaBlock;
 typedef struct AllocationRecord AllocationRecord;
 typedef struct ProfileRecord ProfileRecord;
+typedef struct PassThroughCounter PassThroughCounter;
 typedef struct DynamicReplacement DynamicReplacement;
 typedef struct DynamicHandleRecord DynamicHandleRecord;
 
@@ -106,6 +109,15 @@ struct ProfileRecord {
     ProfileRecord* next;
 };
 
+struct PassThroughCounter {
+    size_t pending_allocations;
+    size_t pending_bytes;
+    atomic_size_t flushed_allocations;
+    atomic_size_t flushed_bytes;
+    size_t generation;
+    PassThroughCounter* next;
+};
+
 struct DynamicReplacement {
     HookKind kind;
     const char* symbol;
@@ -125,6 +137,7 @@ static GumInterceptor* malloc_interceptor = NULL;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread int in_mai_hook = 0;
+static __thread PassThroughCounter* tls_pass_through_counter = NULL;
 
 static int runtime_enabled = 0;
 static int runtime_configured = 0;
@@ -151,11 +164,19 @@ static AllocationRecord* allocation_buckets[MAI_TRACK_BUCKETS];
 static AllocationRecord* live_head = NULL;
 static ProfileRecord* profile_buckets[MAI_PROFILE_BUCKETS];
 static DynamicReplacement* dynamic_replacements = NULL;
+static atomic_int dynamic_replacements_active;
 static DynamicHandleRecord* dynamic_handles = NULL;
 static size_t allocation_sequence = 0;
 static size_t reclaim_epoch = 0;
 
 static MaiStats stats_snapshot = {0};
+static PassThroughCounter* pass_through_counters = NULL;
+static pthread_key_t pass_through_counter_key;
+static pthread_once_t pass_through_counter_key_once = PTHREAD_ONCE_INIT;
+static int pass_through_counter_key_ready = 0;
+static size_t pass_through_counter_generation = 1;
+static atomic_size_t pass_through_fallback_allocations_counter;
+static atomic_size_t pass_through_fallback_bytes_counter;
 
 static gpointer malloc_addr = NULL;
 static gpointer free_addr = NULL;
@@ -580,6 +601,10 @@ static int sample_all_hotness_locked(void) {
 }
 
 static DynamicReplacement* current_dynamic_replacement(HookKind kind) {
+    if (!atomic_load_explicit(&dynamic_replacements_active, memory_order_relaxed)) {
+        return NULL;
+    }
+
     GumInvocationContext* context = gum_interceptor_get_current_invocation();
     if (!context) {
         return NULL;
@@ -718,15 +743,118 @@ static void stats_reduce_live_managed(size_t size) {
     }
 }
 
+static void flush_pass_through_counter(PassThroughCounter* counter) {
+    if (!counter) {
+        return;
+    }
+
+    size_t allocations = counter->pending_allocations;
+    size_t bytes = counter->pending_bytes;
+    if (allocations == 0 && bytes == 0) {
+        return;
+    }
+
+    counter->pending_allocations = 0;
+    counter->pending_bytes = 0;
+    atomic_fetch_add_explicit(&counter->flushed_allocations, allocations,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&counter->flushed_bytes, bytes, memory_order_relaxed);
+}
+
+static void pass_through_counter_destructor(void* value) {
+    PassThroughCounter* counter = (PassThroughCounter*)value;
+    flush_pass_through_counter(counter);
+    if (tls_pass_through_counter == counter) {
+        tls_pass_through_counter = NULL;
+    }
+}
+
+static void init_pass_through_counter_key(void) {
+    if (pthread_key_create(&pass_through_counter_key,
+                           pass_through_counter_destructor) == 0) {
+        pass_through_counter_key_ready = 1;
+    }
+}
+
+static PassThroughCounter* get_pass_through_counter(void) {
+    if (tls_pass_through_counter &&
+        tls_pass_through_counter->generation == pass_through_counter_generation) {
+        return tls_pass_through_counter;
+    }
+
+    (void)pthread_once(&pass_through_counter_key_once, init_pass_through_counter_key);
+
+    PassThroughCounter* counter = meta_alloc(sizeof(*counter));
+    if (!counter) {
+        return NULL;
+    }
+    memset(counter, 0, sizeof(*counter));
+    atomic_init(&counter->flushed_allocations, 0);
+    atomic_init(&counter->flushed_bytes, 0);
+    counter->generation = pass_through_counter_generation;
+
+    pthread_mutex_lock(&runtime_lock);
+    counter->next = pass_through_counters;
+    pass_through_counters = counter;
+    pthread_mutex_unlock(&runtime_lock);
+
+    tls_pass_through_counter = counter;
+    if (pass_through_counter_key_ready) {
+        (void)pthread_setspecific(pass_through_counter_key, counter);
+    }
+
+    return counter;
+}
+
+static void flush_current_pass_through_counter(void) {
+    if (tls_pass_through_counter &&
+        tls_pass_through_counter->generation == pass_through_counter_generation) {
+        flush_pass_through_counter(tls_pass_through_counter);
+    }
+}
+
+static void snapshot_pass_through_counters_locked(size_t* allocations, size_t* bytes) {
+    size_t total_allocations = atomic_load_explicit(
+        &pass_through_fallback_allocations_counter, memory_order_relaxed);
+    size_t total_bytes = atomic_load_explicit(
+        &pass_through_fallback_bytes_counter, memory_order_relaxed);
+
+    for (PassThroughCounter* counter = pass_through_counters;
+         counter;
+         counter = counter->next) {
+        total_allocations += atomic_load_explicit(&counter->flushed_allocations,
+                                                  memory_order_relaxed);
+        total_bytes += atomic_load_explicit(&counter->flushed_bytes,
+                                            memory_order_relaxed);
+    }
+
+    *allocations = total_allocations;
+    *bytes = total_bytes;
+}
+
 static void stats_note_pass_through(size_t size) {
-    stats_snapshot.pass_through_allocations++;
-    stats_snapshot.pass_through_bytes_total += size;
+    PassThroughCounter* counter = get_pass_through_counter();
+    if (!counter) {
+        atomic_fetch_add_explicit(&pass_through_fallback_allocations_counter, 1,
+                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&pass_through_fallback_bytes_counter, size,
+                                  memory_order_relaxed);
+        return;
+    }
+
+    if (counter->pending_bytes > SIZE_MAX - size) {
+        flush_pass_through_counter(counter);
+    }
+    counter->pending_allocations++;
+    counter->pending_bytes += size;
+
+    if (counter->pending_allocations >= MAI_PASS_THROUGH_FLUSH_INTERVAL) {
+        flush_pass_through_counter(counter);
+    }
 }
 
 static void stats_note_pass_through_threadsafe(size_t size) {
-    pthread_mutex_lock(&runtime_lock);
     stats_note_pass_through(size);
-    pthread_mutex_unlock(&runtime_lock);
 }
 
 static void insert_record_locked(AllocationRecord* record) {
@@ -1274,9 +1402,13 @@ int mai_get_stats(MaiStats* out) {
         return -1;
     }
 
+    flush_current_pass_through_counter();
+
     pthread_mutex_lock(&runtime_lock);
     update_observed_rss_locked();
     *out = stats_snapshot;
+    snapshot_pass_through_counters_locked(&out->pass_through_allocations,
+                                          &out->pass_through_bytes_total);
     out->enabled = runtime_enabled;
     out->configured = runtime_configured;
     out->config_error = runtime_config_error;
@@ -1477,10 +1609,20 @@ static int configure_runtime(void) {
     hotness_sample_pages = MAI_DEFAULT_HOTNESS_SAMPLE_PAGES;
 
     memset(&stats_snapshot, 0, sizeof(stats_snapshot));
+    pass_through_counter_generation++;
+    if (pass_through_counter_generation == 0) {
+        pass_through_counter_generation = 1;
+    }
+    pass_through_counters = NULL;
+    atomic_store_explicit(&pass_through_fallback_allocations_counter, 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(&pass_through_fallback_bytes_counter, 0, memory_order_relaxed);
     memset(allocation_buckets, 0, sizeof(allocation_buckets));
     memset(profile_buckets, 0, sizeof(profile_buckets));
     live_head = NULL;
     arena_segments = NULL;
+    dynamic_replacements = NULL;
+    atomic_store_explicit(&dynamic_replacements_active, 0, memory_order_relaxed);
     next_segment_id = 0;
     allocation_sequence = 0;
     reclaim_epoch = 0;
@@ -2015,6 +2157,10 @@ static void revert_dynamic_replacements_for_handle(void* handle) {
         meta_free(replacement);
         replacement = next;
     }
+
+    if (!dynamic_replacements) {
+        atomic_store_explicit(&dynamic_replacements_active, 0, memory_order_relaxed);
+    }
 }
 
 static int replace_dynamic_symbol(void* handle, gpointer address, const DynamicHookSpec* spec) {
@@ -2054,6 +2200,7 @@ static int replace_dynamic_symbol(void* handle, gpointer address, const DynamicH
 
     replacement->next = dynamic_replacements;
     dynamic_replacements = replacement;
+    atomic_store_explicit(&dynamic_replacements_active, 1, memory_order_relaxed);
 
     if (verbose_logging) {
         fprintf(stderr, "MAI: hooked dlopened %s at %p\n", spec->symbol, address);
@@ -2223,6 +2370,7 @@ static void revert_replacements(void) {
         meta_free(dynamic_replacements);
         dynamic_replacements = next;
     }
+    atomic_store_explicit(&dynamic_replacements_active, 0, memory_order_relaxed);
     while (dynamic_handles) {
         DynamicHandleRecord* next = dynamic_handles->next;
         meta_free(dynamic_handles);

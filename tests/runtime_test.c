@@ -453,6 +453,61 @@ static int mode_thread(void) {
     return 0;
 }
 
+static void* small_thread_worker(void* arg) {
+    uintptr_t id = (uintptr_t)arg;
+    for (int i = 0; i < 256; i++) {
+        unsigned char* ptr = malloc(128);
+        if (!ptr) {
+            return (void*)1;
+        }
+        ptr[0] = (unsigned char)id;
+        ptr[127] = (unsigned char)i;
+        if (ptr[0] != (unsigned char)id || ptr[127] != (unsigned char)i) {
+            free(ptr);
+            return (void*)1;
+        }
+        free(ptr);
+    }
+    return NULL;
+}
+
+static int mode_thread_small_stats(void) {
+    enum { thread_count = 4, allocations_per_thread = 256 };
+    pthread_t threads[thread_count];
+    MaiStats before;
+    MaiStats after;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before small thread stats test");
+    }
+
+    for (uintptr_t i = 0; i < thread_count; i++) {
+        if (pthread_create(&threads[i], NULL, small_thread_worker, (void*)i) != 0) {
+            return fail("pthread_create failed in small thread stats test");
+        }
+    }
+
+    for (int i = 0; i < thread_count; i++) {
+        void* result = NULL;
+        if (pthread_join(threads[i], &result) != 0 || result != NULL) {
+            return fail("small thread allocation stress failed");
+        }
+    }
+
+    if (load_stats(&after) != 0) {
+        return fail("mai_get_stats failed after small thread stats test");
+    }
+    if (after.managed_allocations != before.managed_allocations) {
+        return fail("small threaded allocations were routed to MAI arena");
+    }
+    if (after.pass_through_allocations <
+        before.pass_through_allocations + thread_count * allocations_per_thread) {
+        return fail("small threaded pass-through counters were not flushed");
+    }
+
+    return 0;
+}
+
 static int mode_reclaim(void) {
     reclaim_all_fn reclaim_all = (reclaim_all_fn)dlsym(RTLD_DEFAULT, "mai_reclaim_all");
     if (!reclaim_all) {
@@ -918,6 +973,7 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "alignment") == 0) return mode_alignment();
     if (strcmp(argv[1], "many") == 0) return mode_many();
     if (strcmp(argv[1], "thread") == 0) return mode_thread();
+    if (strcmp(argv[1], "thread_small_stats") == 0) return mode_thread_small_stats();
     if (strcmp(argv[1], "reclaim") == 0) return mode_reclaim();
     if (strcmp(argv[1], "target_rss") == 0) return mode_target_rss();
     if (strcmp(argv[1], "profile") == 0) return mode_profile();

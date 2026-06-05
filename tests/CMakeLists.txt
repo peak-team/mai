@@ -37,6 +37,10 @@ target_compile_features(mai_cxx_runtime_test PRIVATE cxx_std_17)
 target_include_directories(mai_cxx_runtime_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(mai_cxx_runtime_test PRIVATE mai ${DL_LIBRARY})
 
+add_executable(mai_benchmark benchmark_test.c)
+target_compile_features(mai_benchmark PRIVATE c_std_11)
+target_link_libraries(mai_benchmark PRIVATE Threads::Threads)
+
 function(add_mai_runtime_test name mode)
     add_test(
         NAME ${name}
@@ -58,6 +62,7 @@ add_mai_runtime_test(mai_realloc realloc)
 add_mai_runtime_test(mai_alignment alignment)
 add_mai_runtime_test(mai_many_allocations many)
 add_mai_runtime_test(mai_multithreaded thread)
+add_mai_runtime_test(mai_multithreaded_small_pass_through_stats thread_small_stats)
 add_mai_runtime_test(mai_mmap_brk_diagnostics diagnostics)
 
 add_test(
@@ -213,6 +218,21 @@ add_test(
 )
 
 add_test(
+    NAME mai_target_rss_policy_reclaim_all
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_TARGET_RSS=8K"
+        "MAI_RECLAIM_POLICY=donthneed"
+        "MAI_RECLAIM_SELECTION=all"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        target_rss
+)
+
+add_test(
     NAME mai_backing_file_creation_failure
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"
@@ -297,4 +317,39 @@ add_test(
         "LD_PRELOAD=$<TARGET_FILE:mai>"
         $<TARGET_FILE:mai_runtime_test>
         disabled
+)
+
+add_test(
+    NAME mai_invalid_reclaim_selection_disables
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_RECLAIM_SELECTION=invalid"
+        "MAI_STATS=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        disabled
+)
+
+add_test(
+    NAME mai_invalid_hotness_sample_disables
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_HOTNESS=1"
+        "MAI_HOTNESS_SAMPLE_PAGES=bad"
+        "MAI_STATS=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        disabled
+)
+
+add_test(
+    NAME mai_benchmark_smoke
+    COMMAND $<TARGET_FILE:mai_benchmark> single 1000 64
+)
+set_tests_properties(mai_benchmark_smoke PROPERTIES
+    PASS_REGULAR_EXPRESSION "mode=single .*ns_per_op="
 )
