@@ -7,8 +7,10 @@ infrequently.
 
 MAI does not rely on Linux swap, kernel modules, DAMON, cgroup privileges,
 userfaultfd paging, or site-wide installation. It is used with `LD_PRELOAD`
-for dynamically linked applications and uses Frida/Gum internally to patch
-allocator entry points.
+for dynamically linked applications. Normal allocator interception uses direct
+`LD_PRELOAD` symbols; Frida/Gum remains available internally for diagnostics
+and best-effort patching of allocator entry points that appear outside normal
+preload resolution.
 
 ## Current Scope
 
@@ -27,16 +29,15 @@ diagnostics, profiling, and sampled hotness support:
 - Backing files are unlinked immediately after mapping to avoid stale files.
 - Basic stats, diagnostics counters, manual reclaim, and target-driven reclaim
   are available.
-- Allocation call-site profiling is available through the Frida/Gum allocation
-  hooks.
+- Allocation call-site profiling is available for MAI-managed allocations.
 - Optional live-allocation hotness sampling uses `mincore()` on bounded samples
   of MAI-managed pages. This reports resident-page estimates, not exact access
   frequency.
 - `dlopen`/`dlmopen` are monitored so newly loaded shared objects, including
   Python extension modules, get a best-effort allocator hook refresh.
   This is mainly for DSOs that introduce their own exported allocator entry
-  points after MAI starts. Normal calls from a dlopened DSO into the already
-  patched libc allocator do not need a dlopen refresh.
+  points after MAI starts. Normal calls from a dlopened DSO into preloaded MAI
+  symbols do not need a dlopen refresh.
 
 MAI currently intercepts:
 
@@ -97,6 +98,7 @@ MAI_HOTNESS=1
 MAI_HOTNESS_SAMPLE_PAGES=64
 MAI_VERBOSE=1
 MAI_STATS=1
+MAI_ALLOCATOR_HOOKS=auto
 ```
 
 `MAI_PATH` is preferred. If it is not set, MAI attempts to discover a scratch
@@ -107,6 +109,17 @@ MAI disables itself.
 
 Supported size suffixes for `MAI_THRESHOLD` and `MAI_ARENA_SIZE` are `K`, `M`,
 `G`, and `T`.
+
+`MAI_ALLOCATOR_HOOKS` controls whether MAI also patches libc allocator entry
+points with Frida/Gum:
+
+- `auto` or unset uses direct `LD_PRELOAD` allocator symbols when available
+  and skips redundant libc allocator patches.
+- `preload` forces direct preload mode and skips libc allocator patches.
+- `frida` additionally patches libc allocator symbols with Frida/Gum.
+
+Even in preload mode, MAI still uses Frida/Gum for `dlopen` refreshes and
+diagnostic hooks.
 
 `MAI_RECLAIM_POLICY` may be:
 

@@ -56,6 +56,7 @@ function(add_mai_runtime_test name mode)
 endfunction()
 
 add_mai_runtime_test(mai_small_pass_through small)
+add_mai_runtime_test(mai_direct_preload_symbols preload_symbols)
 add_mai_runtime_test(mai_large_managed large)
 add_mai_runtime_test(mai_calloc calloc)
 add_mai_runtime_test(mai_realloc realloc)

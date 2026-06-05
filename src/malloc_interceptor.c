@@ -138,6 +138,7 @@ static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread int in_mai_hook = 0;
 static __thread PassThroughCounter* tls_pass_through_counter = NULL;
+static __thread int resolving_original_allocators = 0;
 
 static int runtime_enabled = 0;
 static int runtime_configured = 0;
@@ -147,6 +148,7 @@ static int gum_initialized = 0;
 static int verbose_logging = 0;
 static int stats_logging = 0;
 static int cleanup_in_progress = 0;
+static int direct_allocator_interposition = 0;
 static char mai_path[PATH_MAX];
 static size_t page_size = 4096;
 static size_t threshold_bytes = MAI_DEFAULT_THRESHOLD;
@@ -168,6 +170,8 @@ static atomic_int dynamic_replacements_active;
 static DynamicHandleRecord* dynamic_handles = NULL;
 static size_t allocation_sequence = 0;
 static size_t reclaim_epoch = 0;
+static _Atomic(uintptr_t) managed_range_low;
+static _Atomic(uintptr_t) managed_range_high;
 
 static MaiStats stats_snapshot = {0};
 static PassThroughCounter* pass_through_counters = NULL;
@@ -234,6 +238,12 @@ static int (*original_munmap)(void* addr, size_t length) = NULL;
 static void* (*original_mremap)(void* old_address, size_t old_size, size_t new_size, int flags, ...) = NULL;
 static int (*original_brk)(void* addr) = NULL;
 static void* (*original_sbrk)(intptr_t increment) = NULL;
+
+extern void* __libc_malloc(size_t size) __attribute__((weak));
+extern void __libc_free(void* ptr) __attribute__((weak));
+extern void* __libc_calloc(size_t nmemb, size_t size) __attribute__((weak));
+extern void* __libc_realloc(void* ptr, size_t size) __attribute__((weak));
+extern void* __libc_memalign(size_t alignment, size_t size) __attribute__((weak));
 
 static void* custom_malloc(size_t size);
 static void custom_free(void* ptr);
@@ -600,6 +610,135 @@ static int sample_all_hotness_locked(void) {
     return rc;
 }
 
+static void resolve_original_allocators(void) {
+    if (resolving_original_allocators) {
+        return;
+    }
+
+    resolving_original_allocators = 1;
+    if (!original_malloc) {
+        original_malloc = (void* (*)(size_t))dlsym(RTLD_NEXT, "malloc");
+    }
+    if (!original_free) {
+        original_free = (void (*)(void*))dlsym(RTLD_NEXT, "free");
+    }
+    if (!original_calloc) {
+        original_calloc = (void* (*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
+    }
+    if (!original_realloc) {
+        original_realloc = (void* (*)(void*, size_t))dlsym(RTLD_NEXT, "realloc");
+    }
+    if (!original_aligned_alloc) {
+        original_aligned_alloc =
+            (void* (*)(size_t, size_t))dlsym(RTLD_NEXT, "aligned_alloc");
+    }
+    if (!original_posix_memalign) {
+        original_posix_memalign =
+            (int (*)(void**, size_t, size_t))dlsym(RTLD_NEXT, "posix_memalign");
+    }
+    if (!original_memalign) {
+        original_memalign = (void* (*)(size_t, size_t))dlsym(RTLD_NEXT, "memalign");
+    }
+    if (!original_valloc) {
+        original_valloc = (void* (*)(size_t))dlsym(RTLD_NEXT, "valloc");
+    }
+    if (!original_pvalloc) {
+        original_pvalloc = (void* (*)(size_t))dlsym(RTLD_NEXT, "pvalloc");
+    }
+    if (!original_malloc_usable_size) {
+        original_malloc_usable_size =
+            (size_t (*)(void*))dlsym(RTLD_NEXT, "malloc_usable_size");
+    }
+    resolving_original_allocators = 0;
+}
+
+static void* fallback_malloc(size_t size) {
+    if (__libc_malloc) {
+        return __libc_malloc(size);
+    }
+    void* ptr = mmap(NULL, align_up_size(max_size(size, 1), page_size),
+                     PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return ptr == MAP_FAILED ? NULL : ptr;
+}
+
+static void fallback_free(void* ptr) {
+    if (__libc_free) {
+        __libc_free(ptr);
+    }
+}
+
+static void* fallback_calloc(size_t nmemb, size_t size) {
+    if (__libc_calloc) {
+        return __libc_calloc(nmemb, size);
+    }
+
+    size_t total = 0;
+    if (mul_overflow(nmemb, size, &total) != 0) {
+        return NULL;
+    }
+    void* ptr = fallback_malloc(total);
+    if (ptr && ptr != MAP_FAILED) {
+        memset(ptr, 0, total);
+    }
+    return ptr == MAP_FAILED ? NULL : ptr;
+}
+
+static void* fallback_realloc(void* ptr, size_t size) {
+    if (__libc_realloc) {
+        return __libc_realloc(ptr, size);
+    }
+    if (!ptr) {
+        return fallback_malloc(size);
+    }
+    return NULL;
+}
+
+static void* fallback_memalign(size_t alignment, size_t size) {
+    if (__libc_memalign) {
+        return __libc_memalign(alignment, size);
+    }
+    return NULL;
+}
+
+static void* call_libc_malloc(size_t size) {
+    if (!original_malloc) {
+        resolve_original_allocators();
+    }
+    return original_malloc ? original_malloc(size) : fallback_malloc(size);
+}
+
+static void call_libc_free(void* ptr) {
+    if (!original_free) {
+        resolve_original_allocators();
+    }
+    if (original_free) {
+        original_free(ptr);
+    } else {
+        fallback_free(ptr);
+    }
+}
+
+static void* call_libc_calloc(size_t nmemb, size_t size) {
+    if (!original_calloc) {
+        resolve_original_allocators();
+    }
+    return original_calloc ? original_calloc(nmemb, size) : fallback_calloc(nmemb, size);
+}
+
+static void* call_libc_realloc(void* ptr, size_t size) {
+    if (!original_realloc) {
+        resolve_original_allocators();
+    }
+    return original_realloc ? original_realloc(ptr, size) : fallback_realloc(ptr, size);
+}
+
+static size_t call_libc_malloc_usable_size(void* ptr) {
+    if (!original_malloc_usable_size) {
+        resolve_original_allocators();
+    }
+    return original_malloc_usable_size ? original_malloc_usable_size(ptr) : 0;
+}
+
 static DynamicReplacement* current_dynamic_replacement(HookKind kind) {
     if (!atomic_load_explicit(&dynamic_replacements_active, memory_order_relaxed)) {
         return NULL;
@@ -624,7 +763,10 @@ static void* pass_through_malloc(size_t size) {
     if (replacement) {
         return ((void* (*)(size_t))replacement->original)(size);
     }
-    return original_malloc ? original_malloc(size) : malloc(size);
+    if (!original_malloc) {
+        resolve_original_allocators();
+    }
+    return original_malloc ? original_malloc(size) : fallback_malloc(size);
 }
 
 static void pass_through_free(void* ptr) {
@@ -636,7 +778,12 @@ static void pass_through_free(void* ptr) {
     if (original_free) {
         original_free(ptr);
     } else {
-        free(ptr);
+        resolve_original_allocators();
+        if (original_free) {
+            original_free(ptr);
+        } else {
+            fallback_free(ptr);
+        }
     }
 }
 
@@ -645,7 +792,10 @@ static void* pass_through_calloc(size_t nmemb, size_t size) {
     if (replacement) {
         return ((void* (*)(size_t, size_t))replacement->original)(nmemb, size);
     }
-    return original_calloc ? original_calloc(nmemb, size) : calloc(nmemb, size);
+    if (!original_calloc) {
+        resolve_original_allocators();
+    }
+    return original_calloc ? original_calloc(nmemb, size) : fallback_calloc(nmemb, size);
 }
 
 static void* pass_through_realloc(void* ptr, size_t size) {
@@ -653,7 +803,10 @@ static void* pass_through_realloc(void* ptr, size_t size) {
     if (replacement) {
         return ((void* (*)(void*, size_t))replacement->original)(ptr, size);
     }
-    return original_realloc ? original_realloc(ptr, size) : realloc(ptr, size);
+    if (!original_realloc) {
+        resolve_original_allocators();
+    }
+    return original_realloc ? original_realloc(ptr, size) : fallback_realloc(ptr, size);
 }
 
 static void* pass_through_aligned_alloc(size_t alignment, size_t size) {
@@ -661,7 +814,17 @@ static void* pass_through_aligned_alloc(size_t alignment, size_t size) {
     if (replacement) {
         return ((void* (*)(size_t, size_t))replacement->original)(alignment, size);
     }
-    return original_aligned_alloc ? original_aligned_alloc(alignment, size) : aligned_alloc(alignment, size);
+    if (!original_aligned_alloc) {
+        resolve_original_allocators();
+    }
+    if (original_aligned_alloc) {
+        return original_aligned_alloc(alignment, size);
+    }
+    if (size % alignment != 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    return fallback_memalign(alignment, size);
 }
 
 static int pass_through_posix_memalign(void** memptr, size_t alignment, size_t size) {
@@ -669,9 +832,18 @@ static int pass_through_posix_memalign(void** memptr, size_t alignment, size_t s
     if (replacement) {
         return ((int (*)(void**, size_t, size_t))replacement->original)(memptr, alignment, size);
     }
-    return original_posix_memalign ?
-        original_posix_memalign(memptr, alignment, size) :
-        posix_memalign(memptr, alignment, size);
+    if (!original_posix_memalign) {
+        resolve_original_allocators();
+    }
+    if (original_posix_memalign) {
+        return original_posix_memalign(memptr, alignment, size);
+    }
+    void* ptr = fallback_memalign(alignment, size);
+    if (!ptr) {
+        return ENOMEM;
+    }
+    *memptr = ptr;
+    return 0;
 }
 
 static void* pass_through_memalign(size_t alignment, size_t size) {
@@ -679,7 +851,11 @@ static void* pass_through_memalign(size_t alignment, size_t size) {
     if (replacement) {
         return ((void* (*)(size_t, size_t))replacement->original)(alignment, size);
     }
-    return original_memalign ? original_memalign(alignment, size) : memalign(alignment, size);
+    if (!original_memalign) {
+        resolve_original_allocators();
+    }
+    return original_memalign ? original_memalign(alignment, size) :
+        fallback_memalign(alignment, size);
 }
 
 static size_t pass_through_malloc_usable_size(void* ptr) {
@@ -687,7 +863,10 @@ static size_t pass_through_malloc_usable_size(void* ptr) {
     if (replacement) {
         return ((size_t (*)(void*))replacement->original)(ptr);
     }
-    return original_malloc_usable_size ? original_malloc_usable_size(ptr) : malloc_usable_size(ptr);
+    if (!original_malloc_usable_size) {
+        resolve_original_allocators();
+    }
+    return original_malloc_usable_size ? original_malloc_usable_size(ptr) : 0;
 }
 
 static void note_profile_locked(void* call_site, size_t size) {
@@ -857,6 +1036,22 @@ static void stats_note_pass_through_threadsafe(size_t size) {
     stats_note_pass_through(size);
 }
 
+static void* fast_pass_through_malloc(size_t size) {
+    void* ptr = pass_through_malloc(size);
+    if (ptr) {
+        stats_note_pass_through_threadsafe(size);
+    }
+    return ptr;
+}
+
+static void* fast_pass_through_calloc(size_t nmemb, size_t size, size_t total) {
+    void* ptr = pass_through_calloc(nmemb, size);
+    if (ptr) {
+        stats_note_pass_through_threadsafe(total);
+    }
+    return ptr;
+}
+
 static void insert_record_locked(AllocationRecord* record) {
     size_t bucket = hash_ptr(record->user_ptr);
 
@@ -917,6 +1112,39 @@ static AllocationRecord* take_record_locked(void* ptr) {
     }
 
     return NULL;
+}
+
+static void update_managed_range(void* base, size_t length) {
+    uintptr_t start = (uintptr_t)base;
+    uintptr_t end = start + length;
+    if (end < start) {
+        end = UINTPTR_MAX;
+    }
+
+    uintptr_t low = atomic_load_explicit(&managed_range_low, memory_order_relaxed);
+    while ((low == 0 || start < low) &&
+           !atomic_compare_exchange_weak_explicit(&managed_range_low, &low, start,
+                                                  memory_order_release,
+                                                  memory_order_relaxed)) {
+    }
+
+    uintptr_t high = atomic_load_explicit(&managed_range_high, memory_order_relaxed);
+    while (end > high &&
+           !atomic_compare_exchange_weak_explicit(&managed_range_high, &high, end,
+                                                  memory_order_release,
+                                                  memory_order_relaxed)) {
+    }
+}
+
+static int pointer_may_be_managed(void* ptr) {
+    uintptr_t value = (uintptr_t)ptr;
+    uintptr_t high = atomic_load_explicit(&managed_range_high, memory_order_acquire);
+    if (high == 0) {
+        return 0;
+    }
+    uintptr_t low = atomic_load_explicit(&managed_range_low, memory_order_acquire);
+
+    return low != 0 && value >= low && value < high;
 }
 
 static int build_arena_template(char* buffer, size_t buffer_size) {
@@ -999,6 +1227,7 @@ static ArenaSegment* create_segment_locked(size_t minimum_size) {
 
     stats_snapshot.arena_segments++;
     stats_snapshot.arena_bytes += length;
+    update_managed_range(base, length);
 
     return segment;
 }
@@ -1623,6 +1852,8 @@ static int configure_runtime(void) {
     arena_segments = NULL;
     dynamic_replacements = NULL;
     atomic_store_explicit(&dynamic_replacements_active, 0, memory_order_relaxed);
+    atomic_store_explicit(&managed_range_low, 0, memory_order_relaxed);
+    atomic_store_explicit(&managed_range_high, 0, memory_order_relaxed);
     next_segment_id = 0;
     allocation_sequence = 0;
     reclaim_epoch = 0;
@@ -1701,19 +1932,26 @@ static int configure_runtime(void) {
     return 0;
 }
 
-static void* custom_malloc(size_t size) {
+static void* custom_malloc_from_site(size_t size, void* call_site) {
     if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
         return pass_through_malloc(size);
     }
 
+    if (!should_manage(size)) {
+        return fast_pass_through_malloc(size);
+    }
+
     in_mai_hook++;
     int managed = 0;
-    void* ptr = allocate_by_policy(size, default_alignment(), 0, &managed,
-                                   __builtin_return_address(0));
+    void* ptr = allocate_by_policy(size, default_alignment(), 0, &managed, call_site);
     in_mai_hook--;
 
     (void)managed;
     return ptr;
+}
+
+static void* custom_malloc(size_t size) {
+    return custom_malloc_from_site(size, __builtin_return_address(0));
 }
 
 static void custom_free(void* ptr) {
@@ -1724,6 +1962,12 @@ static void custom_free(void* ptr) {
     }
 
     if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
+        pass_through_free(ptr);
+        errno = saved_errno;
+        return;
+    }
+
+    if (!pointer_may_be_managed(ptr)) {
         pass_through_free(ptr);
         errno = saved_errno;
         return;
@@ -1745,7 +1989,7 @@ static void custom_free(void* ptr) {
     errno = saved_errno;
 }
 
-static void* custom_calloc(size_t nmemb, size_t size) {
+static void* custom_calloc_from_site(size_t nmemb, size_t size, void* call_site) {
     size_t total;
 
     if (mul_overflow(nmemb, size, &total) != 0) {
@@ -1756,19 +2000,26 @@ static void* custom_calloc(size_t nmemb, size_t size) {
         return pass_through_calloc(nmemb, size);
     }
 
+    if (!should_manage(total)) {
+        return fast_pass_through_calloc(nmemb, size, total);
+    }
+
     in_mai_hook++;
     int managed = 0;
-    void* ptr = allocate_by_policy(total, default_alignment(), 1, &managed,
-                                   __builtin_return_address(0));
+    void* ptr = allocate_by_policy(total, default_alignment(), 1, &managed, call_site);
     in_mai_hook--;
 
     (void)managed;
     return ptr;
 }
 
-static void* custom_realloc(void* ptr, size_t size) {
+static void* custom_calloc(size_t nmemb, size_t size) {
+    return custom_calloc_from_site(nmemb, size, __builtin_return_address(0));
+}
+
+static void* custom_realloc_from_site(void* ptr, size_t size, void* call_site) {
     if (!ptr) {
-        return custom_malloc(size);
+        return custom_malloc_from_site(size, call_site);
     }
     if (size == 0) {
         custom_free(ptr);
@@ -1780,6 +2031,30 @@ static void* custom_realloc(void* ptr, size_t size) {
     }
 
     in_mai_hook++;
+
+    if (!pointer_may_be_managed(ptr)) {
+        if (should_manage(size)) {
+            size_t old_size = pass_through_malloc_usable_size(ptr);
+            int managed = 0;
+            void* new_ptr = allocate_by_policy(size, default_alignment(), 0, &managed,
+                                               call_site);
+            if (new_ptr) {
+                memcpy(new_ptr, ptr, old_size < size ? old_size : size);
+                pass_through_free(ptr);
+                in_mai_hook--;
+                return new_ptr;
+            }
+            in_mai_hook--;
+            return NULL;
+        }
+
+        void* result = pass_through_realloc(ptr, size);
+        if (result) {
+            stats_note_pass_through_threadsafe(size);
+        }
+        in_mai_hook--;
+        return result;
+    }
 
     pthread_mutex_lock(&runtime_lock);
     AllocationRecord* record = find_record_locked(ptr);
@@ -1798,7 +2073,7 @@ static void* custom_realloc(void* ptr, size_t size) {
     if (record) {
         int managed = 0;
         void* new_ptr = allocate_by_policy(size, default_alignment(), 0, &managed,
-                                           __builtin_return_address(0));
+                                           call_site);
         if (!new_ptr) {
             in_mai_hook--;
             return NULL;
@@ -1817,7 +2092,7 @@ static void* custom_realloc(void* ptr, size_t size) {
         size_t old_size = pass_through_malloc_usable_size(ptr);
         int managed = 0;
         void* new_ptr = allocate_by_policy(size, default_alignment(), 0, &managed,
-                                           __builtin_return_address(0));
+                                           call_site);
         if (new_ptr) {
             memcpy(new_ptr, ptr, old_size < size ? old_size : size);
             pass_through_free(ptr);
@@ -1837,7 +2112,11 @@ static void* custom_realloc(void* ptr, size_t size) {
     return result;
 }
 
-static void* custom_aligned_alloc(size_t alignment, size_t size) {
+static void* custom_realloc(void* ptr, size_t size) {
+    return custom_realloc_from_site(ptr, size, __builtin_return_address(0));
+}
+
+static void* custom_aligned_alloc_from_site(size_t alignment, size_t size, void* call_site) {
     if (in_mai_hook || cleanup_in_progress || !runtime_configured || !should_manage(size)) {
         void* ptr = pass_through_aligned_alloc(alignment, size);
         if (ptr && !in_mai_hook && !cleanup_in_progress && runtime_configured) {
@@ -1853,15 +2132,19 @@ static void* custom_aligned_alloc(size_t alignment, size_t size) {
 
     in_mai_hook++;
     int managed = 0;
-    void* ptr = allocate_by_policy(size, alignment, 0, &managed,
-                                   __builtin_return_address(0));
+    void* ptr = allocate_by_policy(size, alignment, 0, &managed, call_site);
     in_mai_hook--;
 
     (void)managed;
     return ptr;
 }
 
-static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
+static void* custom_aligned_alloc(size_t alignment, size_t size) {
+    return custom_aligned_alloc_from_site(alignment, size, __builtin_return_address(0));
+}
+
+static int custom_posix_memalign_from_site(void** memptr, size_t alignment, size_t size,
+                                           void* call_site) {
     if (!memptr || !is_power_of_two(alignment) || alignment % sizeof(void*) != 0) {
         return EINVAL;
     }
@@ -1874,8 +2157,7 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
 
     if (should_manage(size)) {
         pthread_mutex_lock(&runtime_lock);
-        AllocationRecord* record = managed_alloc_locked(size, alignment,
-                                                        __builtin_return_address(0));
+        AllocationRecord* record = managed_alloc_locked(size, alignment, call_site);
         if (record) {
             *memptr = record->user_ptr;
         }
@@ -1901,7 +2183,12 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
     return ret;
 }
 
-static void* custom_memalign(size_t alignment, size_t size) {
+static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
+    return custom_posix_memalign_from_site(memptr, alignment, size,
+                                           __builtin_return_address(0));
+}
+
+static void* custom_memalign_from_site(size_t alignment, size_t size, void* call_site) {
     if (in_mai_hook || cleanup_in_progress || !runtime_configured || !should_manage(size)) {
         void* ptr = pass_through_memalign(alignment, size);
         if (ptr && !in_mai_hook && !cleanup_in_progress && runtime_configured) {
@@ -1917,12 +2204,15 @@ static void* custom_memalign(size_t alignment, size_t size) {
 
     in_mai_hook++;
     int managed = 0;
-    void* ptr = allocate_by_policy(size, alignment, 0, &managed,
-                                   __builtin_return_address(0));
+    void* ptr = allocate_by_policy(size, alignment, 0, &managed, call_site);
     in_mai_hook--;
 
     (void)managed;
     return ptr;
+}
+
+static void* custom_memalign(size_t alignment, size_t size) {
+    return custom_memalign_from_site(alignment, size, __builtin_return_address(0));
 }
 
 static void* custom_valloc(size_t size) {
@@ -1942,6 +2232,10 @@ static size_t custom_malloc_usable_size(void* ptr) {
         return pass_through_malloc_usable_size(ptr);
     }
 
+    if (!pointer_may_be_managed(ptr)) {
+        return pass_through_malloc_usable_size(ptr);
+    }
+
     pthread_mutex_lock(&runtime_lock);
     AllocationRecord* record = find_record_locked(ptr);
     size_t usable_size = record ? record->user_size : 0;
@@ -1952,6 +2246,141 @@ static size_t custom_malloc_usable_size(void* ptr) {
     }
 
     return pass_through_malloc_usable_size(ptr);
+}
+
+__attribute__((visibility("default")))
+void* malloc(size_t size) {
+    if (resolving_original_allocators) {
+        return fallback_malloc(size);
+    }
+    if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
+        return call_libc_malloc(size);
+    }
+    if (!should_manage(size)) {
+        void* ptr = call_libc_malloc(size);
+        if (ptr) {
+            stats_note_pass_through_threadsafe(size);
+        }
+        return ptr;
+    }
+    return custom_malloc_from_site(size, __builtin_return_address(0));
+}
+
+__attribute__((visibility("default")))
+void free(void* ptr) {
+    if (resolving_original_allocators) {
+        fallback_free(ptr);
+        return;
+    }
+    if (!ptr) {
+        return;
+    }
+    if (in_mai_hook || cleanup_in_progress || !runtime_configured ||
+        !pointer_may_be_managed(ptr)) {
+        int saved_errno = errno;
+        call_libc_free(ptr);
+        errno = saved_errno;
+        return;
+    }
+    custom_free(ptr);
+}
+
+__attribute__((visibility("default")))
+void* calloc(size_t nmemb, size_t size) {
+    if (resolving_original_allocators) {
+        return fallback_calloc(nmemb, size);
+    }
+    size_t total = 0;
+    if (mul_overflow(nmemb, size, &total) != 0) {
+        return NULL;
+    }
+    if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
+        return call_libc_calloc(nmemb, size);
+    }
+    if (!should_manage(total)) {
+        void* ptr = call_libc_calloc(nmemb, size);
+        if (ptr) {
+            stats_note_pass_through_threadsafe(total);
+        }
+        return ptr;
+    }
+    return custom_calloc_from_site(nmemb, size, __builtin_return_address(0));
+}
+
+__attribute__((visibility("default")))
+void* realloc(void* ptr, size_t size) {
+    if (resolving_original_allocators) {
+        return fallback_realloc(ptr, size);
+    }
+    if (!ptr) {
+        return malloc(size);
+    }
+    if (size == 0) {
+        free(ptr);
+        return NULL;
+    }
+    if (in_mai_hook || cleanup_in_progress || !runtime_configured ||
+        (!pointer_may_be_managed(ptr) && !should_manage(size))) {
+        void* result = call_libc_realloc(ptr, size);
+        if (result && runtime_configured && !in_mai_hook && !cleanup_in_progress) {
+            stats_note_pass_through_threadsafe(size);
+        }
+        return result;
+    }
+    return custom_realloc_from_site(ptr, size, __builtin_return_address(0));
+}
+
+__attribute__((visibility("default")))
+void* aligned_alloc(size_t alignment, size_t size) {
+    if (resolving_original_allocators) {
+        return fallback_memalign(alignment, size);
+    }
+    return custom_aligned_alloc_from_site(alignment, size, __builtin_return_address(0));
+}
+
+__attribute__((visibility("default")))
+int posix_memalign(void** memptr, size_t alignment, size_t size) {
+    if (resolving_original_allocators) {
+        void* ptr = fallback_memalign(alignment, size);
+        if (!ptr) {
+            return ENOMEM;
+        }
+        *memptr = ptr;
+        return 0;
+    }
+    return custom_posix_memalign_from_site(memptr, alignment, size,
+                                           __builtin_return_address(0));
+}
+
+__attribute__((visibility("default")))
+void* memalign(size_t alignment, size_t size) {
+    if (resolving_original_allocators) {
+        return fallback_memalign(alignment, size);
+    }
+    return custom_memalign_from_site(alignment, size, __builtin_return_address(0));
+}
+
+__attribute__((visibility("default")))
+void* valloc(size_t size) {
+    return custom_memalign_from_site(page_size, size, __builtin_return_address(0));
+}
+
+__attribute__((visibility("default")))
+void* pvalloc(size_t size) {
+    size_t rounded = align_up_size(size, page_size);
+    if (rounded == 0) {
+        return NULL;
+    }
+    return custom_memalign_from_site(page_size, rounded, __builtin_return_address(0));
+}
+
+__attribute__((visibility("default")))
+size_t malloc_usable_size(void* ptr) {
+    if (!ptr || resolving_original_allocators || cleanup_in_progress ||
+        !runtime_configured || !pointer_may_be_managed(ptr)) {
+        return call_libc_malloc_usable_size(ptr);
+    }
+    return custom_malloc_usable_size(ptr);
 }
 
 void* mai_operator_new_allocate(size_t size) {
@@ -2048,15 +2477,25 @@ static int hook_address_is_known(gpointer address) {
     }
 
     if (address == malloc_addr ||
+        address == (gpointer)malloc ||
         address == free_addr ||
+        address == (gpointer)free ||
         address == calloc_addr ||
+        address == (gpointer)calloc ||
         address == realloc_addr ||
+        address == (gpointer)realloc ||
         address == aligned_alloc_addr ||
+        address == (gpointer)aligned_alloc ||
         address == posix_memalign_addr ||
+        address == (gpointer)posix_memalign ||
         address == memalign_addr ||
+        address == (gpointer)memalign ||
         address == valloc_addr ||
+        address == (gpointer)valloc ||
         address == pvalloc_addr ||
+        address == (gpointer)pvalloc ||
         address == malloc_usable_size_addr ||
+        address == (gpointer)malloc_usable_size ||
         address == dlopen_addr ||
         address == dlmopen_addr ||
         address == dlclose_addr ||
@@ -2077,6 +2516,23 @@ static int hook_address_is_known(gpointer address) {
     }
 
     return 0;
+}
+
+static int should_patch_libc_allocator_symbols(void) {
+    const char* mode = getenv("MAI_ALLOCATOR_HOOKS");
+
+    if (mode && strcmp(mode, "frida") == 0) {
+        direct_allocator_interposition = 0;
+        return 1;
+    }
+    if (mode && strcmp(mode, "preload") == 0) {
+        direct_allocator_interposition = 1;
+        return 0;
+    }
+
+    void* default_malloc = dlsym(RTLD_DEFAULT, "malloc");
+    direct_allocator_interposition = default_malloc == (void*)malloc;
+    return !direct_allocator_interposition;
 }
 
 static DynamicHandleRecord* find_dynamic_handle(void* handle) {
@@ -2433,16 +2889,19 @@ int malloc_interceptor_attach(void) {
         return -1;
     }
 
-    malloc_addr = (void*)malloc;
-    free_addr = (void*)free;
-    calloc_addr = (void*)calloc;
-    realloc_addr = (void*)realloc;
-    aligned_alloc_addr = (void*)aligned_alloc;
-    posix_memalign_addr = (void*)posix_memalign;
-    memalign_addr = (void*)memalign;
-    valloc_addr = (void*)valloc;
-    pvalloc_addr = (void*)pvalloc;
-    malloc_usable_size_addr = (void*)malloc_usable_size;
+    resolve_original_allocators();
+    int patch_libc_allocators = should_patch_libc_allocator_symbols();
+
+    malloc_addr = (void*)original_malloc;
+    free_addr = (void*)original_free;
+    calloc_addr = (void*)original_calloc;
+    realloc_addr = (void*)original_realloc;
+    aligned_alloc_addr = (void*)original_aligned_alloc;
+    posix_memalign_addr = (void*)original_posix_memalign;
+    memalign_addr = (void*)original_memalign;
+    valloc_addr = (void*)original_valloc;
+    pvalloc_addr = (void*)original_pvalloc;
+    malloc_usable_size_addr = (void*)original_malloc_usable_size;
     dlopen_addr = (void*)dlopen;
     dlmopen_addr = (void*)dlmopen;
     dlclose_addr = (void*)dlclose;
@@ -2454,29 +2913,31 @@ int malloc_interceptor_attach(void) {
 
     gum_interceptor_begin_transaction(malloc_interceptor);
 
-    failed |= replace_fast(malloc_addr, (gpointer)custom_malloc,
-                           (gpointer*)&original_malloc, &malloc_replaced, "malloc");
-    failed |= replace_fast(free_addr, (gpointer)custom_free,
-                           (gpointer*)&original_free, &free_replaced, "free");
-    failed |= replace_fast(calloc_addr, (gpointer)custom_calloc,
-                           (gpointer*)&original_calloc, &calloc_replaced, "calloc");
-    failed |= replace_fast(realloc_addr, (gpointer)custom_realloc,
-                           (gpointer*)&original_realloc, &realloc_replaced, "realloc");
-    failed |= replace_fast(aligned_alloc_addr, (gpointer)custom_aligned_alloc,
-                           (gpointer*)&original_aligned_alloc,
-                           &aligned_alloc_replaced, "aligned_alloc");
-    failed |= replace_regular(posix_memalign_addr, (gpointer)custom_posix_memalign,
-                              (gpointer*)&original_posix_memalign,
-                              &posix_memalign_replaced, "posix_memalign");
-    failed |= replace_fast(memalign_addr, (gpointer)custom_memalign,
-                           (gpointer*)&original_memalign, &memalign_replaced, "memalign");
-    failed |= replace_fast(valloc_addr, (gpointer)custom_valloc,
-                           (gpointer*)&original_valloc, &valloc_replaced, "valloc");
-    failed |= replace_fast(pvalloc_addr, (gpointer)custom_pvalloc,
-                           (gpointer*)&original_pvalloc, &pvalloc_replaced, "pvalloc");
-    failed |= replace_fast(malloc_usable_size_addr, (gpointer)custom_malloc_usable_size,
-                           (gpointer*)&original_malloc_usable_size,
-                           &malloc_usable_size_replaced, "malloc_usable_size");
+    if (patch_libc_allocators) {
+        failed |= replace_fast(malloc_addr, (gpointer)custom_malloc,
+                               (gpointer*)&original_malloc, &malloc_replaced, "malloc");
+        failed |= replace_fast(free_addr, (gpointer)custom_free,
+                               (gpointer*)&original_free, &free_replaced, "free");
+        failed |= replace_fast(calloc_addr, (gpointer)custom_calloc,
+                               (gpointer*)&original_calloc, &calloc_replaced, "calloc");
+        failed |= replace_fast(realloc_addr, (gpointer)custom_realloc,
+                               (gpointer*)&original_realloc, &realloc_replaced, "realloc");
+        failed |= replace_fast(aligned_alloc_addr, (gpointer)custom_aligned_alloc,
+                               (gpointer*)&original_aligned_alloc,
+                               &aligned_alloc_replaced, "aligned_alloc");
+        failed |= replace_regular(posix_memalign_addr, (gpointer)custom_posix_memalign,
+                                  (gpointer*)&original_posix_memalign,
+                                  &posix_memalign_replaced, "posix_memalign");
+        failed |= replace_fast(memalign_addr, (gpointer)custom_memalign,
+                               (gpointer*)&original_memalign, &memalign_replaced, "memalign");
+        failed |= replace_fast(valloc_addr, (gpointer)custom_valloc,
+                               (gpointer*)&original_valloc, &valloc_replaced, "valloc");
+        failed |= replace_fast(pvalloc_addr, (gpointer)custom_pvalloc,
+                               (gpointer*)&original_pvalloc, &pvalloc_replaced, "pvalloc");
+        failed |= replace_fast(malloc_usable_size_addr, (gpointer)custom_malloc_usable_size,
+                               (gpointer*)&original_malloc_usable_size,
+                               &malloc_usable_size_replaced, "malloc_usable_size");
+    }
     failed |= replace_fast(dlopen_addr, (gpointer)custom_dlopen,
                            (gpointer*)&original_dlopen, &dlopen_replaced, "dlopen");
     failed |= replace_fast(dlmopen_addr, (gpointer)custom_dlmopen,
@@ -2511,8 +2972,11 @@ int malloc_interceptor_attach(void) {
 
     hooks_attached = 1;
     if (verbose_logging) {
-        fprintf(stderr, "MAI: enabled path=%s threshold=%zu arena_size=%zu reclaim=%d\n",
-                mai_path, threshold_bytes, arena_size_bytes, reclaim_policy);
+        fprintf(stderr,
+                "MAI: enabled path=%s threshold=%zu arena_size=%zu reclaim=%d "
+                "allocator_hooks=%s\n",
+                mai_path, threshold_bytes, arena_size_bytes, reclaim_policy,
+                patch_libc_allocators ? "frida" : "preload");
     }
 
     pthread_mutex_unlock(&lifecycle_lock);

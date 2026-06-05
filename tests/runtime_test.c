@@ -120,6 +120,30 @@ static int mode_small(void) {
     return 0;
 }
 
+static int mode_preload_symbols(void) {
+    static const char* symbols[] = {
+        "malloc",
+        "free",
+        "calloc",
+        "realloc",
+        "malloc_usable_size",
+        NULL
+    };
+
+    for (size_t i = 0; symbols[i]; i++) {
+        void* symbol = dlsym(RTLD_DEFAULT, symbols[i]);
+        Dl_info info;
+        if (!symbol || dladdr(symbol, &info) == 0 || !info.dli_fname ||
+            !strstr(info.dli_fname, "libmai")) {
+            fprintf(stderr, "%s resolved to %s\n", symbols[i],
+                    info.dli_fname ? info.dli_fname : "?");
+            return fail("allocator symbol did not resolve to libmai preload wrapper");
+        }
+    }
+
+    return 0;
+}
+
 static int mode_large(void) {
     MaiStats before;
     MaiStats after_alloc;
@@ -967,6 +991,7 @@ int main(int argc, char** argv) {
 
     if (strcmp(argv[1], "disabled") == 0) return mode_disabled();
     if (strcmp(argv[1], "small") == 0) return mode_small();
+    if (strcmp(argv[1], "preload_symbols") == 0) return mode_preload_symbols();
     if (strcmp(argv[1], "large") == 0) return mode_large();
     if (strcmp(argv[1], "calloc") == 0) return mode_calloc();
     if (strcmp(argv[1], "realloc") == 0) return mode_realloc();
