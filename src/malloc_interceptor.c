@@ -33,6 +33,10 @@ typedef enum {
 } ReclaimSelection;
 
 typedef enum {
+    BACKEND_ARENA = 0
+} BackendType;
+
+typedef enum {
     HOOK_MALLOC = 0,
     HOOK_FREE,
     HOOK_CALLOC,
@@ -74,6 +78,7 @@ struct AllocationRecord {
     size_t user_size;
     size_t mapped_length;
     size_t alignment;
+    BackendType backend;
     void* call_site;
     size_t allocation_seq;
     size_t reclaim_epoch;
@@ -380,6 +385,58 @@ static size_t hash_profile_site(void* ptr) {
     value >>= 4;
     value ^= value >> 9;
     return (size_t)(value % MAI_PROFILE_BUCKETS);
+}
+
+static size_t sample_process_rss_bytes(void) {
+    char buffer[128];
+    int fd = open("/proc/self/statm", O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+        return 0;
+    }
+
+    ssize_t bytes_read = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (bytes_read <= 0) {
+        return 0;
+    }
+    buffer[bytes_read] = '\0';
+
+    char* cursor = buffer;
+    char* end = NULL;
+    (void)strtoull(cursor, &end, 10);
+    if (end == cursor) {
+        return 0;
+    }
+
+    cursor = end;
+    while (*cursor && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+
+    errno = 0;
+    unsigned long long resident_pages = strtoull(cursor, &end, 10);
+    if (errno != 0 || end == cursor || resident_pages == 0) {
+        return 0;
+    }
+    if (resident_pages > (unsigned long long)(SIZE_MAX / page_size)) {
+        return SIZE_MAX;
+    }
+
+    return (size_t)resident_pages * page_size;
+}
+
+static size_t update_observed_rss_locked(void) {
+    size_t rss = sample_process_rss_bytes();
+    if (rss == 0) {
+        return 0;
+    }
+
+    stats_snapshot.current_rss_bytes = rss;
+    if (rss > stats_snapshot.high_water_rss_bytes) {
+        stats_snapshot.high_water_rss_bytes = rss;
+    }
+
+    return rss;
 }
 
 static DynamicReplacement* current_dynamic_replacement(HookKind kind) {
@@ -700,7 +757,8 @@ static void insert_block_after(ArenaBlock* block, ArenaBlock* new_block) {
     block->next = new_block;
 }
 
-static AllocationRecord* carve_block_locked(ArenaBlock* block, size_t size, size_t alignment,
+static AllocationRecord* carve_block_locked(ArenaBlock* block, size_t user_size,
+                                            size_t block_size, size_t alignment,
                                             void* call_site) {
     uintptr_t segment_base = (uintptr_t)block->segment->base;
     uintptr_t block_start = segment_base + block->offset;
@@ -712,10 +770,10 @@ static AllocationRecord* carve_block_locked(ArenaBlock* block, size_t size, size
     ArenaBlock* suffix_block = NULL;
     AllocationRecord* record = NULL;
 
-    if (prefix > block->size || size > block->size - prefix) {
+    if (prefix > block->size || block_size > block->size - prefix) {
         return NULL;
     }
-    suffix = block->size - prefix - size;
+    suffix = block->size - prefix - block_size;
 
     if (prefix > 0) {
         prefix_block = meta_alloc(sizeof(*prefix_block));
@@ -746,21 +804,22 @@ static AllocationRecord* carve_block_locked(ArenaBlock* block, size_t size, size
     }
 
     block->offset = aligned_offset;
-    block->size = size;
+    block->size = block_size;
     block->free = 0;
 
     if (suffix_block) {
-        suffix_block->offset = aligned_offset + size;
+        suffix_block->offset = aligned_offset + block_size;
         suffix_block->size = suffix;
         suffix_block->free = 1;
         insert_block_after(block, suffix_block);
     }
 
     record->user_ptr = (void*)aligned_start;
-    record->base_ptr = (void*)aligned_start;
-    record->user_size = size;
-    record->mapped_length = size;
+    record->base_ptr = block->segment->base;
+    record->user_size = user_size;
+    record->mapped_length = block->segment->length;
     record->alignment = alignment;
+    record->backend = BACKEND_ARENA;
     record->call_site = call_site;
     record->allocation_seq = ++allocation_sequence;
     record->reclaim_epoch = 0;
@@ -771,13 +830,14 @@ static AllocationRecord* carve_block_locked(ArenaBlock* block, size_t size, size
     record->live_next = NULL;
 
     insert_record_locked(record);
-    stats_note_managed_alloc(size);
-    note_profile_locked(call_site, size);
+    stats_note_managed_alloc(user_size);
+    note_profile_locked(call_site, user_size);
 
     return record;
 }
 
 static AllocationRecord* managed_alloc_locked(size_t size, size_t alignment, void* call_site) {
+    size_t block_size;
     size_t needed;
 
     if (size == 0 || !is_power_of_two(alignment)) {
@@ -787,15 +847,23 @@ static AllocationRecord* managed_alloc_locked(size_t size, size_t alignment, voi
     if (alignment < default_alignment()) {
         alignment = default_alignment();
     }
+    if (alignment < page_size) {
+        alignment = page_size;
+    }
 
-    if (add_overflow(size, alignment - 1, &needed) != 0) {
+    block_size = align_up_size(size, page_size);
+    if (block_size == 0) {
+        return NULL;
+    }
+
+    if (add_overflow(block_size, alignment - 1, &needed) != 0) {
         return NULL;
     }
 
     for (;;) {
         for (ArenaSegment* segment = arena_segments; segment; segment = segment->next) {
             for (ArenaBlock* block = segment->blocks; block; block = block->next) {
-                if (!block->free || block->size < size) {
+                if (!block->free || block->size < block_size) {
                     continue;
                 }
 
@@ -804,8 +872,8 @@ static AllocationRecord* managed_alloc_locked(size_t size, size_t alignment, voi
                 uintptr_t aligned_start = align_up_uintptr(block_start, alignment);
                 size_t aligned_offset = (size_t)(aligned_start - base);
                 size_t prefix = aligned_offset - block->offset;
-                if (prefix <= block->size && size <= block->size - prefix) {
-                    return carve_block_locked(block, size, alignment, call_site);
+                if (prefix <= block->size && block_size <= block->size - prefix) {
+                    return carve_block_locked(block, size, block_size, alignment, call_site);
                 }
             }
         }
@@ -878,6 +946,14 @@ static int reclaim_record_locked(AllocationRecord* record) {
     }
 #endif
     if (madvise(range_start, range_length, advice) != 0) {
+#ifdef MADV_PAGEOUT
+        if (advice == MADV_PAGEOUT && errno == EINVAL &&
+            madvise(range_start, range_length, MADV_DONTNEED) == 0) {
+            record->reclaim_epoch = reclaim_epoch;
+            stats_snapshot.reclaimed_bytes += record->user_size;
+            return rc;
+        }
+#endif
         rc = -1;
     }
 
@@ -921,13 +997,16 @@ static AllocationRecord* select_reclaim_candidate_locked(void) {
 }
 
 static void maybe_policy_reclaim_locked(void) {
+    size_t current_rss = update_observed_rss_locked();
+
     if (target_rss_bytes == 0 ||
         reclaim_policy == RECLAIM_NONE ||
-        stats_snapshot.live_managed_bytes <= target_rss_bytes) {
+        current_rss == 0 ||
+        current_rss <= target_rss_bytes) {
         return;
     }
 
-    size_t needed = stats_snapshot.live_managed_bytes - target_rss_bytes;
+    size_t needed = current_rss - target_rss_bytes;
     size_t attempted = 0;
     reclaim_epoch++;
     stats_snapshot.policy_reclaim_calls++;
@@ -945,6 +1024,8 @@ static void maybe_policy_reclaim_locked(void) {
             continue;
         }
     }
+
+    update_observed_rss_locked();
 }
 
 static void* allocate_by_policy(size_t size, size_t alignment, int zero_fill, int* managed,
@@ -958,7 +1039,6 @@ static void* allocate_by_policy(size_t size, size_t alignment, int zero_fill, in
         if (record) {
             ptr = record->user_ptr;
             *managed = 1;
-            maybe_policy_reclaim_locked();
         }
         pthread_mutex_unlock(&runtime_lock);
 
@@ -966,8 +1046,14 @@ static void* allocate_by_policy(size_t size, size_t alignment, int zero_fill, in
             if (zero_fill) {
                 memset(ptr, 0, size);
             }
+            pthread_mutex_lock(&runtime_lock);
+            maybe_policy_reclaim_locked();
+            pthread_mutex_unlock(&runtime_lock);
             return ptr;
         }
+
+        errno = ENOMEM;
+        return NULL;
     }
 
     if (zero_fill) {
@@ -1021,6 +1107,7 @@ int mai_reclaim_all(void) {
         }
     }
 
+    update_observed_rss_locked();
     pthread_mutex_unlock(&runtime_lock);
     return rc;
 }
@@ -1032,6 +1119,7 @@ int mai_get_stats(MaiStats* out) {
     }
 
     pthread_mutex_lock(&runtime_lock);
+    update_observed_rss_locked();
     *out = stats_snapshot;
     out->enabled = runtime_enabled;
     out->configured = runtime_configured;
@@ -1053,13 +1141,15 @@ static void print_stats(void) {
 
     fprintf(stderr,
             "MAI stats: enabled=%d configured=%d config_error=%d threshold=%zu arena_size=%zu "
-            "target_rss=%zu segments=%zu arena_bytes=%zu managed_total=%zu pass_through_total=%zu "
+            "target_rss=%zu current_rss=%zu high_water_rss=%zu "
+            "segments=%zu arena_bytes=%zu managed_total=%zu pass_through_total=%zu "
             "live_managed=%zu high_water=%zu managed_allocs=%zu pass_through_allocs=%zu "
             "managed_frees=%zu reclaim_calls=%zu policy_reclaim_calls=%zu reclaimed_bytes=%zu "
             "mmap_calls=%zu munmap_calls=%zu mremap_calls=%zu brk_calls=%zu sbrk_calls=%zu "
             "profile_sites=%zu\n",
             stats.enabled, stats.configured, stats.config_error, stats.threshold,
-            stats.arena_size, stats.target_rss, stats.arena_segments, stats.arena_bytes,
+            stats.arena_size, stats.target_rss, stats.current_rss_bytes,
+            stats.high_water_rss_bytes, stats.arena_segments, stats.arena_bytes,
             stats.managed_bytes_total, stats.pass_through_bytes_total,
             stats.live_managed_bytes, stats.high_water_managed_bytes,
             stats.managed_allocations, stats.pass_through_allocations,
@@ -1334,7 +1424,6 @@ static void* custom_realloc(void* ptr, size_t size) {
         if (size <= old_size) {
             stats_reduce_live_managed(old_size - size);
             record->user_size = size;
-            record->mapped_length = size;
             pthread_mutex_unlock(&runtime_lock);
             in_mai_hook--;
             return ptr;
@@ -1361,7 +1450,7 @@ static void* custom_realloc(void* ptr, size_t size) {
     }
 
     if (should_manage(size)) {
-        size_t old_size = malloc_usable_size(ptr);
+        size_t old_size = pass_through_malloc_usable_size(ptr);
         int managed = 0;
         void* new_ptr = allocate_by_policy(size, default_alignment(), 0, &managed,
                                            __builtin_return_address(0));
@@ -1371,6 +1460,8 @@ static void* custom_realloc(void* ptr, size_t size) {
             in_mai_hook--;
             return new_ptr;
         }
+        in_mai_hook--;
+        return NULL;
     }
 
     void* result = pass_through_realloc(ptr, size);
@@ -1384,7 +1475,11 @@ static void* custom_realloc(void* ptr, size_t size) {
 
 static void* custom_aligned_alloc(size_t alignment, size_t size) {
     if (in_mai_hook || cleanup_in_progress || !runtime_configured || !should_manage(size)) {
-        return pass_through_aligned_alloc(alignment, size);
+        void* ptr = pass_through_aligned_alloc(alignment, size);
+        if (ptr && !in_mai_hook && !cleanup_in_progress && runtime_configured) {
+            stats_note_pass_through_threadsafe(size);
+        }
+        return ptr;
     }
 
     if (!is_power_of_two(alignment) || size % alignment != 0) {
@@ -1418,14 +1513,19 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
         AllocationRecord* record = managed_alloc_locked(size, alignment,
                                                         __builtin_return_address(0));
         if (record) {
-            maybe_policy_reclaim_locked();
+            *memptr = record->user_ptr;
         }
         pthread_mutex_unlock(&runtime_lock);
         if (record) {
-            *memptr = record->user_ptr;
+            pthread_mutex_lock(&runtime_lock);
+            maybe_policy_reclaim_locked();
+            pthread_mutex_unlock(&runtime_lock);
             in_mai_hook--;
             return 0;
         }
+
+        in_mai_hook--;
+        return ENOMEM;
     }
 
     int ret = pass_through_posix_memalign(memptr, alignment, size);
@@ -1439,7 +1539,11 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
 
 static void* custom_memalign(size_t alignment, size_t size) {
     if (in_mai_hook || cleanup_in_progress || !runtime_configured || !should_manage(size)) {
-        return pass_through_memalign(alignment, size);
+        void* ptr = pass_through_memalign(alignment, size);
+        if (ptr && !in_mai_hook && !cleanup_in_progress && runtime_configured) {
+            stats_note_pass_through_threadsafe(size);
+        }
+        return ptr;
     }
 
     if (!is_power_of_two(alignment)) {

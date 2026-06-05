@@ -80,6 +80,19 @@ add_test(
 )
 
 add_test(
+    NAME mai_reclaim_pageout
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_RECLAIM_POLICY=pageout"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        reclaim
+)
+
+add_test(
     NAME mai_target_rss_policy_reclaim
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"
@@ -92,6 +105,18 @@ add_test(
         "LD_PRELOAD=$<TARGET_FILE:mai>"
         $<TARGET_FILE:mai_runtime_test>
         target_rss
+)
+
+add_test(
+    NAME mai_backing_file_creation_failure
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=8388608T"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        backing_failure
 )
 
 add_test(

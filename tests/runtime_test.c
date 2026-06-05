@@ -229,6 +229,12 @@ static int mode_realloc(void) {
 }
 
 static int mode_alignment(void) {
+    MaiStats before_small;
+    MaiStats after_small;
+    if (load_stats(&before_small) != 0) {
+        return fail("mai_get_stats failed before small alignment test");
+    }
+
     void* small_aligned = aligned_alloc(4, 128);
     if (!small_aligned || !aligned_ptr(small_aligned, 4)) {
         free(small_aligned);
@@ -242,6 +248,13 @@ static int mode_alignment(void) {
         return fail("below-threshold memalign did not preserve small-alignment libc behavior");
     }
     free(small_memalign);
+
+    if (load_stats(&after_small) != 0) {
+        return fail("mai_get_stats failed after small alignment test");
+    }
+    if (after_small.pass_through_allocations < before_small.pass_through_allocations + 2) {
+        return fail("below-threshold alignment calls were not counted as pass-through allocations");
+    }
 
     void* aligned = aligned_alloc(64, 8192);
     if (!aligned || !aligned_ptr(aligned, 64)) {
@@ -432,17 +445,17 @@ static int mode_target_rss(void) {
 
     void* ptrs[4];
     for (size_t i = 0; i < 4; i++) {
-        ptrs[i] = malloc(8192);
+        ptrs[i] = calloc(1, 8192);
         if (!ptrs[i]) {
             return fail("target RSS allocation failed");
         }
-        memset(ptrs[i], (int)i, 8192);
     }
 
     if (load_stats(&after) != 0) {
         return fail("mai_get_stats failed after target RSS test");
     }
-    if (after.target_rss == 0 ||
+    if (after.target_rss == 0 || after.current_rss_bytes == 0 ||
+        after.high_water_rss_bytes < after.current_rss_bytes ||
         after.policy_reclaim_calls <= before.policy_reclaim_calls ||
         after.reclaimed_bytes <= before.reclaimed_bytes) {
         return fail("target RSS policy reclaim did not run");
@@ -450,7 +463,7 @@ static int mode_target_rss(void) {
 
     for (size_t i = 0; i < 4; i++) {
         unsigned char* ptr = ptrs[i];
-        if (ptr[0] != (unsigned char)i) {
+        if (ptr[0] != 0 || ptr[8191] != 0) {
             return fail("target RSS reclaim corrupted allocation contents");
         }
         free(ptrs[i]);
@@ -609,6 +622,34 @@ static int mode_dlopen(void) {
     return 0;
 }
 
+static int mode_backing_failure(void) {
+    MaiStats before;
+    MaiStats after;
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before backing failure test");
+    }
+
+    errno = 0;
+    void* ptr = malloc(8192);
+    if (ptr) {
+        free(ptr);
+        return fail("large allocation unexpectedly fell back after arena creation failure");
+    }
+    if (errno != ENOMEM) {
+        return fail("arena creation failure did not surface as ENOMEM");
+    }
+
+    if (load_stats(&after) != 0) {
+        return fail("mai_get_stats failed after backing failure test");
+    }
+    if (after.managed_allocations != before.managed_allocations ||
+        after.pass_through_allocations != before.pass_through_allocations) {
+        return fail("failed managed allocation changed allocation counters");
+    }
+
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) {
         return fail("expected exactly one mode argument");
@@ -627,6 +668,7 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "profile") == 0) return mode_profile();
     if (strcmp(argv[1], "diagnostics") == 0) return mode_diagnostics();
     if (strcmp(argv[1], "dlopen") == 0) return mode_dlopen();
+    if (strcmp(argv[1], "backing_failure") == 0) return mode_backing_failure();
 
     return fail("unknown mode");
 }

@@ -34,6 +34,8 @@ typedef struct {
     size_t threshold;
     size_t arena_size;
     size_t target_rss;
+    size_t current_rss_bytes;
+    size_t high_water_rss_bytes;
     size_t arena_segments;
     size_t arena_bytes;
     size_t managed_bytes_total;

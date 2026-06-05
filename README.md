@@ -19,6 +19,8 @@ diagnostics, and profiling support:
 - Small heap allocations pass through to the original allocator.
 - Allocations at or above `MAI_THRESHOLD` are routed to MAI-managed
   file-backed `MAP_SHARED` arena segments.
+- Managed allocations are page-isolated inside arenas so page-granular reclaim
+  does not discard data from unrelated live allocations.
 - Arena metadata is stored outside the managed arena and does not use the
   MAI-managed allocator.
 - One large backing file is used per arena segment, not per allocation.
@@ -103,10 +105,10 @@ Supported size suffixes for `MAI_THRESHOLD` and `MAI_ARENA_SIZE` are `K`, `M`,
 - `pageout` when supported by the platform, otherwise it falls back to
   `donthneed`
 
-`MAI_TARGET_RSS` is an optional soft target for managed live bytes. It is not a
-kernel RSS reading; it is a policy trigger that asks MAI to reclaim selected
-managed ranges after allocations push the managed live-byte estimate above the
-target.
+`MAI_TARGET_RSS` is an optional soft process-RSS target. On Linux, MAI samples
+`/proc/self/statm` after managed allocations and asks the reclaim policy to
+drop selected managed ranges when observed RSS is above the target. It is a
+best-effort policy trigger, not a hard cgroup limit.
 
 `MAI_RECLAIM_SELECTION` controls which allocations are selected when
 `MAI_TARGET_RSS` triggers reclaim:
@@ -116,8 +118,10 @@ target.
 - `all`
 
 Manual reclaim is available through `mai_reclaim_all()`. Reclaim uses
-`msync()` followed by `madvise()` on managed ranges. Re-access is handled by
-the kernel reloading from the backing file.
+`msync()` followed by `madvise()` on managed ranges. `donthneed` uses
+`MADV_DONTNEED`; `pageout` uses `MADV_PAGEOUT` when available and falls back to
+`MADV_DONTNEED` if the running kernel rejects it. Re-access is handled by the
+kernel reloading from the backing file.
 
 `MAI_PROFILE=1` records allocation call-site counters in metadata outside the
 managed arena. When `MAI_STATS=1` is also set, MAI prints a call-site report at
@@ -149,9 +153,7 @@ LD_PRELOAD=/path/to/libmai.so \
 
 The next phases are:
 
-1. Improve `MAI_TARGET_RSS` by comparing policy decisions against measured
-   process RSS, not only MAI-managed live bytes.
-2. Add sampled page-hotness estimation.
-3. Extend runtime support for Fortran runtimes and optional Python/NumPy-specific
+1. Add sampled page-hotness estimation.
+2. Extend runtime support for Fortran runtimes and optional Python/NumPy-specific
    integration.
-4. Add exclusion hooks for pinned, mlocked, MPI/RDMA, and GPU memory.
+3. Add exclusion hooks for pinned, mlocked, MPI/RDMA, and GPU memory.
