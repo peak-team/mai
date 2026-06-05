@@ -29,9 +29,11 @@
 #if defined(__GNUC__) || defined(__clang__)
 #define MAI_LIKELY(value) __builtin_expect(!!(value), 1)
 #define MAI_UNLIKELY(value) __builtin_expect(!!(value), 0)
+#define MAI_TLS_INITIAL_EXEC __attribute__((tls_model("initial-exec")))
 #else
 #define MAI_LIKELY(value) (value)
 #define MAI_UNLIKELY(value) (value)
+#define MAI_TLS_INITIAL_EXEC
 #endif
 
 typedef enum {
@@ -150,9 +152,9 @@ struct DynamicHandleRecord {
 static GumInterceptor* malloc_interceptor = NULL;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
-static __thread int in_mai_hook = 0;
-static __thread PassThroughCounter* tls_pass_through_counter = NULL;
-static __thread int resolving_original_allocators = 0;
+static __thread int in_mai_hook MAI_TLS_INITIAL_EXEC = 0;
+static __thread PassThroughCounter* tls_pass_through_counter MAI_TLS_INITIAL_EXEC = NULL;
+static __thread int resolving_original_allocators MAI_TLS_INITIAL_EXEC = 0;
 
 static int runtime_enabled = 0;
 static int runtime_configured = 0;
@@ -632,16 +634,20 @@ static void resolve_original_allocators(void) {
 
     resolving_original_allocators = 1;
     if (!original_malloc) {
-        original_malloc = (void* (*)(size_t))dlsym(RTLD_NEXT, "malloc");
+        original_malloc = __libc_malloc ? __libc_malloc :
+            (void* (*)(size_t))dlsym(RTLD_NEXT, "malloc");
     }
     if (!original_free) {
-        original_free = (void (*)(void*))dlsym(RTLD_NEXT, "free");
+        original_free = __libc_free ? __libc_free :
+            (void (*)(void*))dlsym(RTLD_NEXT, "free");
     }
     if (!original_calloc) {
-        original_calloc = (void* (*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
+        original_calloc = __libc_calloc ? __libc_calloc :
+            (void* (*)(size_t, size_t))dlsym(RTLD_NEXT, "calloc");
     }
     if (!original_realloc) {
-        original_realloc = (void* (*)(void*, size_t))dlsym(RTLD_NEXT, "realloc");
+        original_realloc = __libc_realloc ? __libc_realloc :
+            (void* (*)(void*, size_t))dlsym(RTLD_NEXT, "realloc");
     }
     if (!original_aligned_alloc) {
         original_aligned_alloc =
@@ -652,7 +658,8 @@ static void resolve_original_allocators(void) {
             (int (*)(void**, size_t, size_t))dlsym(RTLD_NEXT, "posix_memalign");
     }
     if (!original_memalign) {
-        original_memalign = (void* (*)(size_t, size_t))dlsym(RTLD_NEXT, "memalign");
+        original_memalign = __libc_memalign ? __libc_memalign :
+            (void* (*)(size_t, size_t))dlsym(RTLD_NEXT, "memalign");
     }
     if (!original_valloc) {
         original_valloc = (void* (*)(size_t))dlsym(RTLD_NEXT, "valloc");
@@ -722,6 +729,10 @@ static void* call_libc_malloc(size_t size) {
     return original_malloc ? original_malloc(size) : fallback_malloc(size);
 }
 
+static void* direct_libc_malloc(size_t size) {
+    return __libc_malloc ? __libc_malloc(size) : call_libc_malloc(size);
+}
+
 static void call_libc_free(void* ptr) {
     if (!original_free) {
         resolve_original_allocators();
@@ -733,6 +744,14 @@ static void call_libc_free(void* ptr) {
     }
 }
 
+static void direct_libc_free(void* ptr) {
+    if (__libc_free) {
+        __libc_free(ptr);
+    } else {
+        call_libc_free(ptr);
+    }
+}
+
 static void* call_libc_calloc(size_t nmemb, size_t size) {
     if (!original_calloc) {
         resolve_original_allocators();
@@ -740,11 +759,19 @@ static void* call_libc_calloc(size_t nmemb, size_t size) {
     return original_calloc ? original_calloc(nmemb, size) : fallback_calloc(nmemb, size);
 }
 
+static void* direct_libc_calloc(size_t nmemb, size_t size) {
+    return __libc_calloc ? __libc_calloc(nmemb, size) : call_libc_calloc(nmemb, size);
+}
+
 static void* call_libc_realloc(void* ptr, size_t size) {
     if (!original_realloc) {
         resolve_original_allocators();
     }
     return original_realloc ? original_realloc(ptr, size) : fallback_realloc(ptr, size);
+}
+
+static void* direct_libc_realloc(void* ptr, size_t size) {
+    return __libc_realloc ? __libc_realloc(ptr, size) : call_libc_realloc(ptr, size);
 }
 
 static size_t call_libc_malloc_usable_size(void* ptr) {
@@ -2340,11 +2367,14 @@ static size_t custom_malloc_usable_size(void* ptr) {
 
 __attribute__((visibility("default")))
 void* malloc(size_t size) {
+    if (MAI_UNLIKELY(!runtime_configured)) {
+        return direct_libc_malloc(size);
+    }
     if (MAI_UNLIKELY(resolving_original_allocators)) {
         return fallback_malloc(size);
     }
     NOTE_PRELOAD_ALLOCATOR_PATH();
-    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress || !runtime_configured)) {
+    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress)) {
         return call_libc_malloc(size);
     }
     if (MAI_LIKELY(size < threshold_bytes || size == 0)) {
@@ -2359,15 +2389,21 @@ void* malloc(size_t size) {
 
 __attribute__((visibility("default")))
 void free(void* ptr) {
+    if (MAI_UNLIKELY(!ptr)) {
+        return;
+    }
+    if (MAI_UNLIKELY(!runtime_configured)) {
+        int saved_errno = errno;
+        direct_libc_free(ptr);
+        errno = saved_errno;
+        return;
+    }
     if (MAI_UNLIKELY(resolving_original_allocators)) {
         fallback_free(ptr);
         return;
     }
     NOTE_PRELOAD_ALLOCATOR_PATH();
-    if (MAI_UNLIKELY(!ptr)) {
-        return;
-    }
-    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress || !runtime_configured)) {
+    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress)) {
         int saved_errno = errno;
         call_libc_free(ptr);
         errno = saved_errno;
@@ -2384,15 +2420,18 @@ void free(void* ptr) {
 
 __attribute__((visibility("default")))
 void* calloc(size_t nmemb, size_t size) {
-    if (MAI_UNLIKELY(resolving_original_allocators)) {
-        return fallback_calloc(nmemb, size);
-    }
-    NOTE_PRELOAD_ALLOCATOR_PATH();
     size_t total = 0;
     if (MAI_UNLIKELY(mul_overflow(nmemb, size, &total) != 0)) {
         return NULL;
     }
-    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress || !runtime_configured)) {
+    if (MAI_UNLIKELY(!runtime_configured)) {
+        return direct_libc_calloc(nmemb, size);
+    }
+    if (MAI_UNLIKELY(resolving_original_allocators)) {
+        return fallback_calloc(nmemb, size);
+    }
+    NOTE_PRELOAD_ALLOCATOR_PATH();
+    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress)) {
         return call_libc_calloc(nmemb, size);
     }
     if (MAI_LIKELY(total < threshold_bytes || total == 0)) {
@@ -2407,6 +2446,9 @@ void* calloc(size_t nmemb, size_t size) {
 
 __attribute__((visibility("default")))
 void* realloc(void* ptr, size_t size) {
+    if (MAI_UNLIKELY(!runtime_configured)) {
+        return direct_libc_realloc(ptr, size);
+    }
     if (MAI_UNLIKELY(resolving_original_allocators)) {
         return fallback_realloc(ptr, size);
     }
@@ -2418,7 +2460,7 @@ void* realloc(void* ptr, size_t size) {
         free(ptr);
         return NULL;
     }
-    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress || !runtime_configured)) {
+    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress)) {
         void* result = call_libc_realloc(ptr, size);
         if (result && MAI_UNLIKELY(stats_logging) && runtime_configured &&
             !in_mai_hook && !cleanup_in_progress) {
@@ -2439,6 +2481,9 @@ void* realloc(void* ptr, size_t size) {
 
 __attribute__((visibility("default")))
 void* aligned_alloc(size_t alignment, size_t size) {
+    if (MAI_UNLIKELY(!runtime_configured)) {
+        return pass_through_aligned_alloc(alignment, size);
+    }
     if (resolving_original_allocators) {
         return fallback_memalign(alignment, size);
     }
@@ -2448,6 +2493,9 @@ void* aligned_alloc(size_t alignment, size_t size) {
 
 __attribute__((visibility("default")))
 int posix_memalign(void** memptr, size_t alignment, size_t size) {
+    if (MAI_UNLIKELY(!runtime_configured)) {
+        return pass_through_posix_memalign(memptr, alignment, size);
+    }
     if (resolving_original_allocators) {
         void* ptr = fallback_memalign(alignment, size);
         if (!ptr) {
@@ -2463,6 +2511,9 @@ int posix_memalign(void** memptr, size_t alignment, size_t size) {
 
 __attribute__((visibility("default")))
 void* memalign(size_t alignment, size_t size) {
+    if (MAI_UNLIKELY(!runtime_configured)) {
+        return pass_through_memalign(alignment, size);
+    }
     if (resolving_original_allocators) {
         return fallback_memalign(alignment, size);
     }
@@ -2472,12 +2523,28 @@ void* memalign(size_t alignment, size_t size) {
 
 __attribute__((visibility("default")))
 void* valloc(size_t size) {
+    if (MAI_UNLIKELY(!runtime_configured)) {
+        if (!original_valloc) {
+            resolve_original_allocators();
+        }
+        return original_valloc ? original_valloc(size) : pass_through_memalign(page_size, size);
+    }
     NOTE_PRELOAD_ALLOCATOR_PATH();
     return custom_memalign_from_site(page_size, size, __builtin_return_address(0));
 }
 
 __attribute__((visibility("default")))
 void* pvalloc(size_t size) {
+    if (MAI_UNLIKELY(!runtime_configured)) {
+        if (!original_pvalloc) {
+            resolve_original_allocators();
+        }
+        if (original_pvalloc) {
+            return original_pvalloc(size);
+        }
+        size_t rounded = align_up_size(size, page_size);
+        return rounded == 0 ? NULL : pass_through_memalign(page_size, rounded);
+    }
     NOTE_PRELOAD_ALLOCATOR_PATH();
     size_t rounded = align_up_size(size, page_size);
     if (rounded == 0) {
@@ -2488,9 +2555,12 @@ void* pvalloc(size_t size) {
 
 __attribute__((visibility("default")))
 size_t malloc_usable_size(void* ptr) {
+    if (MAI_UNLIKELY(!runtime_configured)) {
+        return call_libc_malloc_usable_size(ptr);
+    }
     NOTE_PRELOAD_ALLOCATOR_PATH();
     if (!ptr || resolving_original_allocators || cleanup_in_progress ||
-        !runtime_configured || !pointer_may_be_managed(ptr)) {
+        !pointer_may_be_managed(ptr)) {
         return call_libc_malloc_usable_size(ptr);
     }
     return custom_malloc_usable_size(ptr);
