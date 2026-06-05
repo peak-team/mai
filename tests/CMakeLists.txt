@@ -352,6 +352,23 @@ add_test(
 )
 
 add_test(
+    NAME mai_target_rss_policy_reclaim_adaptive
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_TARGET_RSS=8K"
+        "MAI_RECLAIM_POLICY=donthneed"
+        "MAI_RECLAIM_SELECTION=adaptive"
+        "MAI_HOTNESS_SAMPLE_PAGES=4"
+        "MAI_EXPECT_ADAPTIVE_RECLAIM=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        target_rss
+)
+
+add_test(
     NAME mai_backing_file_creation_failure
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"

@@ -856,6 +856,11 @@ static int mode_target_rss(void) {
         after.reclaimed_bytes <= before.reclaimed_bytes) {
         return fail("target RSS policy reclaim did not run");
     }
+    if (getenv("MAI_EXPECT_ADAPTIVE_RECLAIM") &&
+        (after.hotness_samples <= before.hotness_samples ||
+         after.hotness_sampled_pages <= before.hotness_sampled_pages)) {
+        return fail("adaptive target RSS reclaim did not sample candidate residency");
+    }
 
     for (size_t i = 0; i < 4; i++) {
         unsigned char* ptr = ptrs[i];

@@ -189,6 +189,15 @@ best-effort policy trigger, not a hard cgroup limit.
 - `oldest`
 - `largest`
 - `all`
+- `adaptive`
+
+`adaptive` uses bounded `mincore()` sampling on live, non-excluded managed
+allocations and prefers the candidate with the largest estimated resident
+footprint, with allocation size and age as tie-breakers. It is intended for
+target-RSS reclaim where dropping already nonresident pages is unlikely to
+reduce RSS. The sampling budget is controlled by `MAI_HOTNESS_SAMPLE_PAGES`;
+hotness reporting does not need to be enabled for adaptive reclaim to use the
+same low-overhead residency sampler.
 
 Manual reclaim is available through `mai_reclaim_all()`. Reclaim uses
 `msync()` followed by `madvise()` on managed ranges. `donthneed` uses

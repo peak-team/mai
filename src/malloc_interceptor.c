@@ -46,7 +46,8 @@ typedef enum {
 typedef enum {
     RECLAIM_SELECT_OLDEST = 0,
     RECLAIM_SELECT_LARGEST,
-    RECLAIM_SELECT_ALL
+    RECLAIM_SELECT_ALL,
+    RECLAIM_SELECT_ADAPTIVE
 } ReclaimSelection;
 
 typedef enum {
@@ -2131,7 +2132,7 @@ static int reclaim_record_locked(AllocationRecord* record) {
     }
 
     if (msync(range_start, range_length, MS_SYNC) != 0) {
-        rc = -1;
+        return -1;
     }
 
     int advice = MADV_DONTNEED;
@@ -2152,18 +2153,53 @@ static int reclaim_record_locked(AllocationRecord* record) {
         rc = -1;
     }
 
+    if (rc != 0) {
+        return rc;
+    }
+
     record->reclaim_epoch = reclaim_epoch;
     stats_snapshot.reclaimed_bytes += record->user_size;
-    return rc;
+    return 0;
 }
 
-static AllocationRecord* select_reclaim_candidate_locked(void) {
+static size_t estimate_resident_bytes(size_t sampled_pages, size_t resident_pages,
+                                      size_t total_pages, size_t max_bytes) {
+    if (sampled_pages == 0 || resident_pages == 0 || total_pages == 0) {
+        return 0;
+    }
+
+    if (resident_pages > SIZE_MAX / total_pages) {
+        return max_bytes;
+    }
+
+    size_t estimated_pages = (resident_pages * total_pages + sampled_pages - 1) /
+        sampled_pages;
+    if (estimated_pages == 0) {
+        estimated_pages = 1;
+    }
+    if (estimated_pages > total_pages) {
+        estimated_pages = total_pages;
+    }
+    if (estimated_pages > SIZE_MAX / page_size) {
+        return max_bytes;
+    }
+
+    size_t bytes = estimated_pages * page_size;
+    return bytes > max_bytes ? max_bytes : bytes;
+}
+
+static AllocationRecord* select_reclaim_candidate_locked(size_t* estimated_bytes_out) {
     AllocationRecord* selected = NULL;
+    size_t selected_estimated_bytes = 0;
+    size_t selected_fallback_size = 0;
+
+    *estimated_bytes_out = 0;
 
     if (reclaim_selection == RECLAIM_SELECT_ALL) {
         for (AllocationRecord* record = live_head; record; record = record->live_next) {
             if (record->reclaim_epoch != reclaim_epoch &&
                 !record_overlaps_exclusion_locked(record)) {
+                *estimated_bytes_out = record->user_size;
                 return record;
             }
         }
@@ -2178,20 +2214,59 @@ static AllocationRecord* select_reclaim_candidate_locked(void) {
             continue;
         }
 
+        if (reclaim_selection == RECLAIM_SELECT_ADAPTIVE) {
+            size_t sampled_pages = 0;
+            size_t resident_pages = 0;
+            size_t total_pages = 0;
+            size_t estimated_bytes = 0;
+            if (sample_record_hotness_locked(record, &sampled_pages, &resident_pages,
+                                             &total_pages) == 0) {
+                estimated_bytes = estimate_resident_bytes(sampled_pages, resident_pages,
+                                                          total_pages,
+                                                          record->user_size);
+            }
+
+            if (!selected ||
+                estimated_bytes > selected_estimated_bytes ||
+                (estimated_bytes == selected_estimated_bytes &&
+                 record->user_size > selected_fallback_size) ||
+                (estimated_bytes == selected_estimated_bytes &&
+                 record->user_size == selected_fallback_size &&
+                 record->allocation_seq < selected->allocation_seq)) {
+                selected = record;
+                selected_estimated_bytes = estimated_bytes;
+                selected_fallback_size = record->user_size;
+            }
+            continue;
+        }
+
         if (!selected) {
             selected = record;
+            selected_estimated_bytes = record->user_size;
+            selected_fallback_size = record->user_size;
             continue;
         }
 
         if (reclaim_selection == RECLAIM_SELECT_LARGEST) {
             if (record->user_size > selected->user_size) {
                 selected = record;
+                selected_estimated_bytes = record->user_size;
+                selected_fallback_size = record->user_size;
             }
         } else if (record->allocation_seq < selected->allocation_seq) {
             selected = record;
+            selected_estimated_bytes = record->user_size;
+            selected_fallback_size = record->user_size;
         }
     }
 
+    if (selected) {
+        if (reclaim_selection == RECLAIM_SELECT_ADAPTIVE) {
+            *estimated_bytes_out = selected_estimated_bytes;
+        } else {
+            *estimated_bytes_out = selected->user_size;
+        }
+    }
     return selected;
 }
 
@@ -2211,13 +2286,20 @@ static void maybe_policy_reclaim_locked(void) {
     stats_snapshot.policy_reclaim_calls++;
 
     while (attempted < needed) {
-        AllocationRecord* candidate = select_reclaim_candidate_locked();
+        size_t estimated_bytes = 0;
+        AllocationRecord* candidate = select_reclaim_candidate_locked(&estimated_bytes);
         if (!candidate) {
             break;
         }
 
-        attempted += candidate->user_size;
-        reclaim_record_locked(candidate);
+        int rc = reclaim_record_locked(candidate);
+        if (estimated_bytes > 0) {
+            attempted += estimated_bytes;
+        } else if (rc == 0) {
+            attempted += page_size;
+        } else {
+            attempted += candidate->user_size;
+        }
 
         if (reclaim_selection == RECLAIM_SELECT_ALL) {
             continue;
@@ -2629,6 +2711,8 @@ static int configure_runtime(void) {
             reclaim_selection = RECLAIM_SELECT_LARGEST;
         } else if (strcmp(reclaim_select, "all") == 0) {
             reclaim_selection = RECLAIM_SELECT_ALL;
+        } else if (strcmp(reclaim_select, "adaptive") == 0) {
+            reclaim_selection = RECLAIM_SELECT_ADAPTIVE;
         } else {
             runtime_config_error = 1;
             return -1;
