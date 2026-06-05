@@ -47,6 +47,70 @@ MAI_TEST_EXPORT int cudaFreeHost(void* ptr) {
     return 0;
 }
 
+MAI_TEST_EXPORT int cudaMallocManaged(void** ptr, size_t size, unsigned int flags) {
+    (void)flags;
+    if (!ptr) {
+        return 1;
+    }
+    *ptr = malloc(size);
+    if (!*ptr) {
+        return 2;
+    }
+    memset(*ptr, 0xca, size);
+    return 0;
+}
+
+MAI_TEST_EXPORT int cudaFree(void* ptr) {
+    free(ptr);
+    return 0;
+}
+
+MAI_TEST_EXPORT int hipHostMalloc(void** ptr, size_t size, unsigned int flags) {
+    (void)flags;
+    if (!ptr) {
+        return 1;
+    }
+    *ptr = malloc(size);
+    if (!*ptr) {
+        return 2;
+    }
+    memset(*ptr, 0x48, size);
+    return 0;
+}
+
+MAI_TEST_EXPORT int hipHostRegister(void* ptr, size_t size, unsigned int flags) {
+    (void)size;
+    (void)flags;
+    return ptr ? 0 : 1;
+}
+
+MAI_TEST_EXPORT int hipHostUnregister(void* ptr) {
+    return ptr ? 0 : 1;
+}
+
+MAI_TEST_EXPORT int hipHostFree(void* ptr) {
+    free(ptr);
+    return 0;
+}
+
+MAI_TEST_EXPORT int hipMallocManaged(void** ptr, size_t size, unsigned int flags) {
+    (void)flags;
+    if (!ptr) {
+        return 1;
+    }
+    *ptr = malloc(size);
+    if (!*ptr) {
+        return 2;
+    }
+    memset(*ptr, 0x68, size);
+    return 0;
+}
+
+MAI_TEST_EXPORT int hipFree(void* ptr) {
+    free(ptr);
+    return 0;
+}
+
 MAI_TEST_EXPORT void* ibv_reg_mr(void* pd, void* addr, size_t length, int access) {
     (void)pd;
     (void)access;
@@ -110,12 +174,53 @@ MAI_TEST_EXPORT int mai_exclusion_plugin_cuda_free(void* ptr) {
     return cudaFreeHost(ptr);
 }
 
+MAI_TEST_EXPORT int mai_exclusion_plugin_cuda_managed_alloc(size_t size, void** out) {
+    return cudaMallocManaged(out, size, 0);
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_cuda_managed_free(void* ptr) {
+    return cudaFree(ptr);
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_hip_register(void* ptr, size_t size) {
+    return hipHostRegister(ptr, size, 0);
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_hip_unregister(void* ptr) {
+    return hipHostUnregister(ptr);
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_hip_alloc(size_t size, void** out) {
+    return hipHostMalloc(out, size, 0);
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_hip_free(void* ptr) {
+    return hipHostFree(ptr);
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_hip_managed_alloc(size_t size, void** out) {
+    return hipMallocManaged(out, size, 0);
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_hip_managed_free(void* ptr) {
+    return hipFree(ptr);
+}
+
 MAI_TEST_EXPORT int mai_exclusion_plugin_rdma_register(void* ptr, size_t size,
                                                        void** out_mr) {
     if (!out_mr) {
         return 1;
     }
     *out_mr = ibv_reg_mr(NULL, ptr, size, 0);
+    return *out_mr ? 0 : 2;
+}
+
+MAI_TEST_EXPORT int mai_exclusion_plugin_rdma_register_iova(void* ptr, size_t size,
+                                                            void** out_mr) {
+    if (!out_mr) {
+        return 1;
+    }
+    *out_mr = ibv_reg_mr_iova(NULL, ptr, size, (uint64_t)(uintptr_t)ptr, 0);
     return *out_mr ? 0 : 2;
 }
 

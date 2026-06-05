@@ -25,6 +25,10 @@ typedef int (*plugin_unregister_fn)(void*);
 typedef int (*plugin_alloc_out_fn)(size_t, void**);
 typedef int (*plugin_free_status_fn)(void*);
 typedef int (*plugin_rdma_register_fn)(void*, size_t, void**);
+typedef int (*runtime_register_fn)(void*, size_t, unsigned int);
+typedef int (*runtime_alloc_out_fn)(void**, size_t, unsigned int);
+typedef int (*runtime_mpi_alloc_fn)(intptr_t, void*, void*);
+typedef void* (*runtime_ibv_register_fn)(void*, void*, size_t, int);
 
 static int fail(const char* message) {
     fprintf(stderr, "%s\n", message);
@@ -178,10 +182,20 @@ static int mode_preload_symbols(void) {
         "cudaHostRegister",
         "cudaHostUnregister",
         "cudaHostAlloc",
+        "cudaMallocHost",
         "cudaFreeHost",
+        "cudaMallocManaged",
+        "cudaFree",
+        "hipHostRegister",
+        "hipHostUnregister",
+        "hipHostMalloc",
+        "hipHostFree",
+        "hipMallocManaged",
+        "hipFree",
         "MPI_Alloc_mem",
         "MPI_Free_mem",
         "ibv_reg_mr",
+        "ibv_reg_mr_iova",
         "ibv_dereg_mr",
         NULL
     };
@@ -197,6 +211,80 @@ static int mode_preload_symbols(void) {
         }
     }
 
+    return 0;
+}
+
+static int mode_missing_safety_symbols(void) {
+    runtime_register_fn cuda_register =
+        (runtime_register_fn)dlsym(RTLD_DEFAULT, "cudaHostRegister");
+    runtime_alloc_out_fn cuda_host_alloc =
+        (runtime_alloc_out_fn)dlsym(RTLD_DEFAULT, "cudaHostAlloc");
+    runtime_alloc_out_fn cuda_managed_alloc =
+        (runtime_alloc_out_fn)dlsym(RTLD_DEFAULT, "cudaMallocManaged");
+    runtime_register_fn hip_register =
+        (runtime_register_fn)dlsym(RTLD_DEFAULT, "hipHostRegister");
+    runtime_alloc_out_fn hip_host_alloc =
+        (runtime_alloc_out_fn)dlsym(RTLD_DEFAULT, "hipHostMalloc");
+    runtime_alloc_out_fn hip_managed_alloc =
+        (runtime_alloc_out_fn)dlsym(RTLD_DEFAULT, "hipMallocManaged");
+    runtime_mpi_alloc_fn mpi_alloc =
+        (runtime_mpi_alloc_fn)dlsym(RTLD_DEFAULT, "MPI_Alloc_mem");
+    runtime_ibv_register_fn ibv_register =
+        (runtime_ibv_register_fn)dlsym(RTLD_DEFAULT, "ibv_reg_mr");
+
+    if (!cuda_register || !cuda_host_alloc || !cuda_managed_alloc ||
+        !hip_register || !hip_host_alloc || !hip_managed_alloc ||
+        !mpi_alloc || !ibv_register) {
+        return fail("safety preload wrappers are not exported");
+    }
+
+    MaiStats before;
+    MaiStats after_alloc;
+    MaiStats after_calls;
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before missing safety symbol test");
+    }
+
+    void* ptr = malloc(8192);
+    if (!ptr) {
+        return fail("missing safety symbol managed allocation failed");
+    }
+    memset(ptr, 0x21, 8192);
+
+    if (load_stats(&after_alloc) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after missing safety allocation");
+    }
+    if (!stats_show_managed_alloc(&before, &after_alloc, 8192)) {
+        free(ptr);
+        return fail("missing safety symbol test allocation was not MAI-managed");
+    }
+
+    void* out = NULL;
+    if (cuda_register(ptr, 8192, 0) == 0 ||
+        cuda_host_alloc(&out, 8192, 0) == 0 ||
+        cuda_managed_alloc(&out, 8192, 0) == 0 ||
+        hip_register(ptr, 8192, 0) == 0 ||
+        hip_host_alloc(&out, 8192, 0) == 0 ||
+        hip_managed_alloc(&out, 8192, 0) == 0 ||
+        mpi_alloc((intptr_t)8192, NULL, &out) == 0 ||
+        ibv_register(NULL, ptr, 8192, 0) != NULL) {
+        free(ptr);
+        return fail("missing safety runtime call unexpectedly succeeded");
+    }
+
+    if (load_stats(&after_calls) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after missing safety calls");
+    }
+    if (after_calls.exclusion_events != after_alloc.exclusion_events ||
+        after_calls.excluded_ranges != after_alloc.excluded_ranges ||
+        after_calls.excluded_bytes != after_alloc.excluded_bytes) {
+        free(ptr);
+        return fail("failed safety runtime calls created exclusions");
+    }
+
+    free(ptr);
     return 0;
 }
 
@@ -1045,7 +1133,16 @@ static int mode_dlopen_exclusions(void) {
     plugin_unregister_fn cuda_unregister = NULL;
     plugin_alloc_out_fn cuda_alloc = NULL;
     plugin_free_status_fn cuda_free = NULL;
+    plugin_alloc_out_fn cuda_managed_alloc = NULL;
+    plugin_free_status_fn cuda_managed_free = NULL;
+    plugin_register_fn hip_register = NULL;
+    plugin_unregister_fn hip_unregister = NULL;
+    plugin_alloc_out_fn hip_alloc = NULL;
+    plugin_free_status_fn hip_free = NULL;
+    plugin_alloc_out_fn hip_managed_alloc = NULL;
+    plugin_free_status_fn hip_managed_free = NULL;
     plugin_rdma_register_fn rdma_register = NULL;
+    plugin_rdma_register_fn rdma_register_iova = NULL;
     plugin_free_status_fn rdma_deregister = NULL;
     plugin_alloc_out_fn mpi_alloc = NULL;
     plugin_free_status_fn mpi_free = NULL;
@@ -1054,12 +1151,30 @@ static int mode_dlopen_exclusions(void) {
     *(void**)(&cuda_unregister) = dlsym(handle, "mai_exclusion_plugin_cuda_unregister");
     *(void**)(&cuda_alloc) = dlsym(handle, "mai_exclusion_plugin_cuda_alloc");
     *(void**)(&cuda_free) = dlsym(handle, "mai_exclusion_plugin_cuda_free");
+    *(void**)(&cuda_managed_alloc) =
+        dlsym(handle, "mai_exclusion_plugin_cuda_managed_alloc");
+    *(void**)(&cuda_managed_free) =
+        dlsym(handle, "mai_exclusion_plugin_cuda_managed_free");
+    *(void**)(&hip_register) = dlsym(handle, "mai_exclusion_plugin_hip_register");
+    *(void**)(&hip_unregister) = dlsym(handle, "mai_exclusion_plugin_hip_unregister");
+    *(void**)(&hip_alloc) = dlsym(handle, "mai_exclusion_plugin_hip_alloc");
+    *(void**)(&hip_free) = dlsym(handle, "mai_exclusion_plugin_hip_free");
+    *(void**)(&hip_managed_alloc) =
+        dlsym(handle, "mai_exclusion_plugin_hip_managed_alloc");
+    *(void**)(&hip_managed_free) =
+        dlsym(handle, "mai_exclusion_plugin_hip_managed_free");
     *(void**)(&rdma_register) = dlsym(handle, "mai_exclusion_plugin_rdma_register");
+    *(void**)(&rdma_register_iova) =
+        dlsym(handle, "mai_exclusion_plugin_rdma_register_iova");
     *(void**)(&rdma_deregister) = dlsym(handle, "mai_exclusion_plugin_rdma_deregister");
     *(void**)(&mpi_alloc) = dlsym(handle, "mai_exclusion_plugin_mpi_alloc");
     *(void**)(&mpi_free) = dlsym(handle, "mai_exclusion_plugin_mpi_free");
     if (!cuda_register || !cuda_unregister || !cuda_alloc || !cuda_free ||
-        !rdma_register || !rdma_deregister || !mpi_alloc || !mpi_free) {
+        !cuda_managed_alloc || !cuda_managed_free ||
+        !hip_register || !hip_unregister || !hip_alloc || !hip_free ||
+        !hip_managed_alloc || !hip_managed_free ||
+        !rdma_register || !rdma_register_iova || !rdma_deregister ||
+        !mpi_alloc || !mpi_free) {
         dlclose(handle);
         return fail("dlsym exclusion plugin functions failed");
     }
@@ -1074,6 +1189,16 @@ static int mode_dlopen_exclusions(void) {
     MaiStats after_rdma_deregister;
     MaiStats after_cuda_alloc;
     MaiStats after_cuda_free;
+    MaiStats after_cuda_managed_alloc;
+    MaiStats after_cuda_managed_free;
+    MaiStats after_hip_register;
+    MaiStats after_hip_unregister;
+    MaiStats after_hip_alloc;
+    MaiStats after_hip_free;
+    MaiStats after_hip_managed_alloc;
+    MaiStats after_hip_managed_free;
+    MaiStats after_rdma_iova_register;
+    MaiStats after_rdma_iova_deregister;
     MaiStats after_mpi_alloc;
     MaiStats after_mpi_free;
 
@@ -1228,6 +1353,187 @@ static int mode_dlopen_exclusions(void) {
         return fail("CUDA host free did not release exclusion");
     }
 
+    void* cuda_managed = NULL;
+    if (cuda_managed_alloc(size, &cuda_managed) != 0 || !cuda_managed) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin cudaMallocManaged failed");
+    }
+    if (load_stats(&after_cuda_managed_alloc) != 0) {
+        cuda_managed_free(cuda_managed);
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after CUDA managed alloc");
+    }
+    if (!stats_show_exclusion(&after_cuda_free, &after_cuda_managed_alloc, size) ||
+        after_cuda_managed_alloc.managed_allocations !=
+            after_cuda_free.managed_allocations) {
+        cuda_managed_free(cuda_managed);
+        free(ptr);
+        dlclose(handle);
+        return fail("CUDA managed allocation was not marked excluded pass-through memory");
+    }
+    if (cuda_managed_free(cuda_managed) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin cudaFree failed for managed allocation");
+    }
+    if (load_stats(&after_cuda_managed_free) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after CUDA managed free");
+    }
+    if (after_cuda_managed_free.exclusion_release_events <=
+            after_cuda_managed_alloc.exclusion_release_events) {
+        free(ptr);
+        dlclose(handle);
+        return fail("CUDA managed free did not release exclusion");
+    }
+
+    if (hip_register(ptr, size) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin hipHostRegister failed");
+    }
+    if (load_stats(&after_hip_register) != 0) {
+        hip_unregister(ptr);
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after HIP register");
+    }
+    if (!stats_show_exclusion(&after_cuda_managed_free, &after_hip_register, size)) {
+        hip_unregister(ptr);
+        free(ptr);
+        dlclose(handle);
+        return fail("dlopen HIP register did not mark exclusion");
+    }
+    if (hip_unregister(ptr) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin hipHostUnregister failed");
+    }
+    if (load_stats(&after_hip_unregister) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after HIP unregister");
+    }
+    if (after_hip_unregister.exclusion_release_events <=
+            after_hip_register.exclusion_release_events ||
+        after_hip_unregister.excluded_ranges >= after_hip_register.excluded_ranges) {
+        free(ptr);
+        dlclose(handle);
+        return fail("HIP unregister did not release exclusion");
+    }
+
+    void* hip_pinned = NULL;
+    if (hip_alloc(size, &hip_pinned) != 0 || !hip_pinned) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin hipHostMalloc failed");
+    }
+    if (load_stats(&after_hip_alloc) != 0) {
+        hip_free(hip_pinned);
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after HIP host alloc");
+    }
+    if (!stats_show_exclusion(&after_hip_unregister, &after_hip_alloc, size) ||
+        after_hip_alloc.managed_allocations != after_hip_unregister.managed_allocations) {
+        hip_free(hip_pinned);
+        free(ptr);
+        dlclose(handle);
+        return fail("HIP host allocation was not marked excluded pass-through memory");
+    }
+    if (hip_free(hip_pinned) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin hipHostFree failed");
+    }
+    if (load_stats(&after_hip_free) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after HIP host free");
+    }
+    if (after_hip_free.exclusion_release_events <=
+            after_hip_alloc.exclusion_release_events) {
+        free(ptr);
+        dlclose(handle);
+        return fail("HIP host free did not release exclusion");
+    }
+
+    void* hip_managed = NULL;
+    if (hip_managed_alloc(size, &hip_managed) != 0 || !hip_managed) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin hipMallocManaged failed");
+    }
+    if (load_stats(&after_hip_managed_alloc) != 0) {
+        hip_managed_free(hip_managed);
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after HIP managed alloc");
+    }
+    if (!stats_show_exclusion(&after_hip_free, &after_hip_managed_alloc, size) ||
+        after_hip_managed_alloc.managed_allocations !=
+            after_hip_free.managed_allocations) {
+        hip_managed_free(hip_managed);
+        free(ptr);
+        dlclose(handle);
+        return fail("HIP managed allocation was not marked excluded pass-through memory");
+    }
+    if (hip_managed_free(hip_managed) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin hipFree failed for managed allocation");
+    }
+    if (load_stats(&after_hip_managed_free) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after HIP managed free");
+    }
+    if (after_hip_managed_free.exclusion_release_events <=
+            after_hip_managed_alloc.exclusion_release_events) {
+        free(ptr);
+        dlclose(handle);
+        return fail("HIP managed free did not release exclusion");
+    }
+
+    void* mr_iova = NULL;
+    if (rdma_register_iova(ptr, size, &mr_iova) != 0 || !mr_iova) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin ibv_reg_mr_iova failed");
+    }
+    if (load_stats(&after_rdma_iova_register) != 0) {
+        rdma_deregister(mr_iova);
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after RDMA iova register");
+    }
+    if (!stats_show_exclusion(&after_hip_managed_free, &after_rdma_iova_register,
+                              size)) {
+        rdma_deregister(mr_iova);
+        free(ptr);
+        dlclose(handle);
+        return fail("dlopen RDMA iova register did not mark exclusion");
+    }
+    if (rdma_deregister(mr_iova) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("plugin ibv_dereg_mr failed for iova MR");
+    }
+    if (load_stats(&after_rdma_iova_deregister) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("mai_get_stats failed after RDMA iova deregister");
+    }
+    if (after_rdma_iova_deregister.exclusion_release_events <=
+            after_rdma_iova_register.exclusion_release_events) {
+        free(ptr);
+        dlclose(handle);
+        return fail("RDMA iova deregister did not release exclusion");
+    }
+
     void* mpi_ptr = NULL;
     if (mpi_alloc(size, &mpi_ptr) != 0 || !mpi_ptr) {
         free(ptr);
@@ -1240,8 +1546,9 @@ static int mode_dlopen_exclusions(void) {
         dlclose(handle);
         return fail("mai_get_stats failed after MPI alloc");
     }
-    if (!stats_show_exclusion(&after_cuda_free, &after_mpi_alloc, size) ||
-        after_mpi_alloc.managed_allocations != after_cuda_free.managed_allocations) {
+    if (!stats_show_exclusion(&after_rdma_iova_deregister, &after_mpi_alloc, size) ||
+        after_mpi_alloc.managed_allocations !=
+            after_rdma_iova_deregister.managed_allocations) {
         mpi_free(mpi_ptr);
         free(ptr);
         dlclose(handle);
@@ -1352,6 +1659,9 @@ int main(int argc, char** argv) {
         return mode_pass_through_stats_default_off();
     }
     if (strcmp(argv[1], "preload_symbols") == 0) return mode_preload_symbols();
+    if (strcmp(argv[1], "missing_safety_symbols") == 0) {
+        return mode_missing_safety_symbols();
+    }
     if (strcmp(argv[1], "preload_path_stats") == 0) return mode_preload_path_stats();
     if (strcmp(argv[1], "frida_hook_mode") == 0) return mode_frida_hook_mode();
     if (strcmp(argv[1], "large") == 0) return mode_large();

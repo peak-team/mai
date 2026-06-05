@@ -65,6 +65,7 @@ endfunction()
 add_mai_runtime_test(mai_small_pass_through small)
 add_mai_runtime_test(mai_pass_through_stats_default_off pass_through_stats_default_off)
 add_mai_runtime_test(mai_direct_preload_symbols preload_symbols)
+add_mai_runtime_test(mai_missing_safety_runtime_symbols missing_safety_symbols)
 add_mai_runtime_test(mai_large_managed large)
 add_mai_runtime_test(mai_calloc calloc)
 add_mai_runtime_test(mai_realloc realloc)
@@ -271,6 +272,25 @@ if(CMAKE_Fortran_COMPILER)
             "LD_PRELOAD=$<TARGET_FILE:mai>"
             $<TARGET_FILE:mai_fortran_runtime_test>
     )
+endif()
+
+find_package(MPI COMPONENTS C QUIET)
+if(MPI_C_FOUND)
+    add_executable(mai_mpi_runtime_test mpi_runtime_test.c)
+    target_compile_features(mai_mpi_runtime_test PRIVATE c_std_11)
+    target_include_directories(mai_mpi_runtime_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(mai_mpi_runtime_test PRIVATE MPI::MPI_C ${DL_LIBRARY})
+    add_test(
+        NAME mai_real_mpi_alloc_mem_exclusion
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ENABLE=1"
+            "MAI_PATH=${MAI_TEST_SCRATCH}"
+            "MAI_THRESHOLD=4K"
+            "MAI_ARENA_SIZE=1M"
+            "LD_PRELOAD=$<TARGET_FILE:mai>"
+            $<TARGET_FILE:mai_mpi_runtime_test>
+    )
+    set_tests_properties(mai_real_mpi_alloc_mem_exclusion PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 add_test(
