@@ -45,7 +45,8 @@ target_link_libraries(mai_cxx_runtime_test PRIVATE mai ${DL_LIBRARY})
 
 add_executable(mai_benchmark benchmark_test.c)
 target_compile_features(mai_benchmark PRIVATE c_std_11)
-target_link_libraries(mai_benchmark PRIVATE Threads::Threads)
+target_include_directories(mai_benchmark PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(mai_benchmark PRIVATE Threads::Threads ${DL_LIBRARY})
 
 function(add_mai_runtime_test name mode)
     add_test(
@@ -470,4 +471,64 @@ add_test(
 )
 set_tests_properties(mai_benchmark_smoke PROPERTIES
     PASS_REGULAR_EXPRESSION "mode=single .*ns_per_op="
+)
+
+add_test(
+    NAME mai_benchmark_direct_preload_path_verified
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=1G"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_PATH_STATS=1"
+        "MAI_BENCH_EXPECT_PATH=preload"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_benchmark>
+        single
+        10000
+        64
+)
+set_tests_properties(mai_benchmark_direct_preload_path_verified PROPERTIES
+    PASS_REGULAR_EXPRESSION "preload_delta=[1-9][0-9]* frida_delta=0"
+)
+
+add_test(
+    NAME mai_benchmark_forced_frida_path_verified
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=1G"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_ALLOCATOR_HOOKS=frida"
+        "MAI_PATH_STATS=1"
+        "MAI_BENCH_ALLOCATOR=libc"
+        "MAI_BENCH_EXPECT_PATH=frida"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_benchmark>
+        single
+        10000
+        64
+)
+set_tests_properties(mai_benchmark_forced_frida_path_verified PROPERTIES
+    PASS_REGULAR_EXPRESSION "preload_delta=0 frida_delta=[1-9][0-9]*"
+)
+
+add_test(
+    NAME mai_benchmark_forced_frida_default_allocator_rejected
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=1G"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_ALLOCATOR_HOOKS=frida"
+        "MAI_PATH_STATS=1"
+        "MAI_BENCH_EXPECT_PATH=frida"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_benchmark>
+        single
+        10000
+        64
+)
+set_tests_properties(mai_benchmark_forced_frida_default_allocator_rejected PROPERTIES
+    WILL_FAIL TRUE
 )
