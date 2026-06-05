@@ -29,6 +29,9 @@ program mai_fortran_runtime_test
         integer(c_size_t) :: brk_calls
         integer(c_size_t) :: sbrk_calls
         integer(c_size_t) :: profile_sites
+        integer(c_size_t) :: hotness_samples
+        integer(c_size_t) :: hotness_sampled_pages
+        integer(c_size_t) :: hotness_resident_pages
     end type mai_stats
 
     interface

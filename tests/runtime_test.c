@@ -16,6 +16,7 @@
 
 typedef int (*get_stats_fn)(MaiStats*);
 typedef int (*reclaim_all_fn)(void);
+typedef int (*sample_hotness_fn)(void);
 typedef void* (*plugin_alloc_fn)(size_t);
 typedef size_t (*plugin_usable_fn)(void*);
 typedef void (*plugin_free_fn)(void*);
@@ -556,6 +557,76 @@ static int mode_profile(void) {
     return 0;
 }
 
+static int mode_hotness(void) {
+    sample_hotness_fn sample_hotness =
+        (sample_hotness_fn)dlsym(RTLD_DEFAULT, "mai_sample_hotness");
+    if (!sample_hotness) {
+        return fail("mai_sample_hotness is unavailable");
+    }
+
+    MaiStats before;
+    MaiStats after_alloc;
+    MaiStats after_sample;
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before hotness test");
+    }
+
+    unsigned char* ptr = calloc(1, 32768);
+    if (!ptr) {
+        return fail("hotness allocation failed");
+    }
+    for (size_t i = 0; i < 32768; i += 4096) {
+        ptr[i] = 0x4b;
+    }
+
+    if (load_stats(&after_alloc) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after hotness allocation");
+    }
+    if (!stats_show_managed_alloc(&before, &after_alloc, 32768)) {
+        free(ptr);
+        return fail("hotness allocation was not MAI-managed");
+    }
+
+    if (sample_hotness() != 0) {
+        free(ptr);
+        return fail("mai_sample_hotness failed");
+    }
+    if (load_stats(&after_sample) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after hotness sample");
+    }
+    if (after_sample.hotness_samples <= before.hotness_samples ||
+        after_sample.hotness_sampled_pages <= before.hotness_sampled_pages ||
+        after_sample.hotness_resident_pages <= before.hotness_resident_pages) {
+        free(ptr);
+        return fail("hotness sampling did not record resident managed pages");
+    }
+
+    free(ptr);
+    return 0;
+}
+
+static int mode_hotness_live_exit(void) {
+    unsigned char* ptr = calloc(1, 32768);
+    if (!ptr) {
+        return fail("hotness live-exit allocation failed");
+    }
+    for (size_t i = 0; i < 32768; i += 4096) {
+        ptr[i] = 0x2a;
+    }
+
+    MaiStats stats;
+    if (load_stats(&stats) != 0) {
+        return fail("mai_get_stats failed after hotness live-exit allocation");
+    }
+    if (stats.managed_allocations == 0 || stats.live_managed_bytes < 32768) {
+        return fail("hotness live-exit allocation was not MAI-managed");
+    }
+
+    return 0;
+}
+
 static int mode_diagnostics(void) {
     MaiStats before;
     MaiStats after;
@@ -850,6 +921,8 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "reclaim") == 0) return mode_reclaim();
     if (strcmp(argv[1], "target_rss") == 0) return mode_target_rss();
     if (strcmp(argv[1], "profile") == 0) return mode_profile();
+    if (strcmp(argv[1], "hotness") == 0) return mode_hotness();
+    if (strcmp(argv[1], "hotness_live_exit") == 0) return mode_hotness_live_exit();
     if (strcmp(argv[1], "diagnostics") == 0) return mode_diagnostics();
     if (strcmp(argv[1], "dlopen") == 0) return mode_dlopen();
     if (strcmp(argv[1], "dlopen_local_allocator") == 0) return mode_dlopen_local_allocator();

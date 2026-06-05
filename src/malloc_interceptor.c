@@ -19,6 +19,8 @@
 #define MAI_TRACK_BUCKETS 8192
 #define MAI_PROFILE_BUCKETS 1024
 #define MAI_FILE_TEMPLATE "mai-arena-XXXXXX"
+#define MAI_DEFAULT_HOTNESS_SAMPLE_PAGES 64
+#define MAI_MAX_HOTNESS_SAMPLE_PAGES 4096
 
 typedef enum {
     RECLAIM_NONE = 0,
@@ -83,6 +85,9 @@ struct AllocationRecord {
     void* call_site;
     size_t allocation_seq;
     size_t reclaim_epoch;
+    size_t hotness_samples;
+    size_t hotness_sampled_pages;
+    size_t hotness_resident_pages;
     ArenaSegment* segment;
     ArenaBlock* block;
     AllocationRecord* hash_next;
@@ -137,6 +142,8 @@ static size_t target_rss_bytes = 0;
 static ReclaimPolicy reclaim_policy = RECLAIM_NONE;
 static ReclaimSelection reclaim_selection = RECLAIM_SELECT_OLDEST;
 static int profile_enabled = 0;
+static int hotness_enabled = 0;
+static size_t hotness_sample_pages = MAI_DEFAULT_HOTNESS_SAMPLE_PAGES;
 
 static ArenaSegment* arena_segments = NULL;
 static size_t next_segment_id = 0;
@@ -352,6 +359,30 @@ static int parse_size_env(const char* value, size_t* out) {
     return 0;
 }
 
+static int parse_count_env(const char* value, size_t* out) {
+    char* end = NULL;
+    unsigned long long number;
+
+    if (!value || value[0] == '\0') {
+        return -1;
+    }
+
+    errno = 0;
+    number = strtoull(value, &end, 10);
+    if (errno != 0 || end == value) {
+        return -1;
+    }
+    while (*end && isspace((unsigned char)*end)) {
+        end++;
+    }
+    if (*end != '\0' || number > (unsigned long long)SIZE_MAX) {
+        return -1;
+    }
+
+    *out = (size_t)number;
+    return 0;
+}
+
 static void* meta_alloc(size_t size) {
     size_t total;
     size_t mapped;
@@ -450,6 +481,102 @@ static size_t update_observed_rss_locked(void) {
     }
 
     return rss;
+}
+
+static int sample_record_hotness_locked(AllocationRecord* record,
+                                        size_t* sampled_pages_out,
+                                        size_t* resident_pages_out,
+                                        size_t* total_pages_out) {
+    void* range_start = NULL;
+    size_t range_length = record_page_range(record, &range_start);
+    size_t total_pages;
+    size_t sample_pages;
+    size_t resident_pages = 0;
+    int rc = 0;
+
+    *sampled_pages_out = 0;
+    *resident_pages_out = 0;
+    *total_pages_out = 0;
+
+    if (range_length == 0) {
+        return 0;
+    }
+
+    total_pages = range_length / page_size;
+    if (total_pages == 0) {
+        return 0;
+    }
+
+    sample_pages = hotness_sample_pages;
+    if (sample_pages == 0 || sample_pages > total_pages) {
+        sample_pages = total_pages;
+    }
+
+    if (sample_pages == total_pages) {
+        unsigned char* vec = meta_alloc(sample_pages);
+        if (!vec) {
+            return -1;
+        }
+
+        if (mincore(range_start, range_length, vec) != 0) {
+            rc = -1;
+        } else {
+            for (size_t i = 0; i < sample_pages; i++) {
+                if (vec[i] & 1) {
+                    resident_pages++;
+                }
+            }
+        }
+        meta_free(vec);
+    } else {
+        uintptr_t start = (uintptr_t)range_start;
+        for (size_t i = 0; i < sample_pages; i++) {
+            size_t page_index = (i * total_pages) / sample_pages;
+            unsigned char vec = 0;
+            void* page = (void*)(start + page_index * page_size);
+            if (mincore(page, page_size, &vec) != 0) {
+                rc = -1;
+                continue;
+            }
+            if (vec & 1) {
+                resident_pages++;
+            }
+        }
+    }
+
+    if (rc == 0) {
+        record->hotness_samples++;
+        record->hotness_sampled_pages += sample_pages;
+        record->hotness_resident_pages += resident_pages;
+        stats_snapshot.hotness_samples++;
+        stats_snapshot.hotness_sampled_pages += sample_pages;
+        stats_snapshot.hotness_resident_pages += resident_pages;
+    }
+
+    *sampled_pages_out = sample_pages;
+    *resident_pages_out = resident_pages;
+    *total_pages_out = total_pages;
+    return rc;
+}
+
+static int sample_all_hotness_locked(void) {
+    int rc = 0;
+
+    if (!hotness_enabled) {
+        return 0;
+    }
+
+    for (AllocationRecord* record = live_head; record; record = record->live_next) {
+        size_t sampled_pages = 0;
+        size_t resident_pages = 0;
+        size_t total_pages = 0;
+        if (sample_record_hotness_locked(record, &sampled_pages, &resident_pages,
+                                         &total_pages) != 0) {
+            rc = -1;
+        }
+    }
+
+    return rc;
 }
 
 static DynamicReplacement* current_dynamic_replacement(HookKind kind) {
@@ -836,6 +963,9 @@ static AllocationRecord* carve_block_locked(ArenaBlock* block, size_t user_size,
     record->call_site = call_site;
     record->allocation_seq = ++allocation_sequence;
     record->reclaim_epoch = 0;
+    record->hotness_samples = 0;
+    record->hotness_sampled_pages = 0;
+    record->hotness_resident_pages = 0;
     record->segment = block->segment;
     record->block = block;
     record->hash_next = NULL;
@@ -1125,6 +1255,19 @@ int mai_reclaim_all(void) {
     return rc;
 }
 
+int mai_sample_hotness(void) {
+    int rc;
+    int saved_hook_depth = in_mai_hook;
+
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+    rc = sample_all_hotness_locked();
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+
+    return rc;
+}
+
 int mai_get_stats(MaiStats* out) {
     if (!out) {
         errno = EINVAL;
@@ -1159,7 +1302,8 @@ static void print_stats(void) {
             "live_managed=%zu high_water=%zu managed_allocs=%zu pass_through_allocs=%zu "
             "managed_frees=%zu reclaim_calls=%zu policy_reclaim_calls=%zu reclaimed_bytes=%zu "
             "mmap_calls=%zu munmap_calls=%zu mremap_calls=%zu brk_calls=%zu sbrk_calls=%zu "
-            "profile_sites=%zu\n",
+            "profile_sites=%zu hotness_samples=%zu hotness_sampled_pages=%zu "
+            "hotness_resident_pages=%zu\n",
             stats.enabled, stats.configured, stats.config_error, stats.threshold,
             stats.arena_size, stats.target_rss, stats.current_rss_bytes,
             stats.high_water_rss_bytes, stats.arena_segments, stats.arena_bytes,
@@ -1169,7 +1313,8 @@ static void print_stats(void) {
             stats.managed_frees, stats.reclaim_calls, stats.policy_reclaim_calls,
             stats.reclaimed_bytes, stats.mmap_calls, stats.munmap_calls,
             stats.mremap_calls, stats.brk_calls, stats.sbrk_calls,
-            stats.profile_sites);
+            stats.profile_sites, stats.hotness_samples, stats.hotness_sampled_pages,
+            stats.hotness_resident_pages);
 }
 
 static void print_profile_report(void) {
@@ -1198,6 +1343,57 @@ static void print_profile_report(void) {
                     record->bytes);
         }
     }
+}
+
+static void print_hotness_report(void) {
+    if (!hotness_enabled) {
+        return;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+
+    fprintf(stderr, "MAI hotness report: sample_pages=%zu\n", hotness_sample_pages);
+    if (!live_head) {
+        fprintf(stderr, "  no live managed allocations\n");
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_hook_depth;
+        return;
+    }
+
+    for (AllocationRecord* record = live_head; record; record = record->live_next) {
+        size_t sampled_pages = 0;
+        size_t resident_pages = 0;
+        size_t total_pages = 0;
+        Dl_info info;
+        const char* symbol = NULL;
+        const char* object = NULL;
+
+        (void)sample_record_hotness_locked(record, &sampled_pages, &resident_pages,
+                                           &total_pages);
+
+        if (dladdr(record->call_site, &info) != 0) {
+            symbol = info.dli_sname;
+            object = info.dli_fname;
+        }
+
+        fprintf(stderr,
+                "  seq=%zu ptr=%p size=%zu pages=%zu sampled=%zu resident=%zu "
+                "call_site=%p symbol=%s object=%s\n",
+                record->allocation_seq,
+                record->user_ptr,
+                record->user_size,
+                total_pages,
+                sampled_pages,
+                resident_pages,
+                record->call_site,
+                symbol ? symbol : "?",
+                object ? object : "?");
+    }
+
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
 }
 
 static int validate_directory(const char* path) {
@@ -1257,6 +1453,7 @@ static int configure_runtime(void) {
     const char* target_rss = getenv("MAI_TARGET_RSS");
     const char* reclaim = getenv("MAI_RECLAIM_POLICY");
     const char* reclaim_select = getenv("MAI_RECLAIM_SELECTION");
+    const char* hotness_sample = getenv("MAI_HOTNESS_SAMPLE_PAGES");
     const char* backing_path;
 
     runtime_enabled = parse_bool_env(enable);
@@ -1265,6 +1462,7 @@ static int configure_runtime(void) {
     verbose_logging = parse_bool_env(getenv("MAI_VERBOSE"));
     stats_logging = parse_bool_env(getenv("MAI_STATS"));
     profile_enabled = parse_bool_env(getenv("MAI_PROFILE"));
+    hotness_enabled = parse_bool_env(getenv("MAI_HOTNESS"));
     reclaim_policy = RECLAIM_NONE;
     reclaim_selection = RECLAIM_SELECT_OLDEST;
 
@@ -1276,6 +1474,7 @@ static int configure_runtime(void) {
     threshold_bytes = MAI_DEFAULT_THRESHOLD;
     arena_size_bytes = MAI_DEFAULT_ARENA_SIZE;
     target_rss_bytes = 0;
+    hotness_sample_pages = MAI_DEFAULT_HOTNESS_SAMPLE_PAGES;
 
     memset(&stats_snapshot, 0, sizeof(stats_snapshot));
     memset(allocation_buckets, 0, sizeof(allocation_buckets));
@@ -1302,12 +1501,22 @@ static int configure_runtime(void) {
         runtime_config_error = 1;
         return -1;
     }
+    if (hotness_sample && parse_count_env(hotness_sample, &hotness_sample_pages) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
 
     if (threshold_bytes == 0) {
         threshold_bytes = 1;
     }
     if (arena_size_bytes < MAI_MIN_ARENA_SIZE) {
         arena_size_bytes = MAI_MIN_ARENA_SIZE;
+    }
+    if (hotness_sample_pages == 0) {
+        hotness_sample_pages = 1;
+    }
+    if (hotness_sample_pages > MAI_MAX_HOTNESS_SAMPLE_PAGES) {
+        hotness_sample_pages = MAI_MAX_HOTNESS_SAMPLE_PAGES;
     }
 
     if (reclaim) {
@@ -2173,9 +2382,10 @@ void malloc_interceptor_detach(void) {
     cleanup_in_progress = 1;
     revert_replacements();
 
-    if (stats_logging || verbose_logging) {
+    if (stats_logging || verbose_logging || profile_enabled || hotness_enabled) {
         print_stats();
         print_profile_report();
+        print_hotness_report();
     }
 
     if (malloc_interceptor) {

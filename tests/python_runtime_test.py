@@ -33,6 +33,9 @@ class MaiStats(ctypes.Structure):
         ("brk_calls", ctypes.c_size_t),
         ("sbrk_calls", ctypes.c_size_t),
         ("profile_sites", ctypes.c_size_t),
+        ("hotness_samples", ctypes.c_size_t),
+        ("hotness_sampled_pages", ctypes.c_size_t),
+        ("hotness_resident_pages", ctypes.c_size_t),
     ]
 
 

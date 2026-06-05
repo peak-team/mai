@@ -54,6 +54,9 @@ typedef struct {
     size_t brk_calls;
     size_t sbrk_calls;
     size_t profile_sites;
+    size_t hotness_samples;
+    size_t hotness_sampled_pages;
+    size_t hotness_resident_pages;
 } MaiStats;
 
 #ifdef __cplusplus
@@ -78,6 +81,9 @@ int mai_get_stats(MaiStats* stats);
 
 __attribute__((visibility("default")))
 int mai_reclaim_all(void);
+
+__attribute__((visibility("default")))
+int mai_sample_hotness(void);
 
 #ifdef __cplusplus
 }

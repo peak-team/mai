@@ -12,8 +12,8 @@ allocator entry points.
 
 ## Current Scope
 
-This version focuses on a correct storage-backed allocator with initial reclaim,
-diagnostics, and profiling support:
+This version focuses on a correct storage-backed allocator with reclaim,
+diagnostics, profiling, and sampled hotness support:
 
 - `MAI_ENABLE=1` opt-in runtime activation.
 - Small heap allocations pass through to the original allocator.
@@ -27,6 +27,11 @@ diagnostics, and profiling support:
 - Backing files are unlinked immediately after mapping to avoid stale files.
 - Basic stats, diagnostics counters, manual reclaim, and target-driven reclaim
   are available.
+- Allocation call-site profiling is available through the Frida/Gum allocation
+  hooks.
+- Optional live-allocation hotness sampling uses `mincore()` on bounded samples
+  of MAI-managed pages. This reports resident-page estimates, not exact access
+  frequency.
 - `dlopen`/`dlmopen` are monitored so newly loaded shared objects, including
   Python extension modules, get a best-effort allocator hook refresh.
   This is mainly for DSOs that introduce their own exported allocator entry
@@ -88,6 +93,8 @@ MAI_TARGET_RSS=0
 MAI_RECLAIM_POLICY=none
 MAI_RECLAIM_SELECTION=oldest
 MAI_PROFILE=1
+MAI_HOTNESS=1
+MAI_HOTNESS_SAMPLE_PAGES=64
 MAI_VERBOSE=1
 MAI_STATS=1
 ```
@@ -127,9 +134,14 @@ Manual reclaim is available through `mai_reclaim_all()`. Reclaim uses
 kernel reloading from the backing file.
 
 `MAI_PROFILE=1` records allocation call-site counters in metadata outside the
-managed arena. When `MAI_STATS=1` is also set, MAI prints a call-site report at
-shutdown. This is an allocation/reclaim heuristic aid, not precise page hotness
-tracking.
+managed arena and prints a call-site report at shutdown.
+
+`MAI_HOTNESS=1` enables optional sampled hotness reporting for live MAI-managed
+allocations. MAI samples at most `MAI_HOTNESS_SAMPLE_PAGES` pages per live
+allocation with `mincore()` and reports how many sampled pages are resident.
+This is a low-overhead residency proxy, not precise page access-frequency
+tracking. `mai_sample_hotness()` can be called by tests or tools to trigger a
+manual sample before shutdown.
 
 ## Build
 
@@ -156,7 +168,6 @@ LD_PRELOAD=/path/to/libmai.so \
 
 The next phases are:
 
-1. Add sampled page-hotness estimation.
-2. Extend runtime support for Fortran runtimes and optional Python/NumPy-specific
+1. Extend runtime support for Fortran runtimes and optional Python/NumPy-specific
    integration.
-3. Add exclusion hooks for pinned, mlocked, MPI/RDMA, and GPU memory.
+2. Add exclusion hooks for pinned, mlocked, MPI/RDMA, and GPU memory.
