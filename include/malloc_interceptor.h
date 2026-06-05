@@ -57,6 +57,10 @@ typedef struct {
     size_t hotness_samples;
     size_t hotness_sampled_pages;
     size_t hotness_resident_pages;
+    size_t allocator_hook_mode;
+    size_t allocator_libc_patches;
+    size_t allocator_preload_calls;
+    size_t allocator_frida_calls;
 } MaiStats;
 
 #ifdef __cplusplus

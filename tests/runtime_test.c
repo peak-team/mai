@@ -144,6 +144,53 @@ static int mode_preload_symbols(void) {
     return 0;
 }
 
+static int mode_preload_path_stats(void) {
+    MaiStats before;
+    MaiStats after;
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before preload path stats test");
+    }
+    if (before.allocator_hook_mode != 1) {
+        return fail("default allocator hook mode is not direct preload");
+    }
+    if (before.allocator_libc_patches != 0) {
+        return fail("default preload mode unexpectedly patched libc allocator symbols");
+    }
+
+    void* ptr = malloc(128);
+    if (!ptr) {
+        return fail("preload path stats malloc failed");
+    }
+    free(ptr);
+
+    if (load_stats(&after) != 0) {
+        return fail("mai_get_stats failed after preload path stats test");
+    }
+    if (after.allocator_preload_calls <= before.allocator_preload_calls) {
+        return fail("direct preload allocator path was not counted");
+    }
+    if (after.allocator_frida_calls != before.allocator_frida_calls) {
+        return fail("direct preload small allocation unexpectedly used Frida path");
+    }
+
+    return 0;
+}
+
+static int mode_frida_hook_mode(void) {
+    MaiStats stats;
+    if (load_stats(&stats) != 0) {
+        return fail("mai_get_stats failed in Frida hook mode test");
+    }
+    if (stats.allocator_hook_mode != 2) {
+        return fail("forced Frida allocator hook mode was not recorded");
+    }
+    if (stats.allocator_libc_patches == 0) {
+        return fail("forced Frida allocator hook mode did not patch libc allocator symbols");
+    }
+
+    return 0;
+}
+
 static int mode_large(void) {
     MaiStats before;
     MaiStats after_alloc;
@@ -895,6 +942,12 @@ static int mode_dlopen_local_allocator(void) {
         dlclose(handle);
         return fail("dlopen refresh did not hook plugin-local malloc");
     }
+    if (getenv("MAI_PATH_STATS") &&
+        after_alloc.allocator_frida_calls <= before.allocator_frida_calls) {
+        plugin_free(ptr);
+        dlclose(handle);
+        return fail("plugin-local allocator fallback did not use Frida path");
+    }
 
     plugin_free(ptr);
     if (load_stats(&after_free) != 0) {
@@ -992,6 +1045,8 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "disabled") == 0) return mode_disabled();
     if (strcmp(argv[1], "small") == 0) return mode_small();
     if (strcmp(argv[1], "preload_symbols") == 0) return mode_preload_symbols();
+    if (strcmp(argv[1], "preload_path_stats") == 0) return mode_preload_path_stats();
+    if (strcmp(argv[1], "frida_hook_mode") == 0) return mode_frida_hook_mode();
     if (strcmp(argv[1], "large") == 0) return mode_large();
     if (strcmp(argv[1], "calloc") == 0) return mode_calloc();
     if (strcmp(argv[1], "realloc") == 0) return mode_realloc();

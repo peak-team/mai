@@ -23,6 +23,8 @@
 #define MAI_DEFAULT_HOTNESS_SAMPLE_PAGES 64
 #define MAI_MAX_HOTNESS_SAMPLE_PAGES 4096
 #define MAI_PASS_THROUGH_FLUSH_INTERVAL 1024
+#define MAI_ALLOCATOR_HOOK_MODE_PRELOAD 1
+#define MAI_ALLOCATOR_HOOK_MODE_FRIDA 2
 
 typedef enum {
     RECLAIM_NONE = 0,
@@ -112,8 +114,12 @@ struct ProfileRecord {
 struct PassThroughCounter {
     size_t pending_allocations;
     size_t pending_bytes;
+    size_t pending_preload_allocator_calls;
+    size_t pending_frida_allocator_calls;
     atomic_size_t flushed_allocations;
     atomic_size_t flushed_bytes;
+    atomic_size_t flushed_preload_allocator_calls;
+    atomic_size_t flushed_frida_allocator_calls;
     size_t generation;
     PassThroughCounter* next;
 };
@@ -147,6 +153,7 @@ static int hooks_attached = 0;
 static int gum_initialized = 0;
 static int verbose_logging = 0;
 static int stats_logging = 0;
+static int path_stats_enabled = 0;
 static int cleanup_in_progress = 0;
 static int direct_allocator_interposition = 0;
 static char mai_path[PATH_MAX];
@@ -929,15 +936,23 @@ static void flush_pass_through_counter(PassThroughCounter* counter) {
 
     size_t allocations = counter->pending_allocations;
     size_t bytes = counter->pending_bytes;
-    if (allocations == 0 && bytes == 0) {
+    size_t preload_calls = counter->pending_preload_allocator_calls;
+    size_t frida_calls = counter->pending_frida_allocator_calls;
+    if (allocations == 0 && bytes == 0 && preload_calls == 0 && frida_calls == 0) {
         return;
     }
 
     counter->pending_allocations = 0;
     counter->pending_bytes = 0;
+    counter->pending_preload_allocator_calls = 0;
+    counter->pending_frida_allocator_calls = 0;
     atomic_fetch_add_explicit(&counter->flushed_allocations, allocations,
                               memory_order_relaxed);
     atomic_fetch_add_explicit(&counter->flushed_bytes, bytes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&counter->flushed_preload_allocator_calls, preload_calls,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&counter->flushed_frida_allocator_calls, frida_calls,
+                              memory_order_relaxed);
 }
 
 static void pass_through_counter_destructor(void* value) {
@@ -970,6 +985,8 @@ static PassThroughCounter* get_pass_through_counter(void) {
     memset(counter, 0, sizeof(*counter));
     atomic_init(&counter->flushed_allocations, 0);
     atomic_init(&counter->flushed_bytes, 0);
+    atomic_init(&counter->flushed_preload_allocator_calls, 0);
+    atomic_init(&counter->flushed_frida_allocator_calls, 0);
     counter->generation = pass_through_counter_generation;
 
     pthread_mutex_lock(&runtime_lock);
@@ -992,11 +1009,15 @@ static void flush_current_pass_through_counter(void) {
     }
 }
 
-static void snapshot_pass_through_counters_locked(size_t* allocations, size_t* bytes) {
+static void snapshot_pass_through_counters_locked(size_t* allocations, size_t* bytes,
+                                                  size_t* preload_calls,
+                                                  size_t* frida_calls) {
     size_t total_allocations = atomic_load_explicit(
         &pass_through_fallback_allocations_counter, memory_order_relaxed);
     size_t total_bytes = atomic_load_explicit(
         &pass_through_fallback_bytes_counter, memory_order_relaxed);
+    size_t total_preload_calls = 0;
+    size_t total_frida_calls = 0;
 
     for (PassThroughCounter* counter = pass_through_counters;
          counter;
@@ -1005,10 +1026,16 @@ static void snapshot_pass_through_counters_locked(size_t* allocations, size_t* b
                                                   memory_order_relaxed);
         total_bytes += atomic_load_explicit(&counter->flushed_bytes,
                                             memory_order_relaxed);
+        total_preload_calls += atomic_load_explicit(
+            &counter->flushed_preload_allocator_calls, memory_order_relaxed);
+        total_frida_calls += atomic_load_explicit(
+            &counter->flushed_frida_allocator_calls, memory_order_relaxed);
     }
 
     *allocations = total_allocations;
     *bytes = total_bytes;
+    *preload_calls = total_preload_calls;
+    *frida_calls = total_frida_calls;
 }
 
 static void stats_note_pass_through(size_t size) {
@@ -1035,6 +1062,50 @@ static void stats_note_pass_through(size_t size) {
 static void stats_note_pass_through_threadsafe(size_t size) {
     stats_note_pass_through(size);
 }
+
+static void stats_note_allocator_path(int preload_path) {
+    if (!path_stats_enabled || !runtime_configured || cleanup_in_progress) {
+        return;
+    }
+
+    PassThroughCounter* counter = get_pass_through_counter();
+    if (!counter) {
+        return;
+    }
+
+    if (preload_path) {
+        counter->pending_preload_allocator_calls++;
+    } else {
+        counter->pending_frida_allocator_calls++;
+    }
+
+    if (counter->pending_preload_allocator_calls +
+            counter->pending_frida_allocator_calls >= MAI_PASS_THROUGH_FLUSH_INTERVAL) {
+        flush_pass_through_counter(counter);
+    }
+}
+
+static void stats_note_preload_allocator_path(void) {
+    stats_note_allocator_path(1);
+}
+
+static void stats_note_frida_allocator_path(void) {
+    stats_note_allocator_path(0);
+}
+
+#define NOTE_PRELOAD_ALLOCATOR_PATH() \
+    do { \
+        if (path_stats_enabled) { \
+            stats_note_preload_allocator_path(); \
+        } \
+    } while (0)
+
+#define NOTE_FRIDA_ALLOCATOR_PATH() \
+    do { \
+        if (path_stats_enabled) { \
+            stats_note_frida_allocator_path(); \
+        } \
+    } while (0)
 
 static void* fast_pass_through_malloc(size_t size) {
     void* ptr = pass_through_malloc(size);
@@ -1637,7 +1708,9 @@ int mai_get_stats(MaiStats* out) {
     update_observed_rss_locked();
     *out = stats_snapshot;
     snapshot_pass_through_counters_locked(&out->pass_through_allocations,
-                                          &out->pass_through_bytes_total);
+                                          &out->pass_through_bytes_total,
+                                          &out->allocator_preload_calls,
+                                          &out->allocator_frida_calls);
     out->enabled = runtime_enabled;
     out->configured = runtime_configured;
     out->config_error = runtime_config_error;
@@ -1664,7 +1737,8 @@ static void print_stats(void) {
             "managed_frees=%zu reclaim_calls=%zu policy_reclaim_calls=%zu reclaimed_bytes=%zu "
             "mmap_calls=%zu munmap_calls=%zu mremap_calls=%zu brk_calls=%zu sbrk_calls=%zu "
             "profile_sites=%zu hotness_samples=%zu hotness_sampled_pages=%zu "
-            "hotness_resident_pages=%zu\n",
+            "hotness_resident_pages=%zu allocator_hook_mode=%zu allocator_libc_patches=%zu "
+            "allocator_preload_calls=%zu allocator_frida_calls=%zu\n",
             stats.enabled, stats.configured, stats.config_error, stats.threshold,
             stats.arena_size, stats.target_rss, stats.current_rss_bytes,
             stats.high_water_rss_bytes, stats.arena_segments, stats.arena_bytes,
@@ -1675,7 +1749,9 @@ static void print_stats(void) {
             stats.reclaimed_bytes, stats.mmap_calls, stats.munmap_calls,
             stats.mremap_calls, stats.brk_calls, stats.sbrk_calls,
             stats.profile_sites, stats.hotness_samples, stats.hotness_sampled_pages,
-            stats.hotness_resident_pages);
+            stats.hotness_resident_pages, stats.allocator_hook_mode,
+            stats.allocator_libc_patches, stats.allocator_preload_calls,
+            stats.allocator_frida_calls);
 }
 
 static void print_profile_report(void) {
@@ -1822,6 +1898,7 @@ static int configure_runtime(void) {
     runtime_config_error = 0;
     verbose_logging = parse_bool_env(getenv("MAI_VERBOSE"));
     stats_logging = parse_bool_env(getenv("MAI_STATS"));
+    path_stats_enabled = parse_bool_env(getenv("MAI_PATH_STATS"));
     profile_enabled = parse_bool_env(getenv("MAI_PROFILE"));
     hotness_enabled = parse_bool_env(getenv("MAI_HOTNESS"));
     reclaim_policy = RECLAIM_NONE;
@@ -2253,6 +2330,7 @@ void* malloc(size_t size) {
     if (resolving_original_allocators) {
         return fallback_malloc(size);
     }
+    NOTE_PRELOAD_ALLOCATOR_PATH();
     if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
         return call_libc_malloc(size);
     }
@@ -2272,6 +2350,7 @@ void free(void* ptr) {
         fallback_free(ptr);
         return;
     }
+    NOTE_PRELOAD_ALLOCATOR_PATH();
     if (!ptr) {
         return;
     }
@@ -2290,6 +2369,7 @@ void* calloc(size_t nmemb, size_t size) {
     if (resolving_original_allocators) {
         return fallback_calloc(nmemb, size);
     }
+    NOTE_PRELOAD_ALLOCATOR_PATH();
     size_t total = 0;
     if (mul_overflow(nmemb, size, &total) != 0) {
         return NULL;
@@ -2312,6 +2392,7 @@ void* realloc(void* ptr, size_t size) {
     if (resolving_original_allocators) {
         return fallback_realloc(ptr, size);
     }
+    NOTE_PRELOAD_ALLOCATOR_PATH();
     if (!ptr) {
         return malloc(size);
     }
@@ -2335,6 +2416,7 @@ void* aligned_alloc(size_t alignment, size_t size) {
     if (resolving_original_allocators) {
         return fallback_memalign(alignment, size);
     }
+    NOTE_PRELOAD_ALLOCATOR_PATH();
     return custom_aligned_alloc_from_site(alignment, size, __builtin_return_address(0));
 }
 
@@ -2348,6 +2430,7 @@ int posix_memalign(void** memptr, size_t alignment, size_t size) {
         *memptr = ptr;
         return 0;
     }
+    NOTE_PRELOAD_ALLOCATOR_PATH();
     return custom_posix_memalign_from_site(memptr, alignment, size,
                                            __builtin_return_address(0));
 }
@@ -2357,16 +2440,19 @@ void* memalign(size_t alignment, size_t size) {
     if (resolving_original_allocators) {
         return fallback_memalign(alignment, size);
     }
+    NOTE_PRELOAD_ALLOCATOR_PATH();
     return custom_memalign_from_site(alignment, size, __builtin_return_address(0));
 }
 
 __attribute__((visibility("default")))
 void* valloc(size_t size) {
+    NOTE_PRELOAD_ALLOCATOR_PATH();
     return custom_memalign_from_site(page_size, size, __builtin_return_address(0));
 }
 
 __attribute__((visibility("default")))
 void* pvalloc(size_t size) {
+    NOTE_PRELOAD_ALLOCATOR_PATH();
     size_t rounded = align_up_size(size, page_size);
     if (rounded == 0) {
         return NULL;
@@ -2376,6 +2462,7 @@ void* pvalloc(size_t size) {
 
 __attribute__((visibility("default")))
 size_t malloc_usable_size(void* ptr) {
+    NOTE_PRELOAD_ALLOCATOR_PATH();
     if (!ptr || resolving_original_allocators || cleanup_in_progress ||
         !runtime_configured || !pointer_may_be_managed(ptr)) {
         return call_libc_malloc_usable_size(ptr);
@@ -2452,6 +2539,56 @@ static void* custom_sbrk(intptr_t increment) {
     return original_sbrk(increment);
 }
 
+static void* frida_malloc(size_t size) {
+    NOTE_FRIDA_ALLOCATOR_PATH();
+    return custom_malloc(size);
+}
+
+static void frida_free(void* ptr) {
+    NOTE_FRIDA_ALLOCATOR_PATH();
+    custom_free(ptr);
+}
+
+static void* frida_calloc(size_t nmemb, size_t size) {
+    NOTE_FRIDA_ALLOCATOR_PATH();
+    return custom_calloc(nmemb, size);
+}
+
+static void* frida_realloc(void* ptr, size_t size) {
+    NOTE_FRIDA_ALLOCATOR_PATH();
+    return custom_realloc(ptr, size);
+}
+
+static void* frida_aligned_alloc(size_t alignment, size_t size) {
+    NOTE_FRIDA_ALLOCATOR_PATH();
+    return custom_aligned_alloc(alignment, size);
+}
+
+static int frida_posix_memalign(void** memptr, size_t alignment, size_t size) {
+    NOTE_FRIDA_ALLOCATOR_PATH();
+    return custom_posix_memalign(memptr, alignment, size);
+}
+
+static void* frida_memalign(size_t alignment, size_t size) {
+    NOTE_FRIDA_ALLOCATOR_PATH();
+    return custom_memalign(alignment, size);
+}
+
+static void* frida_valloc(size_t size) {
+    NOTE_FRIDA_ALLOCATOR_PATH();
+    return custom_valloc(size);
+}
+
+static void* frida_pvalloc(size_t size) {
+    NOTE_FRIDA_ALLOCATOR_PATH();
+    return custom_pvalloc(size);
+}
+
+static size_t frida_malloc_usable_size(void* ptr) {
+    NOTE_FRIDA_ALLOCATOR_PATH();
+    return custom_malloc_usable_size(ptr);
+}
+
 typedef struct {
     HookKind kind;
     const char* symbol;
@@ -2459,16 +2596,16 @@ typedef struct {
 } DynamicHookSpec;
 
 static const DynamicHookSpec dynamic_hook_specs[] = {
-    { HOOK_MALLOC, "malloc", (gpointer)custom_malloc },
-    { HOOK_FREE, "free", (gpointer)custom_free },
-    { HOOK_CALLOC, "calloc", (gpointer)custom_calloc },
-    { HOOK_REALLOC, "realloc", (gpointer)custom_realloc },
-    { HOOK_ALIGNED_ALLOC, "aligned_alloc", (gpointer)custom_aligned_alloc },
-    { HOOK_POSIX_MEMALIGN, "posix_memalign", (gpointer)custom_posix_memalign },
-    { HOOK_MEMALIGN, "memalign", (gpointer)custom_memalign },
-    { HOOK_VALLOC, "valloc", (gpointer)custom_valloc },
-    { HOOK_PVALLOC, "pvalloc", (gpointer)custom_pvalloc },
-    { HOOK_MALLOC_USABLE_SIZE, "malloc_usable_size", (gpointer)custom_malloc_usable_size },
+    { HOOK_MALLOC, "malloc", (gpointer)frida_malloc },
+    { HOOK_FREE, "free", (gpointer)frida_free },
+    { HOOK_CALLOC, "calloc", (gpointer)frida_calloc },
+    { HOOK_REALLOC, "realloc", (gpointer)frida_realloc },
+    { HOOK_ALIGNED_ALLOC, "aligned_alloc", (gpointer)frida_aligned_alloc },
+    { HOOK_POSIX_MEMALIGN, "posix_memalign", (gpointer)frida_posix_memalign },
+    { HOOK_MEMALIGN, "memalign", (gpointer)frida_memalign },
+    { HOOK_VALLOC, "valloc", (gpointer)frida_valloc },
+    { HOOK_PVALLOC, "pvalloc", (gpointer)frida_pvalloc },
+    { HOOK_MALLOC_USABLE_SIZE, "malloc_usable_size", (gpointer)frida_malloc_usable_size },
 };
 
 static int hook_address_is_known(gpointer address) {
@@ -2914,27 +3051,27 @@ int malloc_interceptor_attach(void) {
     gum_interceptor_begin_transaction(malloc_interceptor);
 
     if (patch_libc_allocators) {
-        failed |= replace_fast(malloc_addr, (gpointer)custom_malloc,
+        failed |= replace_fast(malloc_addr, (gpointer)frida_malloc,
                                (gpointer*)&original_malloc, &malloc_replaced, "malloc");
-        failed |= replace_fast(free_addr, (gpointer)custom_free,
+        failed |= replace_fast(free_addr, (gpointer)frida_free,
                                (gpointer*)&original_free, &free_replaced, "free");
-        failed |= replace_fast(calloc_addr, (gpointer)custom_calloc,
+        failed |= replace_fast(calloc_addr, (gpointer)frida_calloc,
                                (gpointer*)&original_calloc, &calloc_replaced, "calloc");
-        failed |= replace_fast(realloc_addr, (gpointer)custom_realloc,
+        failed |= replace_fast(realloc_addr, (gpointer)frida_realloc,
                                (gpointer*)&original_realloc, &realloc_replaced, "realloc");
-        failed |= replace_fast(aligned_alloc_addr, (gpointer)custom_aligned_alloc,
+        failed |= replace_fast(aligned_alloc_addr, (gpointer)frida_aligned_alloc,
                                (gpointer*)&original_aligned_alloc,
                                &aligned_alloc_replaced, "aligned_alloc");
-        failed |= replace_regular(posix_memalign_addr, (gpointer)custom_posix_memalign,
+        failed |= replace_regular(posix_memalign_addr, (gpointer)frida_posix_memalign,
                                   (gpointer*)&original_posix_memalign,
                                   &posix_memalign_replaced, "posix_memalign");
-        failed |= replace_fast(memalign_addr, (gpointer)custom_memalign,
+        failed |= replace_fast(memalign_addr, (gpointer)frida_memalign,
                                (gpointer*)&original_memalign, &memalign_replaced, "memalign");
-        failed |= replace_fast(valloc_addr, (gpointer)custom_valloc,
+        failed |= replace_fast(valloc_addr, (gpointer)frida_valloc,
                                (gpointer*)&original_valloc, &valloc_replaced, "valloc");
-        failed |= replace_fast(pvalloc_addr, (gpointer)custom_pvalloc,
+        failed |= replace_fast(pvalloc_addr, (gpointer)frida_pvalloc,
                                (gpointer*)&original_pvalloc, &pvalloc_replaced, "pvalloc");
-        failed |= replace_fast(malloc_usable_size_addr, (gpointer)custom_malloc_usable_size,
+        failed |= replace_fast(malloc_usable_size_addr, (gpointer)frida_malloc_usable_size,
                                (gpointer*)&original_malloc_usable_size,
                                &malloc_usable_size_replaced, "malloc_usable_size");
     }
@@ -2971,6 +3108,19 @@ int malloc_interceptor_attach(void) {
     }
 
     hooks_attached = 1;
+    stats_snapshot.allocator_hook_mode = patch_libc_allocators ?
+        MAI_ALLOCATOR_HOOK_MODE_FRIDA : MAI_ALLOCATOR_HOOK_MODE_PRELOAD;
+    stats_snapshot.allocator_libc_patches =
+        (size_t)malloc_replaced +
+        (size_t)free_replaced +
+        (size_t)calloc_replaced +
+        (size_t)realloc_replaced +
+        (size_t)aligned_alloc_replaced +
+        (size_t)posix_memalign_replaced +
+        (size_t)memalign_replaced +
+        (size_t)valloc_replaced +
+        (size_t)pvalloc_replaced +
+        (size_t)malloc_usable_size_replaced;
     if (verbose_logging) {
         fprintf(stderr,
                 "MAI: enabled path=%s threshold=%zu arena_size=%zu reclaim=%d "

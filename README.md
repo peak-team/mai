@@ -99,6 +99,7 @@ MAI_HOTNESS_SAMPLE_PAGES=64
 MAI_VERBOSE=1
 MAI_STATS=1
 MAI_ALLOCATOR_HOOKS=auto
+MAI_PATH_STATS=0
 ```
 
 `MAI_PATH` is preferred. If it is not set, MAI attempts to discover a scratch
@@ -120,6 +121,10 @@ points with Frida/Gum:
 
 Even in preload mode, MAI still uses Frida/Gum for `dlopen` refreshes and
 diagnostic hooks.
+
+`MAI_PATH_STATS=1` enables diagnostic counters that distinguish direct
+preload allocator entries from Frida/Gum replacement entries. It is intended
+for tests and troubleshooting; leave it disabled for performance measurements.
 
 `MAI_RECLAIM_POLICY` may be:
 

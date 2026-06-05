@@ -36,6 +36,10 @@ class MaiStats(ctypes.Structure):
         ("hotness_samples", ctypes.c_size_t),
         ("hotness_sampled_pages", ctypes.c_size_t),
         ("hotness_resident_pages", ctypes.c_size_t),
+        ("allocator_hook_mode", ctypes.c_size_t),
+        ("allocator_libc_patches", ctypes.c_size_t),
+        ("allocator_preload_calls", ctypes.c_size_t),
+        ("allocator_frida_calls", ctypes.c_size_t),
     ]
 
 

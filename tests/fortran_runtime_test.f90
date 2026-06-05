@@ -32,6 +32,10 @@ program mai_fortran_runtime_test
         integer(c_size_t) :: hotness_samples
         integer(c_size_t) :: hotness_sampled_pages
         integer(c_size_t) :: hotness_resident_pages
+        integer(c_size_t) :: allocator_hook_mode
+        integer(c_size_t) :: allocator_libc_patches
+        integer(c_size_t) :: allocator_preload_calls
+        integer(c_size_t) :: allocator_frida_calls
     end type mai_stats
 
     interface

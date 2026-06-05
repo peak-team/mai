@@ -67,6 +67,33 @@ add_mai_runtime_test(mai_multithreaded_small_pass_through_stats thread_small_sta
 add_mai_runtime_test(mai_mmap_brk_diagnostics diagnostics)
 
 add_test(
+    NAME mai_direct_preload_path_stats
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_PATH_STATS=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        preload_path_stats
+)
+
+add_test(
+    NAME mai_forced_frida_allocator_mode
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_ALLOCATOR_HOOKS=frida"
+        "MAI_PATH_STATS=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        frida_hook_mode
+)
+
+add_test(
     NAME mai_scratch_env_discovery
     COMMAND ${CMAKE_COMMAND} -E env
         --unset=MAI_PATH
@@ -118,6 +145,20 @@ add_test(
         "MAI_PATH=${MAI_TEST_SCRATCH}"
         "MAI_THRESHOLD=4K"
         "MAI_ARENA_SIZE=1M"
+        "MAI_TEST_LOCAL_ALLOCATOR_PLUGIN=$<TARGET_FILE:mai_local_allocator_plugin>"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        dlopen_local_allocator
+)
+
+add_test(
+    NAME mai_dlopen_local_allocator_fallback_path_stats
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_PATH_STATS=1"
         "MAI_TEST_LOCAL_ALLOCATOR_PLUGIN=$<TARGET_FILE:mai_local_allocator_plugin>"
         "LD_PRELOAD=$<TARGET_FILE:mai>"
         $<TARGET_FILE:mai_runtime_test>
