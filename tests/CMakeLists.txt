@@ -529,6 +529,14 @@ set_tests_properties(mai_benchmark_smoke PROPERTIES
 )
 
 add_test(
+    NAME mai_benchmark_calloc_smoke
+    COMMAND $<TARGET_FILE:mai_benchmark> single_calloc 1000 64
+)
+set_tests_properties(mai_benchmark_calloc_smoke PROPERTIES
+    PASS_REGULAR_EXPRESSION "mode=single_calloc .*ns_per_op="
+)
+
+add_test(
     NAME mai_benchmark_direct_preload_path_verified
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"

@@ -15,14 +15,17 @@
 typedef struct {
     size_t iterations;
     size_t size;
+    int zero_allocate;
     uintptr_t checksum;
 } WorkerArgs;
 
 typedef void* (*bench_malloc_fn)(size_t);
+typedef void* (*bench_calloc_fn)(size_t, size_t);
 typedef void (*bench_free_fn)(void*);
 typedef int (*get_stats_fn)(MaiStats*);
 
 static bench_malloc_fn benchmark_malloc = malloc;
+static bench_calloc_fn benchmark_calloc = calloc;
 static bench_free_fn benchmark_free = free;
 static const char* allocator_source = "default";
 
@@ -53,6 +56,7 @@ static int configure_allocator_source(void) {
     if (!source || source[0] == '\0' || strcmp(source, "default") == 0) {
         allocator_source = "default";
         benchmark_malloc = malloc;
+        benchmark_calloc = calloc;
         benchmark_free = free;
         return 0;
     }
@@ -65,13 +69,15 @@ static int configure_allocator_source(void) {
         }
 
         void* malloc_symbol = dlsym(handle, "malloc");
+        void* calloc_symbol = dlsym(handle, "calloc");
         void* free_symbol = dlsym(handle, "free");
-        if (!malloc_symbol || !free_symbol) {
+        if (!malloc_symbol || !calloc_symbol || !free_symbol) {
             fprintf(stderr, "failed to resolve libc malloc/free: %s\n", dlerror());
             return -1;
         }
 
         benchmark_malloc = (bench_malloc_fn)malloc_symbol;
+        benchmark_calloc = (bench_calloc_fn)calloc_symbol;
         benchmark_free = (bench_free_fn)free_symbol;
         allocator_source = "libc";
         return 0;
@@ -94,8 +100,15 @@ static void* worker_loop(void* arg) {
     uintptr_t checksum = 0;
 
     for (size_t i = 0; i < worker->iterations; i++) {
-        unsigned char* ptr = benchmark_malloc(worker->size);
+        unsigned char* ptr = worker->zero_allocate ?
+            benchmark_calloc(1, worker->size) : benchmark_malloc(worker->size);
         if (!ptr) {
+            worker->checksum = UINTPTR_MAX;
+            return NULL;
+        }
+        if (worker->zero_allocate &&
+            (ptr[0] != 0 || ptr[worker->size - 1] != 0)) {
+            benchmark_free(ptr);
             worker->checksum = UINTPTR_MAX;
             return NULL;
         }
@@ -111,11 +124,12 @@ static void* worker_loop(void* arg) {
     return NULL;
 }
 
-static int run_single(size_t iterations, size_t size, double* seconds_out,
-                      uintptr_t* checksum_out) {
+static int run_single(size_t iterations, size_t size, int zero_allocate,
+                      double* seconds_out, uintptr_t* checksum_out) {
     WorkerArgs worker = {
         .iterations = iterations,
         .size = size,
+        .zero_allocate = zero_allocate,
         .checksum = 0,
     };
     struct timespec start;
@@ -136,8 +150,8 @@ static int run_single(size_t iterations, size_t size, double* seconds_out,
 }
 
 static int run_threaded(size_t iterations, size_t size, size_t thread_count,
-                        size_t* actual_iterations_out, double* seconds_out,
-                        uintptr_t* checksum_out) {
+                        int zero_allocate, size_t* actual_iterations_out,
+                        double* seconds_out, uintptr_t* checksum_out) {
     if (thread_count > SIZE_MAX / sizeof(pthread_t) ||
         thread_count > SIZE_MAX / sizeof(WorkerArgs)) {
         return 1;
@@ -169,6 +183,7 @@ static int run_threaded(size_t iterations, size_t size, size_t thread_count,
     for (size_t i = 0; i < thread_count; i++) {
         workers[i].iterations = per_thread;
         workers[i].size = size;
+        workers[i].zero_allocate = zero_allocate;
         if (pthread_create(&threads[i], NULL, worker_loop, &workers[i]) != 0) {
             benchmark_free(threads);
             benchmark_free(workers);
@@ -274,7 +289,8 @@ static void print_result(const char* mode, size_t iterations, size_t size,
 int main(int argc, char** argv) {
     if (argc < 4) {
         fprintf(stderr,
-                "usage: %s single|threaded <iterations> <size> [threads]\n"
+                "usage: %s single|single_calloc|threaded|threaded_calloc "
+                "<iterations> <size> [threads]\n"
                 "  MAI_BENCH_ALLOCATOR=default|libc\n"
                 "  MAI_BENCH_EXPECT_PATH=preload|frida|any\n",
                 argv[0]);
@@ -304,16 +320,20 @@ int main(int argc, char** argv) {
     size_t actual_iterations = iterations;
     size_t threads = 1;
 
-    if (strcmp(argv[1], "single") == 0) {
-        rc = run_single(iterations, size, &seconds, &checksum);
-    } else if (strcmp(argv[1], "threaded") == 0) {
+    int zero_allocate = 0;
+    if (strcmp(argv[1], "single") == 0 || strcmp(argv[1], "single_calloc") == 0) {
+        zero_allocate = strcmp(argv[1], "single_calloc") == 0;
+        rc = run_single(iterations, size, zero_allocate, &seconds, &checksum);
+    } else if (strcmp(argv[1], "threaded") == 0 ||
+               strcmp(argv[1], "threaded_calloc") == 0) {
+        zero_allocate = strcmp(argv[1], "threaded_calloc") == 0;
         threads = 4;
         if (argc >= 5 && (parse_size(argv[4], &threads) != 0 || threads == 0)) {
             fprintf(stderr, "invalid thread count\n");
             return 2;
         }
-        rc = run_threaded(iterations, size, threads, &actual_iterations, &seconds,
-                          &checksum);
+        rc = run_threaded(iterations, size, threads, zero_allocate,
+                          &actual_iterations, &seconds, &checksum);
     } else {
         fprintf(stderr, "unknown mode: %s\n", argv[1]);
         return 2;

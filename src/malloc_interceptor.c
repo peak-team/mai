@@ -29,6 +29,8 @@
 #define MAI_AUTO_MEMORY_CAP_PERCENT 95
 #define MAI_CGROUP_LIMIT_SENTINEL (1ULL << 60)
 #define MAI_ZERO_FILL_CHUNK (1024ULL * 1024ULL)
+#define MAI_MEMORY_CAP_CHECK_INTERVAL 1024
+#define MAI_MEMORY_CAP_REFRESH_INTERVAL 1024
 
 #if defined(__GNUC__) || defined(__clang__)
 #define MAI_LIKELY(value) __builtin_expect(!!(value), 1)
@@ -236,6 +238,8 @@ static size_t target_rss_bytes = 0;
 static size_t max_rss_bytes = 0;
 static int max_rss_auto = 1;
 static int max_rss_enabled = 1;
+static size_t memory_cap_check_counter = 0;
+static size_t memory_cap_refresh_counter = 0;
 static ReclaimPolicy reclaim_policy = RECLAIM_NONE;
 static ReclaimSelection reclaim_selection = RECLAIM_SELECT_OLDEST;
 static int profile_enabled = 0;
@@ -815,8 +819,110 @@ static size_t sample_mem_available_bytes(void) {
     return (size_t)kib * 1024ULL;
 }
 
+static int controller_list_has_memory(const char* controllers) {
+    const char* cursor = controllers;
+    while (*cursor) {
+        const char* comma = strchr(cursor, ',');
+        size_t length = comma ? (size_t)(comma - cursor) : strlen(cursor);
+        if (length == strlen("memory") && strncmp(cursor, "memory", length) == 0) {
+            return 1;
+        }
+        if (!comma) {
+            break;
+        }
+        cursor = comma + 1;
+    }
+    return 0;
+}
+
+static int build_cgroup_file_path(char* buffer, size_t buffer_size,
+                                  const char* mount_root,
+                                  const char* relative_path,
+                                  const char* file_name) {
+    if (!buffer || buffer_size == 0 || !mount_root || !relative_path || !file_name) {
+        return -1;
+    }
+
+    while (*relative_path == '/') {
+        relative_path++;
+    }
+    if (strstr(relative_path, "..")) {
+        return -1;
+    }
+
+    int written;
+    if (*relative_path) {
+        written = snprintf(buffer, buffer_size, "%s/%s/%s", mount_root,
+                           relative_path, file_name);
+    } else {
+        written = snprintf(buffer, buffer_size, "%s/%s", mount_root, file_name);
+    }
+
+    return written >= 0 && (size_t)written < buffer_size ? 0 : -1;
+}
+
+static int read_process_cgroup_memory_file(const char* v2_file, const char* v1_file,
+                                           size_t* out) {
+    char buffer[4096];
+    int fd = open("/proc/self/cgroup", O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+        return -1;
+    }
+
+    ssize_t bytes_read = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (bytes_read <= 0) {
+        return -1;
+    }
+    buffer[bytes_read] = '\0';
+
+    for (char* line = buffer; line && *line;) {
+        char* next = strchr(line, '\n');
+        if (next) {
+            *next = '\0';
+            next++;
+        }
+
+        char* first_colon = strchr(line, ':');
+        char* second_colon = first_colon ? strchr(first_colon + 1, ':') : NULL;
+        if (!first_colon || !second_colon) {
+            line = next;
+            continue;
+        }
+
+        *first_colon = '\0';
+        *second_colon = '\0';
+        const char* hierarchy = line;
+        const char* controllers = first_colon + 1;
+        const char* relative_path = second_colon + 1;
+        char path[PATH_MAX];
+
+        if (strcmp(hierarchy, "0") == 0 && controllers[0] == '\0') {
+            if (build_cgroup_file_path(path, sizeof(path), "/sys/fs/cgroup",
+                                       relative_path, v2_file) == 0 &&
+                read_size_file(path, out) == 0) {
+                return 0;
+            }
+        } else if (controller_list_has_memory(controllers)) {
+            if (build_cgroup_file_path(path, sizeof(path), "/sys/fs/cgroup/memory",
+                                       relative_path, v1_file) == 0 &&
+                read_size_file(path, out) == 0) {
+                return 0;
+            }
+        }
+
+        line = next;
+    }
+
+    return -1;
+}
+
 static size_t sample_cgroup_limit_bytes(void) {
     size_t value = 0;
+    if (read_process_cgroup_memory_file("memory.max", "memory.limit_in_bytes",
+                                        &value) == 0) {
+        return value;
+    }
     if (read_size_file("/sys/fs/cgroup/memory.max", &value) == 0) {
         return value;
     }
@@ -828,6 +934,10 @@ static size_t sample_cgroup_limit_bytes(void) {
 
 static size_t sample_cgroup_current_bytes(void) {
     size_t value = 0;
+    if (read_process_cgroup_memory_file("memory.current", "memory.usage_in_bytes",
+                                        &value) == 0) {
+        return value;
+    }
     if (read_size_file("/sys/fs/cgroup/memory.current", &value) == 0) {
         return value;
     }
@@ -2498,9 +2608,15 @@ static size_t effective_max_rss_locked(size_t current_rss) {
         return 0;
     }
 
-    if (max_rss_auto) {
+    if (max_rss_auto &&
+        (max_rss_bytes == 0 || memory_cap_refresh_counter == 0)) {
         max_rss_bytes = detect_auto_max_rss_bytes(current_rss);
     }
+    memory_cap_refresh_counter++;
+    if (memory_cap_refresh_counter >= MAI_MEMORY_CAP_REFRESH_INTERVAL) {
+        memory_cap_refresh_counter = 0;
+    }
+
     stats_snapshot.max_rss = max_rss_bytes;
     return max_rss_bytes;
 }
@@ -2515,7 +2631,37 @@ static int rss_has_headroom(size_t current_rss, size_t cap, size_t incoming_resi
     return incoming_resident_bytes <= cap - current_rss;
 }
 
+static void estimate_rss_growth_locked(size_t bytes) {
+    if (bytes == 0 || stats_snapshot.current_rss_bytes == 0) {
+        return;
+    }
+    if (stats_snapshot.current_rss_bytes > SIZE_MAX - bytes) {
+        stats_snapshot.current_rss_bytes = SIZE_MAX;
+    } else {
+        stats_snapshot.current_rss_bytes += bytes;
+    }
+    if (stats_snapshot.current_rss_bytes > stats_snapshot.high_water_rss_bytes) {
+        stats_snapshot.high_water_rss_bytes = stats_snapshot.current_rss_bytes;
+    }
+}
+
 static int ensure_memory_cap_headroom_locked(size_t incoming_resident_bytes) {
+    if (!max_rss_enabled) {
+        return 0;
+    }
+
+    if (stats_snapshot.current_rss_bytes != 0 &&
+        max_rss_bytes != 0 &&
+        rss_has_headroom(stats_snapshot.current_rss_bytes, max_rss_bytes,
+                         incoming_resident_bytes)) {
+        memory_cap_check_counter++;
+        if (memory_cap_check_counter < MAI_MEMORY_CAP_CHECK_INTERVAL) {
+            estimate_rss_growth_locked(incoming_resident_bytes);
+            return 0;
+        }
+        memory_cap_check_counter = 0;
+    }
+
     size_t current_rss = update_observed_rss_locked();
     size_t cap = effective_max_rss_locked(current_rss);
     if (rss_has_headroom(current_rss, cap, incoming_resident_bytes)) {
@@ -2916,6 +3062,8 @@ static int configure_runtime(void) {
     max_rss_bytes = 0;
     max_rss_auto = 1;
     max_rss_enabled = 1;
+    memory_cap_check_counter = 0;
+    memory_cap_refresh_counter = 0;
     hotness_sample_pages = MAI_DEFAULT_HOTNESS_SAMPLE_PAGES;
 
     memset(&stats_snapshot, 0, sizeof(stats_snapshot));
@@ -3045,7 +3193,7 @@ static void* custom_malloc_from_site(size_t size, void* call_site) {
         return pass_through_malloc(size);
     }
 
-    if (!should_manage(size)) {
+    if (MAI_LIKELY(size < threshold_bytes || size == 0 || mlockall_future_active)) {
         return fast_pass_through_malloc(size);
     }
 
@@ -3108,7 +3256,7 @@ static void* custom_calloc_from_site(size_t nmemb, size_t size, void* call_site)
         return pass_through_calloc(nmemb, size);
     }
 
-    if (!should_manage(total)) {
+    if (MAI_LIKELY(total < threshold_bytes || total == 0 || mlockall_future_active)) {
         return fast_pass_through_calloc(nmemb, size, total);
     }
 
