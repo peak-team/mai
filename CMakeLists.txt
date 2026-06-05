@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.9)
 
-project(mai C)
+project(mai C CXX)
 
 # Set build type to Release by default if CMAKE_BUILD_TYPE is not given
 set(default_build_type "Debug")
@@ -28,6 +28,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN 1)
 
 find_package(Threads REQUIRED)
+include(CTest)
 find_library(DL_LIBRARY dl)
 find_library(RESOLV_LIBRARY resolv)
 message(STATUS "M_LIBRARY    = ${M_LIBRARY}")
@@ -52,5 +53,6 @@ if(NOT FRIDA_GUM_LIBRARIES OR NOT FRIDA_GUM_INCLUDE_DIRS)
 endif()
 
 add_subdirectory(src)
-
-
+if(BUILD_TESTING AND EXISTS "${PROJECT_SOURCE_DIR}/tests/CMakeLists.txt")
+    add_subdirectory(tests)
+endif()

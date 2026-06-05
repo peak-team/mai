@@ -2,6 +2,7 @@
 FILE(GLOB sources_mai
     mai.c
     malloc_interceptor.c
+    cxx_intercepts.cpp
 )
 
 add_library(mai 

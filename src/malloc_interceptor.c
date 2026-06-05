@@ -1,461 +1,1954 @@
+#define _GNU_SOURCE
+
 #include "malloc_interceptor.h"
 
-// Configuration
-#define MMAP_DIR_ENV "MAI_MMAP_PATH"
-#define DEFAULT_MMAP_DIR "./"
-#define MMAP_FILE_FORMAT "%s/mai_%x_%lx_%lx_%x"
+#include <ctype.h>
+#include <dlfcn.h>
+#include <malloc.h>
+#include <stddef.h>
+
+#include "frida-gum.h"
+
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
+#define MAI_DEFAULT_THRESHOLD (64ULL * 1024ULL * 1024ULL)
+#define MAI_DEFAULT_ARENA_SIZE (1024ULL * 1024ULL * 1024ULL)
+#define MAI_MIN_ARENA_SIZE (1024ULL * 1024ULL)
+#define MAI_TRACK_BUCKETS 8192
+#define MAI_PROFILE_BUCKETS 1024
+#define MAI_FILE_TEMPLATE "mai-arena-XXXXXX"
+
+typedef enum {
+    RECLAIM_NONE = 0,
+    RECLAIM_DONTNEED,
+    RECLAIM_PAGEOUT
+} ReclaimPolicy;
+
+typedef enum {
+    RECLAIM_SELECT_OLDEST = 0,
+    RECLAIM_SELECT_LARGEST,
+    RECLAIM_SELECT_ALL
+} ReclaimSelection;
+
+typedef enum {
+    HOOK_MALLOC = 0,
+    HOOK_FREE,
+    HOOK_CALLOC,
+    HOOK_REALLOC,
+    HOOK_ALIGNED_ALLOC,
+    HOOK_POSIX_MEMALIGN,
+    HOOK_MEMALIGN,
+    HOOK_VALLOC,
+    HOOK_PVALLOC,
+    HOOK_MALLOC_USABLE_SIZE
+} HookKind;
+
+typedef struct ArenaSegment ArenaSegment;
+typedef struct ArenaBlock ArenaBlock;
+typedef struct AllocationRecord AllocationRecord;
+typedef struct ProfileRecord ProfileRecord;
+typedef struct DynamicReplacement DynamicReplacement;
+
+struct ArenaBlock {
+    size_t offset;
+    size_t size;
+    int free;
+    ArenaSegment* segment;
+    ArenaBlock* prev;
+    ArenaBlock* next;
+};
+
+struct ArenaSegment {
+    void* base;
+    size_t length;
+    size_t id;
+    ArenaBlock* blocks;
+    ArenaSegment* next;
+};
+
+struct AllocationRecord {
+    void* user_ptr;
+    void* base_ptr;
+    size_t user_size;
+    size_t mapped_length;
+    size_t alignment;
+    void* call_site;
+    size_t allocation_seq;
+    size_t reclaim_epoch;
+    ArenaSegment* segment;
+    ArenaBlock* block;
+    AllocationRecord* hash_next;
+    AllocationRecord* live_prev;
+    AllocationRecord* live_next;
+};
 
 typedef struct {
-    void* ptr;
-    size_t size;
-    int is_mmap;
-    char* filename;  // Store filename for mmap allocations
-} AllocationEntry;
+    size_t length;
+} MetaHeader;
 
-// Global variables
-static GumInterceptor* malloc_interceptor;
-static pthread_mutex_t track_mutex = PTHREAD_MUTEX_INITIALIZER;
-static GumMetalHashTable* track_table = NULL;
-static char mmap_dir[PATH_MAX];
-static unsigned int random_seed;
+struct ProfileRecord {
+    void* call_site;
+    size_t allocations;
+    size_t bytes;
+    ProfileRecord* next;
+};
+
+struct DynamicReplacement {
+    HookKind kind;
+    const char* symbol;
+    void* address;
+    void* original;
+    DynamicReplacement* next;
+};
+
+static GumInterceptor* malloc_interceptor = NULL;
+static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
+static __thread int in_mai_hook = 0;
+
+static int runtime_enabled = 0;
+static int runtime_configured = 0;
+static int runtime_config_error = 0;
+static int hooks_attached = 0;
+static int gum_initialized = 0;
+static int verbose_logging = 0;
+static int stats_logging = 0;
 static int cleanup_in_progress = 0;
-static gulong max_memory = 0;
-static gulong current_memory = 0;
-static gpointer malloc_addr = NULL; 
+static char mai_path[PATH_MAX];
+static size_t page_size = 4096;
+static size_t threshold_bytes = MAI_DEFAULT_THRESHOLD;
+static size_t arena_size_bytes = MAI_DEFAULT_ARENA_SIZE;
+static size_t target_rss_bytes = 0;
+static ReclaimPolicy reclaim_policy = RECLAIM_NONE;
+static ReclaimSelection reclaim_selection = RECLAIM_SELECT_OLDEST;
+static int profile_enabled = 0;
+
+static ArenaSegment* arena_segments = NULL;
+static size_t next_segment_id = 0;
+static AllocationRecord* allocation_buckets[MAI_TRACK_BUCKETS];
+static AllocationRecord* live_head = NULL;
+static ProfileRecord* profile_buckets[MAI_PROFILE_BUCKETS];
+static DynamicReplacement* dynamic_replacements = NULL;
+static size_t allocation_sequence = 0;
+static size_t reclaim_epoch = 0;
+
+static MaiStats stats_snapshot = {0};
+
+static gpointer malloc_addr = NULL;
 static gpointer free_addr = NULL;
 static gpointer calloc_addr = NULL;
 static gpointer realloc_addr = NULL;
 static gpointer aligned_alloc_addr = NULL;
 static gpointer posix_memalign_addr = NULL;
+static gpointer memalign_addr = NULL;
+static gpointer valloc_addr = NULL;
+static gpointer pvalloc_addr = NULL;
+static gpointer malloc_usable_size_addr = NULL;
+static gpointer dlopen_addr = NULL;
+static gpointer dlmopen_addr = NULL;
+static gpointer mmap_addr = NULL;
+static gpointer munmap_addr = NULL;
+static gpointer mremap_addr = NULL;
+static gpointer brk_addr = NULL;
+static gpointer sbrk_addr = NULL;
 
-// Original function pointers
-static void* (*original_malloc)(size_t size);
-static void (*original_free)(void* ptr);
-static void* (*original_calloc)(size_t nmemb, size_t size);
-static void* (*original_realloc)(void* ptr, size_t size);
-static void* (*original_aligned_alloc)(size_t alignment, size_t size);
-static int (*original_posix_memalign)(void** memptr, size_t alignment, size_t size);
+static int malloc_replaced = 0;
+static int free_replaced = 0;
+static int calloc_replaced = 0;
+static int realloc_replaced = 0;
+static int aligned_alloc_replaced = 0;
+static int posix_memalign_replaced = 0;
+static int memalign_replaced = 0;
+static int valloc_replaced = 0;
+static int pvalloc_replaced = 0;
+static int malloc_usable_size_replaced = 0;
+static int dlopen_replaced = 0;
+static int dlmopen_replaced = 0;
+static int mmap_replaced = 0;
+static int munmap_replaced = 0;
+static int mremap_replaced = 0;
+static int brk_replaced = 0;
+static int sbrk_replaced = 0;
 
-// Forward declarations for internal use
-static void* internal_malloc(size_t size);
-static void internal_free(void* ptr);
-static void init_table();
+static void* (*original_malloc)(size_t size) = NULL;
+static void (*original_free)(void* ptr) = NULL;
+static void* (*original_calloc)(size_t nmemb, size_t size) = NULL;
+static void* (*original_realloc)(void* ptr, size_t size) = NULL;
+static void* (*original_aligned_alloc)(size_t alignment, size_t size) = NULL;
+static int (*original_posix_memalign)(void** memptr, size_t alignment, size_t size) = NULL;
+static void* (*original_memalign)(size_t alignment, size_t size) = NULL;
+static void* (*original_valloc)(size_t size) = NULL;
+static void* (*original_pvalloc)(size_t size) = NULL;
+static size_t (*original_malloc_usable_size)(void* ptr) = NULL;
+static void* (*original_dlopen)(const char* filename, int flags) = NULL;
+static void* (*original_dlmopen)(Lmid_t nsid, const char* filename, int flags) = NULL;
+static void* (*original_mmap)(void* addr, size_t length, int prot, int flags, int fd, off_t offset) = NULL;
+static int (*original_munmap)(void* addr, size_t length) = NULL;
+static void* (*original_mremap)(void* old_address, size_t old_size, size_t new_size, int flags, ...) = NULL;
+static int (*original_brk)(void* addr) = NULL;
+static void* (*original_sbrk)(intptr_t increment) = NULL;
 
-static void add_tracking_entry(void* ptr, size_t size, int is_mmap, char* filename) {
-    if (!track_table || cleanup_in_progress) return;
-    
-    AllocationEntry* entry = internal_malloc(sizeof(AllocationEntry));
-    if (!entry) return;
-    
-    entry->ptr = ptr;
-    entry->size = size;
-    entry->is_mmap = is_mmap;
-    entry->filename = filename;  // May be NULL for non-mmap allocations
-    
-    pthread_mutex_lock(&track_mutex);
-        
-    gum_metal_hash_table_insert(track_table, ptr, entry);
-    current_memory+=size;
-    max_memory = current_memory > max_memory ? current_memory : max_memory;
-    
-    pthread_mutex_unlock(&track_mutex);
+static void* custom_malloc(size_t size);
+static void custom_free(void* ptr);
+static void* custom_calloc(size_t nmemb, size_t size);
+static void* custom_realloc(void* ptr, size_t size);
+static void* custom_aligned_alloc(size_t alignment, size_t size);
+static int custom_posix_memalign(void** memptr, size_t alignment, size_t size);
+static void* custom_memalign(size_t alignment, size_t size);
+static void* custom_valloc(size_t size);
+static void* custom_pvalloc(size_t size);
+static size_t custom_malloc_usable_size(void* ptr);
+static void* custom_dlopen(const char* filename, int flags);
+static void* custom_dlmopen(Lmid_t nsid, const char* filename, int flags);
+static void* custom_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset);
+static int custom_munmap(void* addr, size_t length);
+static void* custom_mremap(void* old_address, size_t old_size, size_t new_size, int flags, void* new_address);
+static int custom_brk(void* addr);
+static void* custom_sbrk(intptr_t increment);
+static size_t record_page_range(AllocationRecord* record, void** range_start);
+
+static size_t max_size(size_t a, size_t b) {
+    return a > b ? a : b;
 }
 
-static AllocationEntry* find_tracking_entry(void* ptr) {
-    if (!track_table || cleanup_in_progress) return NULL;
-    
-    pthread_mutex_lock(&track_mutex);
-    
-    AllocationEntry* entry = gum_metal_hash_table_lookup(track_table, ptr);
-
-    if (entry && entry->ptr == ptr) {
-        pthread_mutex_unlock(&track_mutex);
-        return entry;
+static int add_overflow(size_t a, size_t b, size_t* out) {
+    if (a > SIZE_MAX - b) {
+        errno = ENOMEM;
+        return -1;
     }
-        
-    pthread_mutex_unlock(&track_mutex);
-    return NULL;
+
+    *out = a + b;
+    return 0;
 }
 
-static void remove_tracking_entry(void* ptr) {
-    if (!track_table || cleanup_in_progress) return;
-    
-    pthread_mutex_lock(&track_mutex);
-
-    AllocationEntry* entry = gum_metal_hash_table_lookup(track_table, ptr);
-    gum_metal_hash_table_remove(track_table, ptr);
-    current_memory-=entry->size;
-
-    pthread_mutex_unlock(&track_mutex);
-    if (entry->filename) {
-        remove(entry->filename);
-        internal_free(entry->filename);
+static int mul_overflow(size_t a, size_t b, size_t* out) {
+    if (a != 0 && b > SIZE_MAX / a) {
+        errno = ENOMEM;
+        return -1;
     }
+
+    *out = a * b;
+    return 0;
 }
 
-// Internal versions of malloc/free for our own use
-static void* internal_malloc(size_t size) {
-    return original_malloc(size);
+static int is_power_of_two(size_t value) {
+    return value != 0 && (value & (value - 1)) == 0;
 }
 
-static void internal_free(void* ptr) {
-    original_free(ptr);
+static size_t default_alignment(void) {
+    return _Alignof(max_align_t);
 }
 
-static void init_table() {
-    // Initialize random seed
-    random_seed = (unsigned int)time(NULL) ^ (unsigned int)getpid();
-    
-    // Get mmap directory from environment
-    const char* env_dir = getenv(MMAP_DIR_ENV);
-    snprintf(mmap_dir, sizeof(mmap_dir), "%s", 
-             env_dir ? env_dir : DEFAULT_MMAP_DIR);
-    
-    // Create tracking table
-    track_table = gum_metal_hash_table_new(g_direct_hash, g_direct_equal);
-    if (!track_table) {
-        fprintf(stderr, "Failed to initialize tracking table\n");
-        exit(1);
+static uintptr_t align_up_uintptr(uintptr_t value, size_t alignment) {
+    uintptr_t mask = (uintptr_t)alignment - 1;
+    return (value + mask) & ~mask;
+}
+
+static size_t align_up_size(size_t value, size_t alignment) {
+    if (alignment == 0) {
+        return value;
     }
-}
 
-static void* mmap_fallback(size_t size) {
-    char* filename = NULL;
-    int fd = -1;
-    void* ptr = NULL;
-    // fprintf(stderr, "mmap_fallback: %lu\n", size);
-    // Generate unique filename with PID, TID, timestamp, and random number
-    pid_t pid = getpid();
-    pthread_t tid = pthread_self();
-    time_t timestamp = time(NULL);
-    unsigned int random_val = rand_r(&random_seed);
-    
-    filename = internal_malloc(PATH_MAX);
-    if (!filename) goto error;
-    
-    int result = snprintf(filename, PATH_MAX, MMAP_FILE_FORMAT, 
-            mmap_dir, pid, (unsigned long)tid, (unsigned long)timestamp, random_val);
-
-    // Check for truncation
-    if (result < 0 || result >= PATH_MAX) goto error;
-
-    // Create the file
-    fd = open(filename, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
-    if (fd == -1) goto error;
-    
-    // Set file size
-    if (ftruncate(fd, size) == -1) goto error;
-    
-    // Map the file
-    ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (ptr == MAP_FAILED) goto error;
-    
-    close(fd);
-    
-    // Track this allocation
-    add_tracking_entry(ptr, size, 1, filename);
-    return ptr;
-    
-error:
-    if (fd != -1) close(fd);
-    if (filename) {
-        unlink(filename);
-        internal_free(filename);
+    size_t rem = value % alignment;
+    if (rem == 0) {
+        return value;
     }
-    return NULL;
-}
-
-// Custom implementation of malloc
-static void* custom_malloc(size_t size) {
-    void* ptr = original_malloc(size);
-    if (ptr) {
-        add_tracking_entry(ptr, size, 0, NULL);
-        return ptr;
+    if (value > SIZE_MAX - (alignment - rem)) {
+        errno = ENOMEM;
+        return 0;
     }
-    
-    return mmap_fallback(size);
+    return value + (alignment - rem);
 }
 
-// Custom implementation of free
-static void custom_free(void* ptr) {
-    if (!ptr) return;
-    
-    AllocationEntry* entry = find_tracking_entry(ptr);
-    if (!entry) {
-        original_free(ptr);
+static int parse_bool_env(const char* value) {
+    if (!value || value[0] == '\0') {
+        return 0;
+    }
+
+    return strcmp(value, "1") == 0 ||
+           strcasecmp(value, "true") == 0 ||
+           strcasecmp(value, "yes") == 0 ||
+           strcasecmp(value, "on") == 0;
+}
+
+static int parse_size_env(const char* value, size_t* out) {
+    char* end = NULL;
+    unsigned long long number;
+    unsigned long long multiplier = 1;
+
+    if (!value || value[0] == '\0') {
+        return -1;
+    }
+
+    errno = 0;
+    number = strtoull(value, &end, 10);
+    if (errno != 0 || end == value) {
+        return -1;
+    }
+
+    while (*end && isspace((unsigned char)*end)) {
+        end++;
+    }
+
+    if (*end) {
+        switch (tolower((unsigned char)*end)) {
+            case 'k':
+                multiplier = 1024ULL;
+                end++;
+                break;
+            case 'm':
+                multiplier = 1024ULL * 1024ULL;
+                end++;
+                break;
+            case 'g':
+                multiplier = 1024ULL * 1024ULL * 1024ULL;
+                end++;
+                break;
+            case 't':
+                multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+                end++;
+                break;
+            default:
+                return -1;
+        }
+        if (tolower((unsigned char)*end) == 'b') {
+            end++;
+        }
+    }
+
+    while (*end && isspace((unsigned char)*end)) {
+        end++;
+    }
+    if (*end != '\0') {
+        return -1;
+    }
+
+    if (number > ULLONG_MAX / multiplier ||
+        number * multiplier > (unsigned long long)SIZE_MAX) {
+        return -1;
+    }
+
+    *out = (size_t)(number * multiplier);
+    return 0;
+}
+
+static void* meta_alloc(size_t size) {
+    size_t total;
+    size_t mapped;
+    MetaHeader* header;
+
+    if (add_overflow(sizeof(*header), size, &total) != 0) {
+        return NULL;
+    }
+
+    mapped = align_up_size(total, page_size);
+    if (mapped == 0) {
+        return NULL;
+    }
+
+    header = mmap(NULL, mapped, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (header == MAP_FAILED) {
+        return NULL;
+    }
+
+    header->length = mapped;
+    return (void*)(header + 1);
+}
+
+static void meta_free(void* ptr) {
+    if (!ptr) {
         return;
     }
-        
-    if (entry->is_mmap) {
-        munmap(ptr, entry->size);
-    } else {
-        original_free(ptr);
-    }
-    
-    remove_tracking_entry(ptr);
+
+    MetaHeader* header = ((MetaHeader*)ptr) - 1;
+    munmap(header, header->length);
 }
 
-// Custom implementation of calloc
-static void* custom_calloc(size_t nmemb, size_t size) {
-    // Check for overflow in nmemb * size
-    if (size && nmemb > SIZE_MAX / size) {
+static size_t hash_ptr(void* ptr) {
+    uintptr_t value = (uintptr_t)ptr;
+    value >>= 4;
+    value ^= value >> 7;
+    value ^= value >> 17;
+    return (size_t)(value % MAI_TRACK_BUCKETS);
+}
+
+static size_t hash_profile_site(void* ptr) {
+    uintptr_t value = (uintptr_t)ptr;
+    value >>= 4;
+    value ^= value >> 9;
+    return (size_t)(value % MAI_PROFILE_BUCKETS);
+}
+
+static DynamicReplacement* current_dynamic_replacement(HookKind kind) {
+    GumInvocationContext* context = gum_interceptor_get_current_invocation();
+    if (!context) {
+        return NULL;
+    }
+
+    DynamicReplacement* replacement =
+        (DynamicReplacement*)gum_invocation_context_get_replacement_data(context);
+    if (!replacement || replacement->kind != kind || !replacement->original) {
+        return NULL;
+    }
+
+    return replacement;
+}
+
+static void* pass_through_malloc(size_t size) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_MALLOC);
+    if (replacement) {
+        return ((void* (*)(size_t))replacement->original)(size);
+    }
+    return original_malloc ? original_malloc(size) : malloc(size);
+}
+
+static void pass_through_free(void* ptr) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_FREE);
+    if (replacement) {
+        ((void (*)(void*))replacement->original)(ptr);
+        return;
+    }
+    if (original_free) {
+        original_free(ptr);
+    } else {
+        free(ptr);
+    }
+}
+
+static void* pass_through_calloc(size_t nmemb, size_t size) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_CALLOC);
+    if (replacement) {
+        return ((void* (*)(size_t, size_t))replacement->original)(nmemb, size);
+    }
+    return original_calloc ? original_calloc(nmemb, size) : calloc(nmemb, size);
+}
+
+static void* pass_through_realloc(void* ptr, size_t size) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_REALLOC);
+    if (replacement) {
+        return ((void* (*)(void*, size_t))replacement->original)(ptr, size);
+    }
+    return original_realloc ? original_realloc(ptr, size) : realloc(ptr, size);
+}
+
+static void* pass_through_aligned_alloc(size_t alignment, size_t size) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_ALIGNED_ALLOC);
+    if (replacement) {
+        return ((void* (*)(size_t, size_t))replacement->original)(alignment, size);
+    }
+    return original_aligned_alloc ? original_aligned_alloc(alignment, size) : aligned_alloc(alignment, size);
+}
+
+static int pass_through_posix_memalign(void** memptr, size_t alignment, size_t size) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_POSIX_MEMALIGN);
+    if (replacement) {
+        return ((int (*)(void**, size_t, size_t))replacement->original)(memptr, alignment, size);
+    }
+    return original_posix_memalign ?
+        original_posix_memalign(memptr, alignment, size) :
+        posix_memalign(memptr, alignment, size);
+}
+
+static void* pass_through_memalign(size_t alignment, size_t size) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_MEMALIGN);
+    if (replacement) {
+        return ((void* (*)(size_t, size_t))replacement->original)(alignment, size);
+    }
+    return original_memalign ? original_memalign(alignment, size) : memalign(alignment, size);
+}
+
+static size_t pass_through_malloc_usable_size(void* ptr) {
+    DynamicReplacement* replacement = current_dynamic_replacement(HOOK_MALLOC_USABLE_SIZE);
+    if (replacement) {
+        return ((size_t (*)(void*))replacement->original)(ptr);
+    }
+    return original_malloc_usable_size ? original_malloc_usable_size(ptr) : malloc_usable_size(ptr);
+}
+
+static void note_profile_locked(void* call_site, size_t size) {
+    if (!profile_enabled || !call_site) {
+        return;
+    }
+
+    size_t bucket = hash_profile_site(call_site);
+    for (ProfileRecord* record = profile_buckets[bucket]; record; record = record->next) {
+        if (record->call_site == call_site) {
+            record->allocations++;
+            record->bytes += size;
+            return;
+        }
+    }
+
+    ProfileRecord* record = meta_alloc(sizeof(*record));
+    if (!record) {
+        return;
+    }
+
+    record->call_site = call_site;
+    record->allocations = 1;
+    record->bytes = size;
+    record->next = profile_buckets[bucket];
+    profile_buckets[bucket] = record;
+    stats_snapshot.profile_sites++;
+}
+
+static void stats_note_managed_alloc(size_t size) {
+    stats_snapshot.managed_allocations++;
+    stats_snapshot.managed_bytes_total += size;
+    stats_snapshot.live_managed_bytes += size;
+    if (stats_snapshot.live_managed_bytes > stats_snapshot.high_water_managed_bytes) {
+        stats_snapshot.high_water_managed_bytes = stats_snapshot.live_managed_bytes;
+    }
+}
+
+static void stats_note_managed_free(size_t size) {
+    stats_snapshot.managed_frees++;
+    if (stats_snapshot.live_managed_bytes >= size) {
+        stats_snapshot.live_managed_bytes -= size;
+    } else {
+        stats_snapshot.live_managed_bytes = 0;
+    }
+}
+
+static void stats_reduce_live_managed(size_t size) {
+    if (stats_snapshot.live_managed_bytes >= size) {
+        stats_snapshot.live_managed_bytes -= size;
+    } else {
+        stats_snapshot.live_managed_bytes = 0;
+    }
+}
+
+static void stats_note_pass_through(size_t size) {
+    stats_snapshot.pass_through_allocations++;
+    stats_snapshot.pass_through_bytes_total += size;
+}
+
+static void stats_note_pass_through_threadsafe(size_t size) {
+    pthread_mutex_lock(&runtime_lock);
+    stats_note_pass_through(size);
+    pthread_mutex_unlock(&runtime_lock);
+}
+
+static void insert_record_locked(AllocationRecord* record) {
+    size_t bucket = hash_ptr(record->user_ptr);
+
+    record->hash_next = allocation_buckets[bucket];
+    allocation_buckets[bucket] = record;
+
+    record->live_prev = NULL;
+    record->live_next = live_head;
+    if (live_head) {
+        live_head->live_prev = record;
+    }
+    live_head = record;
+}
+
+static AllocationRecord* find_record_locked(void* ptr) {
+    for (AllocationRecord* record = allocation_buckets[hash_ptr(ptr)];
+         record;
+         record = record->hash_next) {
+        if (record->user_ptr == ptr) {
+            return record;
+        }
+    }
+
+    return NULL;
+}
+
+static AllocationRecord* take_record_locked(void* ptr) {
+    size_t bucket = hash_ptr(ptr);
+    AllocationRecord* previous = NULL;
+
+    for (AllocationRecord* record = allocation_buckets[bucket];
+         record;
+         record = record->hash_next) {
+        if (record->user_ptr != ptr) {
+            previous = record;
+            continue;
+        }
+
+        if (previous) {
+            previous->hash_next = record->hash_next;
+        } else {
+            allocation_buckets[bucket] = record->hash_next;
+        }
+
+        if (record->live_prev) {
+            record->live_prev->live_next = record->live_next;
+        } else {
+            live_head = record->live_next;
+        }
+        if (record->live_next) {
+            record->live_next->live_prev = record->live_prev;
+        }
+
+        record->hash_next = NULL;
+        record->live_prev = NULL;
+        record->live_next = NULL;
+        return record;
+    }
+
+    return NULL;
+}
+
+static int build_arena_template(char* buffer, size_t buffer_size) {
+    size_t path_len = strlen(mai_path);
+    const char* slash = path_len > 0 && mai_path[path_len - 1] == '/' ? "" : "/";
+    int written = snprintf(buffer, buffer_size, "%s%s%s", mai_path, slash, MAI_FILE_TEMPLATE);
+
+    if (written < 0 || (size_t)written >= buffer_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    return 0;
+}
+
+static ArenaSegment* create_segment_locked(size_t minimum_size) {
+    char filename[PATH_MAX];
+    int fd = -1;
+    int saved_errno;
+    size_t length = max_size(arena_size_bytes, minimum_size);
+    ArenaSegment* segment = NULL;
+    ArenaBlock* block = NULL;
+    void* base;
+
+    length = align_up_size(length, page_size);
+    if (length == 0 || build_arena_template(filename, sizeof(filename)) != 0) {
+        return NULL;
+    }
+
+    fd = mkstemp(filename);
+    if (fd == -1) {
+        return NULL;
+    }
+
+    if (unlink(filename) != 0) {
+        saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return NULL;
+    }
+
+    if (ftruncate(fd, (off_t)length) != 0) {
+        saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return NULL;
+    }
+
+    base = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    saved_errno = errno;
+    close(fd);
+    if (base == MAP_FAILED) {
+        errno = saved_errno;
+        return NULL;
+    }
+
+    segment = meta_alloc(sizeof(*segment));
+    block = meta_alloc(sizeof(*block));
+    if (!segment || !block) {
+        meta_free(segment);
+        meta_free(block);
+        munmap(base, length);
         errno = ENOMEM;
         return NULL;
     }
 
-    size_t total_size = nmemb * size;
-    
-    // Try original calloc first
-    void* ptr = original_calloc(nmemb, size);
-    if (ptr) {
-        add_tracking_entry(ptr, total_size, 0, NULL);
-        return ptr;
+    segment->base = base;
+    segment->length = length;
+    segment->id = next_segment_id++;
+    segment->next = arena_segments;
+    segment->blocks = block;
+    arena_segments = segment;
+
+    block->offset = 0;
+    block->size = length;
+    block->free = 1;
+    block->segment = segment;
+    block->prev = NULL;
+    block->next = NULL;
+
+    stats_snapshot.arena_segments++;
+    stats_snapshot.arena_bytes += length;
+
+    return segment;
+}
+
+static void insert_block_before(ArenaBlock* block, ArenaBlock* new_block) {
+    new_block->segment = block->segment;
+    new_block->prev = block->prev;
+    new_block->next = block;
+    if (block->prev) {
+        block->prev->next = new_block;
+    } else {
+        block->segment->blocks = new_block;
     }
-    
-    // Fall back to mmap + memset
-    ptr = mmap_fallback(total_size);
-    if (ptr) {
-        memset(ptr, 0, total_size);
+    block->prev = new_block;
+}
+
+static void insert_block_after(ArenaBlock* block, ArenaBlock* new_block) {
+    new_block->segment = block->segment;
+    new_block->prev = block;
+    new_block->next = block->next;
+    if (block->next) {
+        block->next->prev = new_block;
     }
+    block->next = new_block;
+}
+
+static AllocationRecord* carve_block_locked(ArenaBlock* block, size_t size, size_t alignment,
+                                            void* call_site) {
+    uintptr_t segment_base = (uintptr_t)block->segment->base;
+    uintptr_t block_start = segment_base + block->offset;
+    uintptr_t aligned_start = align_up_uintptr(block_start, alignment);
+    size_t aligned_offset = (size_t)(aligned_start - segment_base);
+    size_t prefix = aligned_offset - block->offset;
+    size_t suffix;
+    ArenaBlock* prefix_block = NULL;
+    ArenaBlock* suffix_block = NULL;
+    AllocationRecord* record = NULL;
+
+    if (prefix > block->size || size > block->size - prefix) {
+        return NULL;
+    }
+    suffix = block->size - prefix - size;
+
+    if (prefix > 0) {
+        prefix_block = meta_alloc(sizeof(*prefix_block));
+        if (!prefix_block) {
+            return NULL;
+        }
+    }
+    if (suffix > 0) {
+        suffix_block = meta_alloc(sizeof(*suffix_block));
+        if (!suffix_block) {
+            meta_free(prefix_block);
+            return NULL;
+        }
+    }
+
+    record = meta_alloc(sizeof(*record));
+    if (!record) {
+        meta_free(prefix_block);
+        meta_free(suffix_block);
+        return NULL;
+    }
+
+    if (prefix_block) {
+        prefix_block->offset = block->offset;
+        prefix_block->size = prefix;
+        prefix_block->free = 1;
+        insert_block_before(block, prefix_block);
+    }
+
+    block->offset = aligned_offset;
+    block->size = size;
+    block->free = 0;
+
+    if (suffix_block) {
+        suffix_block->offset = aligned_offset + size;
+        suffix_block->size = suffix;
+        suffix_block->free = 1;
+        insert_block_after(block, suffix_block);
+    }
+
+    record->user_ptr = (void*)aligned_start;
+    record->base_ptr = (void*)aligned_start;
+    record->user_size = size;
+    record->mapped_length = size;
+    record->alignment = alignment;
+    record->call_site = call_site;
+    record->allocation_seq = ++allocation_sequence;
+    record->reclaim_epoch = 0;
+    record->segment = block->segment;
+    record->block = block;
+    record->hash_next = NULL;
+    record->live_prev = NULL;
+    record->live_next = NULL;
+
+    insert_record_locked(record);
+    stats_note_managed_alloc(size);
+    note_profile_locked(call_site, size);
+
+    return record;
+}
+
+static AllocationRecord* managed_alloc_locked(size_t size, size_t alignment, void* call_site) {
+    size_t needed;
+
+    if (size == 0 || !is_power_of_two(alignment)) {
+        return NULL;
+    }
+
+    if (alignment < default_alignment()) {
+        alignment = default_alignment();
+    }
+
+    if (add_overflow(size, alignment - 1, &needed) != 0) {
+        return NULL;
+    }
+
+    for (;;) {
+        for (ArenaSegment* segment = arena_segments; segment; segment = segment->next) {
+            for (ArenaBlock* block = segment->blocks; block; block = block->next) {
+                if (!block->free || block->size < size) {
+                    continue;
+                }
+
+                uintptr_t base = (uintptr_t)segment->base;
+                uintptr_t block_start = base + block->offset;
+                uintptr_t aligned_start = align_up_uintptr(block_start, alignment);
+                size_t aligned_offset = (size_t)(aligned_start - base);
+                size_t prefix = aligned_offset - block->offset;
+                if (prefix <= block->size && size <= block->size - prefix) {
+                    return carve_block_locked(block, size, alignment, call_site);
+                }
+            }
+        }
+
+        if (!create_segment_locked(needed)) {
+            return NULL;
+        }
+    }
+}
+
+static void coalesce_block_locked(ArenaBlock* block) {
+    if (block->prev && block->prev->free) {
+        ArenaBlock* previous = block->prev;
+        previous->size += block->size;
+        previous->next = block->next;
+        if (block->next) {
+            block->next->prev = previous;
+        }
+        meta_free(block);
+        block = previous;
+    }
+
+    if (block->next && block->next->free) {
+        ArenaBlock* next = block->next;
+        block->size += next->size;
+        block->next = next->next;
+        if (next->next) {
+            next->next->prev = block;
+        }
+        meta_free(next);
+    }
+}
+
+static void managed_free_record_locked(AllocationRecord* record) {
+    ArenaBlock* block = record->block;
+    block->free = 1;
+    stats_note_managed_free(record->user_size);
+    coalesce_block_locked(block);
+}
+
+static AllocationRecord* free_managed_pointer_locked(void* ptr) {
+    AllocationRecord* record = take_record_locked(ptr);
+    if (record) {
+        managed_free_record_locked(record);
+    }
+    return record;
+}
+
+static int should_manage(size_t size) {
+    return runtime_enabled && runtime_configured && size >= threshold_bytes && size > 0;
+}
+
+static int reclaim_record_locked(AllocationRecord* record) {
+    void* range_start = NULL;
+    size_t range_length = record_page_range(record, &range_start);
+    int rc = 0;
+
+    if (range_length == 0) {
+        return 0;
+    }
+
+    if (msync(range_start, range_length, MS_SYNC) != 0) {
+        rc = -1;
+    }
+
+    int advice = MADV_DONTNEED;
+#ifdef MADV_PAGEOUT
+    if (reclaim_policy == RECLAIM_PAGEOUT) {
+        advice = MADV_PAGEOUT;
+    }
+#endif
+    if (madvise(range_start, range_length, advice) != 0) {
+        rc = -1;
+    }
+
+    record->reclaim_epoch = reclaim_epoch;
+    stats_snapshot.reclaimed_bytes += record->user_size;
+    return rc;
+}
+
+static AllocationRecord* select_reclaim_candidate_locked(void) {
+    AllocationRecord* selected = NULL;
+
+    if (reclaim_selection == RECLAIM_SELECT_ALL) {
+        for (AllocationRecord* record = live_head; record; record = record->live_next) {
+            if (record->reclaim_epoch != reclaim_epoch) {
+                return record;
+            }
+        }
+        return NULL;
+    }
+
+    for (AllocationRecord* record = live_head; record; record = record->live_next) {
+        if (record->reclaim_epoch == reclaim_epoch) {
+            continue;
+        }
+
+        if (!selected) {
+            selected = record;
+            continue;
+        }
+
+        if (reclaim_selection == RECLAIM_SELECT_LARGEST) {
+            if (record->user_size > selected->user_size) {
+                selected = record;
+            }
+        } else if (record->allocation_seq < selected->allocation_seq) {
+            selected = record;
+        }
+    }
+
+    return selected;
+}
+
+static void maybe_policy_reclaim_locked(void) {
+    if (target_rss_bytes == 0 ||
+        reclaim_policy == RECLAIM_NONE ||
+        stats_snapshot.live_managed_bytes <= target_rss_bytes) {
+        return;
+    }
+
+    size_t needed = stats_snapshot.live_managed_bytes - target_rss_bytes;
+    size_t attempted = 0;
+    reclaim_epoch++;
+    stats_snapshot.policy_reclaim_calls++;
+
+    while (attempted < needed) {
+        AllocationRecord* candidate = select_reclaim_candidate_locked();
+        if (!candidate) {
+            break;
+        }
+
+        attempted += candidate->user_size;
+        reclaim_record_locked(candidate);
+
+        if (reclaim_selection == RECLAIM_SELECT_ALL) {
+            continue;
+        }
+    }
+}
+
+static void* allocate_by_policy(size_t size, size_t alignment, int zero_fill, int* managed,
+                                void* call_site) {
+    void* ptr = NULL;
+
+    *managed = 0;
+    if (should_manage(size)) {
+        pthread_mutex_lock(&runtime_lock);
+        AllocationRecord* record = managed_alloc_locked(size, alignment, call_site);
+        if (record) {
+            ptr = record->user_ptr;
+            *managed = 1;
+            maybe_policy_reclaim_locked();
+        }
+        pthread_mutex_unlock(&runtime_lock);
+
+        if (ptr) {
+            if (zero_fill) {
+                memset(ptr, 0, size);
+            }
+            return ptr;
+        }
+    }
+
+    if (zero_fill) {
+        ptr = pass_through_calloc(1, size);
+    } else if (alignment == default_alignment()) {
+        ptr = pass_through_malloc(size);
+    } else {
+        if (pass_through_posix_memalign(&ptr, alignment, size) != 0) {
+            ptr = NULL;
+        }
+    }
+
+    if (ptr) {
+        stats_note_pass_through_threadsafe(size);
+    }
+
     return ptr;
 }
 
-// Custom implementation of realloc
-static void* custom_realloc(void* ptr, size_t size) {
-    if (!ptr) return custom_malloc(size);
-    if (!size) { custom_free(ptr); return NULL; }
-    
-    AllocationEntry* entry = find_tracking_entry(ptr);
-    if (!entry) {
-        // Not tracked by us, use original realloc
-        return original_realloc(ptr, size);
-    }
-    
-    void* new_ptr;
-    
-    if (entry->is_mmap) {
-        // For mmap'd regions, we need to do a manual copy
-        new_ptr = custom_malloc(size);  // This might use mmap_fallback if needed
-        if (!new_ptr) return NULL;
-        
-        memcpy(new_ptr, ptr, entry->size < size ? entry->size : size);
-        custom_free(ptr);  // This will handle unmapping
-    } else {
-        // Try original realloc first
-        new_ptr = original_realloc(ptr, size);
-        if (new_ptr) {
-            remove_tracking_entry(ptr);
-            add_tracking_entry(new_ptr, size, 0, NULL);
-        } else {
-            // Original realloc failed, try mmap fallback
-            new_ptr = mmap_fallback(size);
-            if (new_ptr) {
-                memcpy(new_ptr, ptr, entry->size < size ? entry->size : size);
-                original_free(ptr);
-                remove_tracking_entry(ptr);
-            }
-        }
-    }
-    
-    return new_ptr;
-}
+static size_t record_page_range(AllocationRecord* record, void** range_start) {
+    uintptr_t start = (uintptr_t)record->user_ptr;
+    uintptr_t end = start + record->user_size;
+    uintptr_t page_mask = (uintptr_t)page_size - 1;
+    uintptr_t aligned_start = start & ~page_mask;
+    uintptr_t aligned_end = (end + page_mask) & ~page_mask;
 
-// Custom implementation of aligned_alloc
-static void* custom_aligned_alloc(size_t alignment, size_t size) {
-    void* ptr = original_aligned_alloc(alignment, size);
-    if (ptr) {
-        add_tracking_entry(ptr, size, 0, NULL);
-        return ptr;
-    }
-    
-    // For mmap fallback, we'd need to ensure alignment
-    size_t padded_size = size + alignment;
-    void* base_ptr = mmap_fallback(padded_size);
-    if (!base_ptr) return NULL;
-    
-    // Adjust pointer to meet alignment
-    uintptr_t addr = (uintptr_t)base_ptr;
-    uintptr_t aligned_addr = (addr + alignment - 1) & ~(alignment - 1);
-    
-    // If already aligned, just return
-    if (addr == aligned_addr) return base_ptr;
-    
-    // Update tracking entry
-    remove_tracking_entry(base_ptr);
-    fprintf(stderr, "Align: %lu %lu\n", addr, aligned_addr);
-    add_tracking_entry((void*)aligned_addr, size, 1, NULL);
-    
-    return (void*)aligned_addr;
-}
-
-// Custom implementation of posix_memalign
-static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {    
-    int ret = original_posix_memalign(memptr, alignment, size);
-    if (ret == 0) {
-        add_tracking_entry(*memptr, size, 0, NULL);
+    if (aligned_end < aligned_start) {
         return 0;
     }
-    
-    // Fallback implementation
-    size_t padded_size = size + alignment;
-    void* base_ptr = mmap_fallback(padded_size);
-    if (!base_ptr) return ENOMEM;
-    
-    uintptr_t addr = (uintptr_t)base_ptr;
-    uintptr_t aligned_addr = (addr + alignment - 1) & ~(alignment - 1);
-    
-    *memptr = (void*)aligned_addr;
-    
-    // Update tracking if needed
-    if (addr != aligned_addr) {
-        remove_tracking_entry(base_ptr);
-        add_tracking_entry(*memptr, size, 1, NULL);
+
+    *range_start = (void*)aligned_start;
+    return (size_t)(aligned_end - aligned_start);
+}
+
+int mai_reclaim_all(void) {
+    int rc = 0;
+
+    pthread_mutex_lock(&runtime_lock);
+
+    stats_snapshot.reclaim_calls++;
+    reclaim_epoch++;
+
+    if (reclaim_policy == RECLAIM_NONE) {
+        pthread_mutex_unlock(&runtime_lock);
+        return 0;
     }
-    
+
+    for (AllocationRecord* record = live_head; record; record = record->live_next) {
+        if (reclaim_record_locked(record) != 0) {
+            rc = -1;
+        }
+    }
+
+    pthread_mutex_unlock(&runtime_lock);
+    return rc;
+}
+
+int mai_get_stats(MaiStats* out) {
+    if (!out) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    pthread_mutex_lock(&runtime_lock);
+    *out = stats_snapshot;
+    out->enabled = runtime_enabled;
+    out->configured = runtime_configured;
+    out->config_error = runtime_config_error;
+    out->threshold = threshold_bytes;
+    out->arena_size = arena_size_bytes;
+    out->target_rss = target_rss_bytes;
+    pthread_mutex_unlock(&runtime_lock);
+
     return 0;
 }
 
-// Main function to attach interceptors
-int malloc_interceptor_attach() {
-    GumReplaceReturn replace_check;
-    
-    // Initialize Frida interceptor
-    malloc_interceptor = gum_interceptor_obtain();
+static void print_stats(void) {
+    MaiStats stats;
+
+    if (mai_get_stats(&stats) != 0) {
+        return;
+    }
+
+    fprintf(stderr,
+            "MAI stats: enabled=%d configured=%d config_error=%d threshold=%zu arena_size=%zu "
+            "target_rss=%zu segments=%zu arena_bytes=%zu managed_total=%zu pass_through_total=%zu "
+            "live_managed=%zu high_water=%zu managed_allocs=%zu pass_through_allocs=%zu "
+            "managed_frees=%zu reclaim_calls=%zu policy_reclaim_calls=%zu reclaimed_bytes=%zu "
+            "mmap_calls=%zu munmap_calls=%zu mremap_calls=%zu brk_calls=%zu sbrk_calls=%zu "
+            "profile_sites=%zu\n",
+            stats.enabled, stats.configured, stats.config_error, stats.threshold,
+            stats.arena_size, stats.target_rss, stats.arena_segments, stats.arena_bytes,
+            stats.managed_bytes_total, stats.pass_through_bytes_total,
+            stats.live_managed_bytes, stats.high_water_managed_bytes,
+            stats.managed_allocations, stats.pass_through_allocations,
+            stats.managed_frees, stats.reclaim_calls, stats.policy_reclaim_calls,
+            stats.reclaimed_bytes, stats.mmap_calls, stats.munmap_calls,
+            stats.mremap_calls, stats.brk_calls, stats.sbrk_calls,
+            stats.profile_sites);
+}
+
+static void print_profile_report(void) {
+    if (!profile_enabled) {
+        return;
+    }
+
+    fprintf(stderr, "MAI allocation profile:\n");
+    for (size_t i = 0; i < MAI_PROFILE_BUCKETS; i++) {
+        for (ProfileRecord* record = profile_buckets[i]; record; record = record->next) {
+            Dl_info info;
+            const char* symbol = NULL;
+            const char* object = NULL;
+
+            if (dladdr(record->call_site, &info) != 0) {
+                symbol = info.dli_sname;
+                object = info.dli_fname;
+            }
+
+            fprintf(stderr,
+                    "  call_site=%p symbol=%s object=%s allocations=%zu bytes=%zu\n",
+                    record->call_site,
+                    symbol ? symbol : "?",
+                    object ? object : "?",
+                    record->allocations,
+                    record->bytes);
+        }
+    }
+}
+
+static int validate_directory(const char* path) {
+    struct stat st;
+
+    if (!path || path[0] == '\0') {
+        return -1;
+    }
+    if (strlen(path) >= sizeof(mai_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    if (access(path, R_OK | W_OK | X_OK) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static const char* discover_backing_path(void) {
+    static const char* env_names[] = {
+        "SLURM_TMPDIR",
+        "PBS_JOBFS",
+        "TMPDIR",
+        "LOCAL_SCRATCH",
+        "SCRATCH",
+        "JOBSCRATCH",
+        NULL
+    };
+    const char* explicit_path = getenv("MAI_PATH");
+
+    if (explicit_path && explicit_path[0] != '\0') {
+        return validate_directory(explicit_path) == 0 ? explicit_path : NULL;
+    }
+
+    for (size_t i = 0; env_names[i]; i++) {
+        const char* value = getenv(env_names[i]);
+        if (validate_directory(value) == 0) {
+            return value;
+        }
+    }
+
+    return NULL;
+}
+
+static int configure_runtime(void) {
+    const char* enable = getenv("MAI_ENABLE");
+    const char* threshold = getenv("MAI_THRESHOLD");
+    const char* arena_size = getenv("MAI_ARENA_SIZE");
+    const char* target_rss = getenv("MAI_TARGET_RSS");
+    const char* reclaim = getenv("MAI_RECLAIM_POLICY");
+    const char* reclaim_select = getenv("MAI_RECLAIM_SELECTION");
+    const char* backing_path;
+
+    runtime_enabled = parse_bool_env(enable);
+    runtime_configured = 0;
+    runtime_config_error = 0;
+    verbose_logging = parse_bool_env(getenv("MAI_VERBOSE"));
+    stats_logging = parse_bool_env(getenv("MAI_STATS"));
+    profile_enabled = parse_bool_env(getenv("MAI_PROFILE"));
+    reclaim_policy = RECLAIM_NONE;
+    reclaim_selection = RECLAIM_SELECT_OLDEST;
+
+    page_size = (size_t)sysconf(_SC_PAGESIZE);
+    if (page_size == 0) {
+        page_size = 4096;
+    }
+
+    threshold_bytes = MAI_DEFAULT_THRESHOLD;
+    arena_size_bytes = MAI_DEFAULT_ARENA_SIZE;
+    target_rss_bytes = 0;
+
+    memset(&stats_snapshot, 0, sizeof(stats_snapshot));
+    memset(allocation_buckets, 0, sizeof(allocation_buckets));
+    memset(profile_buckets, 0, sizeof(profile_buckets));
+    live_head = NULL;
+    arena_segments = NULL;
+    next_segment_id = 0;
+    allocation_sequence = 0;
+    reclaim_epoch = 0;
+
+    if (!runtime_enabled) {
+        return 0;
+    }
+
+    if (threshold && parse_size_env(threshold, &threshold_bytes) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (arena_size && parse_size_env(arena_size, &arena_size_bytes) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (target_rss && parse_size_env(target_rss, &target_rss_bytes) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+
+    if (threshold_bytes == 0) {
+        threshold_bytes = 1;
+    }
+    if (arena_size_bytes < MAI_MIN_ARENA_SIZE) {
+        arena_size_bytes = MAI_MIN_ARENA_SIZE;
+    }
+
+    if (reclaim) {
+        if (strcmp(reclaim, "none") == 0) {
+            reclaim_policy = RECLAIM_NONE;
+        } else if (strcmp(reclaim, "donthneed") == 0) {
+            reclaim_policy = RECLAIM_DONTNEED;
+        } else if (strcmp(reclaim, "pageout") == 0) {
+#ifdef MADV_PAGEOUT
+            reclaim_policy = RECLAIM_PAGEOUT;
+#else
+            reclaim_policy = RECLAIM_DONTNEED;
+#endif
+        } else {
+            runtime_config_error = 1;
+            return -1;
+        }
+    }
+    if (reclaim_select) {
+        if (strcmp(reclaim_select, "oldest") == 0) {
+            reclaim_selection = RECLAIM_SELECT_OLDEST;
+        } else if (strcmp(reclaim_select, "largest") == 0) {
+            reclaim_selection = RECLAIM_SELECT_LARGEST;
+        } else if (strcmp(reclaim_select, "all") == 0) {
+            reclaim_selection = RECLAIM_SELECT_ALL;
+        } else {
+            runtime_config_error = 1;
+            return -1;
+        }
+    }
+
+    backing_path = discover_backing_path();
+    if (!backing_path) {
+        runtime_config_error = 1;
+        return -1;
+    }
+
+    snprintf(mai_path, sizeof(mai_path), "%s", backing_path);
+    runtime_configured = 1;
+    return 0;
+}
+
+static void* custom_malloc(size_t size) {
+    if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
+        return pass_through_malloc(size);
+    }
+
+    in_mai_hook++;
+    int managed = 0;
+    void* ptr = allocate_by_policy(size, default_alignment(), 0, &managed,
+                                   __builtin_return_address(0));
+    in_mai_hook--;
+
+    (void)managed;
+    return ptr;
+}
+
+static void custom_free(void* ptr) {
+    int saved_errno = errno;
+
+    if (!ptr) {
+        return;
+    }
+
+    if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
+        pass_through_free(ptr);
+        errno = saved_errno;
+        return;
+    }
+
+    in_mai_hook++;
+
+    pthread_mutex_lock(&runtime_lock);
+    AllocationRecord* record = free_managed_pointer_locked(ptr);
+    pthread_mutex_unlock(&runtime_lock);
+
+    if (record) {
+        meta_free(record);
+    } else {
+        pass_through_free(ptr);
+    }
+
+    in_mai_hook--;
+    errno = saved_errno;
+}
+
+static void* custom_calloc(size_t nmemb, size_t size) {
+    size_t total;
+
+    if (mul_overflow(nmemb, size, &total) != 0) {
+        return NULL;
+    }
+
+    if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
+        return pass_through_calloc(nmemb, size);
+    }
+
+    in_mai_hook++;
+    int managed = 0;
+    void* ptr = allocate_by_policy(total, default_alignment(), 1, &managed,
+                                   __builtin_return_address(0));
+    in_mai_hook--;
+
+    (void)managed;
+    return ptr;
+}
+
+static void* custom_realloc(void* ptr, size_t size) {
+    if (!ptr) {
+        return custom_malloc(size);
+    }
+    if (size == 0) {
+        custom_free(ptr);
+        return NULL;
+    }
+
+    if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
+        return pass_through_realloc(ptr, size);
+    }
+
+    in_mai_hook++;
+
+    pthread_mutex_lock(&runtime_lock);
+    AllocationRecord* record = find_record_locked(ptr);
+    if (record) {
+        size_t old_size = record->user_size;
+        if (size <= old_size) {
+            stats_reduce_live_managed(old_size - size);
+            record->user_size = size;
+            record->mapped_length = size;
+            pthread_mutex_unlock(&runtime_lock);
+            in_mai_hook--;
+            return ptr;
+        }
+    }
+    pthread_mutex_unlock(&runtime_lock);
+
+    if (record) {
+        int managed = 0;
+        void* new_ptr = allocate_by_policy(size, default_alignment(), 0, &managed,
+                                           __builtin_return_address(0));
+        if (!new_ptr) {
+            in_mai_hook--;
+            return NULL;
+        }
+
+        memcpy(new_ptr, ptr, record->user_size);
+        pthread_mutex_lock(&runtime_lock);
+        AllocationRecord* old_record = free_managed_pointer_locked(ptr);
+        pthread_mutex_unlock(&runtime_lock);
+        meta_free(old_record);
+        in_mai_hook--;
+        return new_ptr;
+    }
+
+    if (should_manage(size)) {
+        size_t old_size = malloc_usable_size(ptr);
+        int managed = 0;
+        void* new_ptr = allocate_by_policy(size, default_alignment(), 0, &managed,
+                                           __builtin_return_address(0));
+        if (new_ptr) {
+            memcpy(new_ptr, ptr, old_size < size ? old_size : size);
+            pass_through_free(ptr);
+            in_mai_hook--;
+            return new_ptr;
+        }
+    }
+
+    void* result = pass_through_realloc(ptr, size);
+    if (result) {
+        stats_note_pass_through_threadsafe(size);
+    }
+
+    in_mai_hook--;
+    return result;
+}
+
+static void* custom_aligned_alloc(size_t alignment, size_t size) {
+    if (in_mai_hook || cleanup_in_progress || !runtime_configured || !should_manage(size)) {
+        return pass_through_aligned_alloc(alignment, size);
+    }
+
+    if (!is_power_of_two(alignment) || size % alignment != 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    in_mai_hook++;
+    int managed = 0;
+    void* ptr = allocate_by_policy(size, alignment, 0, &managed,
+                                   __builtin_return_address(0));
+    in_mai_hook--;
+
+    (void)managed;
+    return ptr;
+}
+
+static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
+    if (!memptr || !is_power_of_two(alignment) || alignment % sizeof(void*) != 0) {
+        return EINVAL;
+    }
+
+    if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
+        return pass_through_posix_memalign(memptr, alignment, size);
+    }
+
+    in_mai_hook++;
+
+    if (should_manage(size)) {
+        pthread_mutex_lock(&runtime_lock);
+        AllocationRecord* record = managed_alloc_locked(size, alignment,
+                                                        __builtin_return_address(0));
+        if (record) {
+            maybe_policy_reclaim_locked();
+        }
+        pthread_mutex_unlock(&runtime_lock);
+        if (record) {
+            *memptr = record->user_ptr;
+            in_mai_hook--;
+            return 0;
+        }
+    }
+
+    int ret = pass_through_posix_memalign(memptr, alignment, size);
+    if (ret == 0) {
+        stats_note_pass_through_threadsafe(size);
+    }
+
+    in_mai_hook--;
+    return ret;
+}
+
+static void* custom_memalign(size_t alignment, size_t size) {
+    if (in_mai_hook || cleanup_in_progress || !runtime_configured || !should_manage(size)) {
+        return pass_through_memalign(alignment, size);
+    }
+
+    if (!is_power_of_two(alignment)) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    in_mai_hook++;
+    int managed = 0;
+    void* ptr = allocate_by_policy(size, alignment, 0, &managed,
+                                   __builtin_return_address(0));
+    in_mai_hook--;
+
+    (void)managed;
+    return ptr;
+}
+
+static void* custom_valloc(size_t size) {
+    return custom_memalign(page_size, size);
+}
+
+static void* custom_pvalloc(size_t size) {
+    size_t rounded = align_up_size(size, page_size);
+    if (rounded == 0) {
+        return NULL;
+    }
+    return custom_memalign(page_size, rounded);
+}
+
+static size_t custom_malloc_usable_size(void* ptr) {
+    if (!ptr || cleanup_in_progress || !runtime_configured) {
+        return pass_through_malloc_usable_size(ptr);
+    }
+
+    pthread_mutex_lock(&runtime_lock);
+    AllocationRecord* record = find_record_locked(ptr);
+    size_t usable_size = record ? record->user_size : 0;
+    pthread_mutex_unlock(&runtime_lock);
+
+    if (record) {
+        return usable_size;
+    }
+
+    return pass_through_malloc_usable_size(ptr);
+}
+
+void* mai_operator_new_allocate(size_t size) {
+    if (size == 0) {
+        size = 1;
+    }
+    return custom_malloc(size);
+}
+
+void* mai_operator_new_aligned_allocate(size_t size, size_t alignment) {
+    void* ptr = NULL;
+
+    if (size == 0) {
+        size = 1;
+    }
+    if (!is_power_of_two(alignment) || alignment < sizeof(void*)) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    if (custom_posix_memalign(&ptr, alignment, size) != 0) {
+        return NULL;
+    }
+
+    return ptr;
+}
+
+void mai_operator_delete_free(void* ptr) {
+    custom_free(ptr);
+}
+
+static void note_diagnostic_counter(size_t* counter) {
+    if (in_mai_hook || !runtime_configured) {
+        return;
+    }
+
+    pthread_mutex_lock(&runtime_lock);
+    (*counter)++;
+    pthread_mutex_unlock(&runtime_lock);
+}
+
+static void* custom_mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    note_diagnostic_counter(&stats_snapshot.mmap_calls);
+    return original_mmap(addr, length, prot, flags, fd, offset);
+}
+
+static int custom_munmap(void* addr, size_t length) {
+    note_diagnostic_counter(&stats_snapshot.munmap_calls);
+    return original_munmap(addr, length);
+}
+
+static void* custom_mremap(void* old_address, size_t old_size, size_t new_size, int flags, void* new_address) {
+    note_diagnostic_counter(&stats_snapshot.mremap_calls);
+#ifdef MREMAP_FIXED
+    if (flags & MREMAP_FIXED) {
+        return original_mremap(old_address, old_size, new_size, flags, new_address);
+    }
+#endif
+    return original_mremap(old_address, old_size, new_size, flags);
+}
+
+static int custom_brk(void* addr) {
+    note_diagnostic_counter(&stats_snapshot.brk_calls);
+    return original_brk(addr);
+}
+
+static void* custom_sbrk(intptr_t increment) {
+    note_diagnostic_counter(&stats_snapshot.sbrk_calls);
+    return original_sbrk(increment);
+}
+
+typedef struct {
+    HookKind kind;
+    const char* symbol;
+    gpointer replacement;
+} DynamicHookSpec;
+
+static const DynamicHookSpec dynamic_hook_specs[] = {
+    { HOOK_MALLOC, "malloc", (gpointer)custom_malloc },
+    { HOOK_FREE, "free", (gpointer)custom_free },
+    { HOOK_CALLOC, "calloc", (gpointer)custom_calloc },
+    { HOOK_REALLOC, "realloc", (gpointer)custom_realloc },
+    { HOOK_ALIGNED_ALLOC, "aligned_alloc", (gpointer)custom_aligned_alloc },
+    { HOOK_POSIX_MEMALIGN, "posix_memalign", (gpointer)custom_posix_memalign },
+    { HOOK_MEMALIGN, "memalign", (gpointer)custom_memalign },
+    { HOOK_VALLOC, "valloc", (gpointer)custom_valloc },
+    { HOOK_PVALLOC, "pvalloc", (gpointer)custom_pvalloc },
+    { HOOK_MALLOC_USABLE_SIZE, "malloc_usable_size", (gpointer)custom_malloc_usable_size },
+};
+
+static int hook_address_is_known(gpointer address) {
+    if (!address) {
+        return 1;
+    }
+
+    if (address == malloc_addr ||
+        address == free_addr ||
+        address == calloc_addr ||
+        address == realloc_addr ||
+        address == aligned_alloc_addr ||
+        address == posix_memalign_addr ||
+        address == memalign_addr ||
+        address == valloc_addr ||
+        address == pvalloc_addr ||
+        address == malloc_usable_size_addr ||
+        address == dlopen_addr ||
+        address == dlmopen_addr ||
+        address == mmap_addr ||
+        address == munmap_addr ||
+        address == mremap_addr ||
+        address == brk_addr ||
+        address == sbrk_addr) {
+        return 1;
+    }
+
+    for (DynamicReplacement* replacement = dynamic_replacements;
+         replacement;
+         replacement = replacement->next) {
+        if (replacement->address == address) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int replace_dynamic_symbol(gpointer address, const DynamicHookSpec* spec) {
+    if (hook_address_is_known(address)) {
+        return 0;
+    }
+
+    DynamicReplacement* replacement = meta_alloc(sizeof(*replacement));
+    if (!replacement) {
+        return -1;
+    }
+
+    replacement->kind = spec->kind;
+    replacement->symbol = spec->symbol;
+    replacement->address = address;
+    replacement->original = NULL;
+    replacement->next = NULL;
+
+    GumReplaceReturn ret = gum_interceptor_replace(malloc_interceptor,
+                                                   address,
+                                                   spec->replacement,
+                                                   replacement,
+                                                   (gpointer*)&replacement->original);
+    if (ret == GUM_REPLACE_ALREADY_REPLACED) {
+        meta_free(replacement);
+        return 0;
+    }
+    if (ret != GUM_REPLACE_OK) {
+        if (verbose_logging) {
+            fprintf(stderr, "MAI: failed to replace dlopened %s at %p: %d\n",
+                    spec->symbol, address, ret);
+        }
+        meta_free(replacement);
+        return -1;
+    }
+
+    replacement->next = dynamic_replacements;
+    dynamic_replacements = replacement;
+
+    if (verbose_logging) {
+        fprintf(stderr, "MAI: hooked dlopened %s at %p\n", spec->symbol, address);
+    }
+
+    return 0;
+}
+
+static void refresh_hooks_for_handle(void* handle) {
+    if (!handle || !malloc_interceptor || cleanup_in_progress) {
+        return;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+
+    gum_interceptor_ignore_current_thread(malloc_interceptor);
     gum_interceptor_begin_transaction(malloc_interceptor);
-    
-    // Find function addresses
+
+    for (size_t i = 0; i < sizeof(dynamic_hook_specs) / sizeof(dynamic_hook_specs[0]); i++) {
+        void* symbol_address = dlsym(handle, dynamic_hook_specs[i].symbol);
+        if (symbol_address) {
+            replace_dynamic_symbol((gpointer)symbol_address, &dynamic_hook_specs[i]);
+        }
+    }
+
+    gum_interceptor_end_transaction(malloc_interceptor);
+    gum_interceptor_unignore_current_thread(malloc_interceptor);
+
+    in_mai_hook = saved_hook_depth;
+}
+
+static void* custom_dlopen(const char* filename, int flags) {
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    void* handle = original_dlopen(filename, flags);
+    in_mai_hook = saved_hook_depth;
+
+    if (handle) {
+        refresh_hooks_for_handle(handle);
+    }
+
+    return handle;
+}
+
+static void* custom_dlmopen(Lmid_t nsid, const char* filename, int flags) {
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    void* handle = original_dlmopen(nsid, filename, flags);
+    in_mai_hook = saved_hook_depth;
+
+    if (handle) {
+        refresh_hooks_for_handle(handle);
+    }
+
+    return handle;
+}
+
+static int replace_fast(gpointer address, gpointer replacement, gpointer* original,
+                        int* replaced, const char* name) {
+    GumReplaceReturn ret;
+
+    if (!address) {
+        return 0;
+    }
+
+    ret = gum_interceptor_replace_fast(malloc_interceptor, address, replacement, original);
+    if (ret != GUM_REPLACE_OK) {
+        fprintf(stderr, "MAI: failed to replace %s: %d\n", name, ret);
+        return -1;
+    }
+
+    *replaced = 1;
+    return 0;
+}
+
+static int replace_regular(gpointer address, gpointer replacement, gpointer* original,
+                           int* replaced, const char* name) {
+    GumReplaceReturn ret;
+
+    if (!address) {
+        return 0;
+    }
+
+    ret = gum_interceptor_replace(malloc_interceptor, address, replacement, NULL, original);
+    if (ret != GUM_REPLACE_OK) {
+        fprintf(stderr, "MAI: failed to replace %s: %d\n", name, ret);
+        return -1;
+    }
+
+    *replaced = 1;
+    return 0;
+}
+
+static void revert_replacements(void) {
+    if (!malloc_interceptor) {
+        return;
+    }
+
+    gum_interceptor_begin_transaction(malloc_interceptor);
+
+    for (DynamicReplacement* replacement = dynamic_replacements;
+         replacement;
+         replacement = replacement->next) {
+        gum_interceptor_revert(malloc_interceptor, replacement->address);
+    }
+
+    if (malloc_replaced) gum_interceptor_revert(malloc_interceptor, malloc_addr);
+    if (free_replaced) gum_interceptor_revert(malloc_interceptor, free_addr);
+    if (calloc_replaced) gum_interceptor_revert(malloc_interceptor, calloc_addr);
+    if (realloc_replaced) gum_interceptor_revert(malloc_interceptor, realloc_addr);
+    if (aligned_alloc_replaced) gum_interceptor_revert(malloc_interceptor, aligned_alloc_addr);
+    if (posix_memalign_replaced) gum_interceptor_revert(malloc_interceptor, posix_memalign_addr);
+    if (memalign_replaced) gum_interceptor_revert(malloc_interceptor, memalign_addr);
+    if (valloc_replaced) gum_interceptor_revert(malloc_interceptor, valloc_addr);
+    if (pvalloc_replaced) gum_interceptor_revert(malloc_interceptor, pvalloc_addr);
+    if (malloc_usable_size_replaced) gum_interceptor_revert(malloc_interceptor, malloc_usable_size_addr);
+    if (dlopen_replaced) gum_interceptor_revert(malloc_interceptor, dlopen_addr);
+    if (dlmopen_replaced) gum_interceptor_revert(malloc_interceptor, dlmopen_addr);
+    if (mmap_replaced) gum_interceptor_revert(malloc_interceptor, mmap_addr);
+    if (munmap_replaced) gum_interceptor_revert(malloc_interceptor, munmap_addr);
+    if (mremap_replaced) gum_interceptor_revert(malloc_interceptor, mremap_addr);
+    if (brk_replaced) gum_interceptor_revert(malloc_interceptor, brk_addr);
+    if (sbrk_replaced) gum_interceptor_revert(malloc_interceptor, sbrk_addr);
+
+    gum_interceptor_end_transaction(malloc_interceptor);
+
+    while (dynamic_replacements) {
+        DynamicReplacement* next = dynamic_replacements->next;
+        meta_free(dynamic_replacements);
+        dynamic_replacements = next;
+    }
+
+    malloc_replaced = 0;
+    free_replaced = 0;
+    calloc_replaced = 0;
+    realloc_replaced = 0;
+    aligned_alloc_replaced = 0;
+    posix_memalign_replaced = 0;
+    memalign_replaced = 0;
+    valloc_replaced = 0;
+    pvalloc_replaced = 0;
+    malloc_usable_size_replaced = 0;
+    dlopen_replaced = 0;
+    dlmopen_replaced = 0;
+    mmap_replaced = 0;
+    munmap_replaced = 0;
+    mremap_replaced = 0;
+    brk_replaced = 0;
+    sbrk_replaced = 0;
+}
+
+int malloc_interceptor_attach(void) {
+    int failed = 0;
+
+    pthread_mutex_lock(&lifecycle_lock);
+
+    if (hooks_attached) {
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 0;
+    }
+
+    if (configure_runtime() != 0) {
+        if (verbose_logging || stats_logging) {
+            fprintf(stderr, "MAI: disabled because configuration is invalid or no scratch path was found\n");
+            print_stats();
+        }
+        runtime_enabled = 0;
+        pthread_mutex_unlock(&lifecycle_lock);
+        return -1;
+    }
+
+    if (!runtime_enabled) {
+        pthread_mutex_unlock(&lifecycle_lock);
+        return 0;
+    }
+
+    gum_init_embedded();
+    gum_initialized = 1;
+
+    malloc_interceptor = gum_interceptor_obtain();
+    if (!malloc_interceptor) {
+        gum_deinit_embedded();
+        gum_initialized = 0;
+        pthread_mutex_unlock(&lifecycle_lock);
+        return -1;
+    }
+
     malloc_addr = (void*)malloc;
     free_addr = (void*)free;
     calloc_addr = (void*)calloc;
     realloc_addr = (void*)realloc;
     aligned_alloc_addr = (void*)aligned_alloc;
     posix_memalign_addr = (void*)posix_memalign;
+    memalign_addr = (void*)memalign;
+    valloc_addr = (void*)valloc;
+    pvalloc_addr = (void*)pvalloc;
+    malloc_usable_size_addr = (void*)malloc_usable_size;
+    dlopen_addr = (void*)dlopen;
+    dlmopen_addr = (void*)dlmopen;
+    mmap_addr = (void*)mmap;
+    munmap_addr = (void*)munmap;
+    mremap_addr = (void*)mremap;
+    brk_addr = (void*)brk;
+    sbrk_addr = (void*)sbrk;
 
-    // malloc_addr = gum_find_function("malloc");
-    // free_addr = gum_find_function("free");
-    // calloc_addr = gum_find_function("calloc");
-    // realloc_addr = gum_find_function("realloc");
-    // aligned_alloc_addr = gum_find_function("aligned_alloc");
-    // posix_memalign_addr = gum_find_function("posix_memalign"); //(void*)posix_memalign; 
-    //fprintf(stderr, "posix_memalign_addr: %p\n", posix_memalign_addr);
-    /*
-    GumDebugSymbolDetails details;
+    gum_interceptor_begin_transaction(malloc_interceptor);
 
-    if (gum_symbol_details_from_address(posix_memalign_addr, &details)) {
-        printf("Symbol Details:\n");
-        printf("  Address: %p\n", (void*) details.address);
-        printf("  Module Name: %s\n", details.module_name);
-        printf("  Symbol Name: %s\n", details.symbol_name);
-        printf("  File Name: %s\n", details.file_name);
-        printf("  Line Number: %u\n", details.line_number);
-        printf("  Column: %u\n", details.column);
-    } else {
-        fprintf(stderr, "Failed to retrieve symbol details for address: %p\n", posix_memalign_addr);
-    }
+    failed |= replace_fast(malloc_addr, (gpointer)custom_malloc,
+                           (gpointer*)&original_malloc, &malloc_replaced, "malloc");
+    failed |= replace_fast(free_addr, (gpointer)custom_free,
+                           (gpointer*)&original_free, &free_replaced, "free");
+    failed |= replace_fast(calloc_addr, (gpointer)custom_calloc,
+                           (gpointer*)&original_calloc, &calloc_replaced, "calloc");
+    failed |= replace_fast(realloc_addr, (gpointer)custom_realloc,
+                           (gpointer*)&original_realloc, &realloc_replaced, "realloc");
+    failed |= replace_fast(aligned_alloc_addr, (gpointer)custom_aligned_alloc,
+                           (gpointer*)&original_aligned_alloc,
+                           &aligned_alloc_replaced, "aligned_alloc");
+    failed |= replace_regular(posix_memalign_addr, (gpointer)custom_posix_memalign,
+                              (gpointer*)&original_posix_memalign,
+                              &posix_memalign_replaced, "posix_memalign");
+    failed |= replace_fast(memalign_addr, (gpointer)custom_memalign,
+                           (gpointer*)&original_memalign, &memalign_replaced, "memalign");
+    failed |= replace_fast(valloc_addr, (gpointer)custom_valloc,
+                           (gpointer*)&original_valloc, &valloc_replaced, "valloc");
+    failed |= replace_fast(pvalloc_addr, (gpointer)custom_pvalloc,
+                           (gpointer*)&original_pvalloc, &pvalloc_replaced, "pvalloc");
+    failed |= replace_fast(malloc_usable_size_addr, (gpointer)custom_malloc_usable_size,
+                           (gpointer*)&original_malloc_usable_size,
+                           &malloc_usable_size_replaced, "malloc_usable_size");
+    failed |= replace_fast(dlopen_addr, (gpointer)custom_dlopen,
+                           (gpointer*)&original_dlopen, &dlopen_replaced, "dlopen");
+    failed |= replace_fast(dlmopen_addr, (gpointer)custom_dlmopen,
+                           (gpointer*)&original_dlmopen, &dlmopen_replaced, "dlmopen");
+    failed |= replace_fast(mmap_addr, (gpointer)custom_mmap,
+                           (gpointer*)&original_mmap, &mmap_replaced, "mmap");
+    failed |= replace_fast(munmap_addr, (gpointer)custom_munmap,
+                           (gpointer*)&original_munmap, &munmap_replaced, "munmap");
+    failed |= replace_fast(mremap_addr, (gpointer)custom_mremap,
+                           (gpointer*)&original_mremap, &mremap_replaced, "mremap");
+    failed |= replace_fast(brk_addr, (gpointer)custom_brk,
+                           (gpointer*)&original_brk, &brk_replaced, "brk");
+    failed |= replace_fast(sbrk_addr, (gpointer)custom_sbrk,
+                           (gpointer*)&original_sbrk, &sbrk_replaced, "sbrk");
 
-    GArray *function_addresses;
-
-    function_addresses = gum_find_functions_matching("*posix_mem*");
-    if (function_addresses == NULL) {
-        fprintf(stderr, "Failed to find functions matching: %s\n", "posix_memalign");
-    }
-
-    fprintf(stderr, "Found %u matching function addresses:\n", function_addresses->len);
-    for (guint i = 0; i < function_addresses->len; i++) {
-        gpointer address = g_array_index(function_addresses, gpointer, i);
-        gchar* func_name = gum_symbol_name_from_address(address);
-        fprintf(stderr, "  %p   %s\n", address, func_name);
-    }
-    */ 
-    // Replace functions with our custom implementations
-    if (malloc_addr) {
-        replace_check = gum_interceptor_replace_fast(malloc_interceptor, 
-                                                  malloc_addr, 
-                                                  custom_malloc,
-                                                  (gpointer*)(&original_malloc));
-        if (replace_check != GUM_REPLACE_OK) {
-            fprintf(stderr, "Failed to replace malloc: %d\n", replace_check);
-        }
-    }
-    
-    if (free_addr) {
-        replace_check = gum_interceptor_replace_fast(malloc_interceptor, 
-                                                  free_addr, 
-                                                  custom_free,
-                                                  (gpointer*)(&original_free));
-        if (replace_check != GUM_REPLACE_OK) {
-            fprintf(stderr, "Failed to replace free: %d\n", replace_check);
-        }
-    }
-    
-    if (calloc_addr) {
-        replace_check = gum_interceptor_replace_fast(malloc_interceptor, 
-                                                  calloc_addr, 
-                                                  custom_calloc,
-                                                  (gpointer*)(&original_calloc));
-        if (replace_check != GUM_REPLACE_OK) {
-            fprintf(stderr, "Failed to replace calloc: %d\n", replace_check);
-        }
-    }
-    
-    if (realloc_addr) {
-        replace_check = gum_interceptor_replace_fast(malloc_interceptor, 
-                                                  realloc_addr, 
-                                                  custom_realloc,
-                                                  (gpointer*)(&original_realloc));
-        if (replace_check != GUM_REPLACE_OK) {
-            fprintf(stderr, "Failed to replace realloc: %d\n", replace_check);
-        }
-    }
-    
-    if (aligned_alloc_addr) {
-        replace_check = gum_interceptor_replace_fast(malloc_interceptor, 
-                                                  aligned_alloc_addr, 
-                                                  custom_aligned_alloc,
-                                                  (gpointer*)(&original_aligned_alloc));
-        if (replace_check != GUM_REPLACE_OK) {
-            fprintf(stderr, "Failed to replace aligned_alloc: %d\n", replace_check);
-        }
-    }
-    
-    if (posix_memalign_addr) {
-        replace_check = gum_interceptor_replace(malloc_interceptor, 
-                                                  posix_memalign_addr, 
-                                                  custom_posix_memalign, NULL,
-                                                  (gpointer*)(&original_posix_memalign));
-        if (replace_check != GUM_REPLACE_OK) {
-            fprintf(stderr, "Failed to replace posix_memalign: %d\n", replace_check);
-        }
-    }
-    
     gum_interceptor_end_transaction(malloc_interceptor);
-    
-    // Initialize the tracking table if not already done
-    init_table();
-    
-    fprintf(stderr, "Memory allocation functions intercepted successfully\n");
-    
+
+    if (failed) {
+        cleanup_in_progress = 1;
+        revert_replacements();
+        g_object_unref(malloc_interceptor);
+        malloc_interceptor = NULL;
+        gum_deinit_embedded();
+        gum_initialized = 0;
+        runtime_enabled = 0;
+        cleanup_in_progress = 0;
+        pthread_mutex_unlock(&lifecycle_lock);
+        return -1;
+    }
+
+    hooks_attached = 1;
+    if (verbose_logging) {
+        fprintf(stderr, "MAI: enabled path=%s threshold=%zu arena_size=%zu reclaim=%d\n",
+                mai_path, threshold_bytes, arena_size_bytes, reclaim_policy);
+    }
+
+    pthread_mutex_unlock(&lifecycle_lock);
     return 0;
 }
 
-// Function to detach interceptors and clean up
-void malloc_interceptor_dettach() {
+void malloc_interceptor_detach(void) {
+    pthread_mutex_lock(&lifecycle_lock);
+
+    if (!hooks_attached && !runtime_enabled) {
+        pthread_mutex_unlock(&lifecycle_lock);
+        return;
+    }
+
     cleanup_in_progress = 1;
-    
-    // Revert all interceptors
-    if (malloc_addr) gum_interceptor_revert(malloc_interceptor, malloc_addr);
-    if (free_addr) gum_interceptor_revert(malloc_interceptor, free_addr);
-    if (calloc_addr) gum_interceptor_revert(malloc_interceptor, calloc_addr);
-    if (realloc_addr) gum_interceptor_revert(malloc_interceptor, realloc_addr);
-    if (aligned_alloc_addr) gum_interceptor_revert(malloc_interceptor, aligned_alloc_addr);
-    if (posix_memalign_addr) gum_interceptor_revert(malloc_interceptor, posix_memalign_addr);
-    
-    // Clean up tracking table if it exists
-    gum_metal_hash_table_unref(track_table);
-    
-    // Release interceptor
-    g_object_unref(malloc_interceptor);
-    
-    fprintf(stderr, "Memory allocation interceptors detached and resources cleaned up\n");
-    fprintf(stderr, "Max usage (bytes): %lu\n", max_memory);
+    revert_replacements();
+
+    if (stats_logging || verbose_logging) {
+        print_stats();
+        print_profile_report();
+    }
+
+    if (malloc_interceptor) {
+        g_object_unref(malloc_interceptor);
+        malloc_interceptor = NULL;
+    }
+    if (gum_initialized) {
+        gum_deinit_embedded();
+        gum_initialized = 0;
+    }
+
+    hooks_attached = 0;
+    runtime_enabled = 0;
+    cleanup_in_progress = 0;
+
+    pthread_mutex_unlock(&lifecycle_lock);
+}
+
+void malloc_interceptor_dettach(void) {
+    malloc_interceptor_detach();
 }
