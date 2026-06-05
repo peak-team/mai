@@ -129,6 +129,7 @@ MAI_PATH=/path/to/node-local-or-scratch-storage
 MAI_THRESHOLD=64M
 MAI_ARENA_SIZE=1G
 MAI_TARGET_RSS=0
+MAI_MAX_RSS=auto
 MAI_RECLAIM_POLICY=none
 MAI_RECLAIM_SELECTION=oldest
 MAI_PROFILE=1
@@ -183,6 +184,15 @@ counts for excluded ranges, and safety hook patch counts.
 drop selected managed ranges when observed RSS is above the target. It is a
 best-effort policy trigger, not a hard cgroup limit.
 
+`MAI_MAX_RSS` is a process-RSS safety cap for MAI-managed allocation activity.
+The default is `auto`, which uses unprivileged cgroup memory files, physical
+memory, and `/proc/meminfo` `MemAvailable` when available, with conservative
+headroom. It can also be set to an explicit size or to `off`. Before MAI returns
+`ENOMEM` because of this cap, it first tries the configured reclaim selection
+and then an exhaustive reclaim pass over every live, non-excluded managed
+allocation. This does not let MAI control stack, static, pinned, GPU, RDMA, or
+other non-managed memory, and it does not install or rely on system swap.
+
 `MAI_RECLAIM_SELECTION` controls which allocations are selected when
 `MAI_TARGET_RSS` triggers reclaim:
 
@@ -220,7 +230,7 @@ manual sample before shutdown.
 ```
 mkdir build
 cd build
-cmake --install-prefix=$HOME ..
+cmake -DCMAKE_INSTALL_PREFIX=$HOME ..
 make
 ctest --output-on-failure
 ```

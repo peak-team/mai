@@ -43,6 +43,9 @@ program mai_fortran_runtime_test
         integer(c_size_t) :: reclaim_skipped_excluded
         integer(c_size_t) :: reclaim_skipped_excluded_bytes
         integer(c_size_t) :: safety_hook_patches
+        integer(c_size_t) :: max_rss
+        integer(c_size_t) :: memory_cap_reclaim_calls
+        integer(c_size_t) :: memory_cap_failures
     end type mai_stats
 
     interface

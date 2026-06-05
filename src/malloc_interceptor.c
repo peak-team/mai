@@ -26,6 +26,9 @@
 #define MAI_PASS_THROUGH_FLUSH_INTERVAL 1024
 #define MAI_ALLOCATOR_HOOK_MODE_PRELOAD 1
 #define MAI_ALLOCATOR_HOOK_MODE_FRIDA 2
+#define MAI_AUTO_MEMORY_CAP_PERCENT 95
+#define MAI_CGROUP_LIMIT_SENTINEL (1ULL << 60)
+#define MAI_ZERO_FILL_CHUNK (1024ULL * 1024ULL)
 
 #if defined(__GNUC__) || defined(__clang__)
 #define MAI_LIKELY(value) __builtin_expect(!!(value), 1)
@@ -230,6 +233,9 @@ static size_t page_size = 4096;
 static size_t threshold_bytes = MAI_DEFAULT_THRESHOLD;
 static size_t arena_size_bytes = MAI_DEFAULT_ARENA_SIZE;
 static size_t target_rss_bytes = 0;
+static size_t max_rss_bytes = 0;
+static int max_rss_auto = 1;
+static int max_rss_enabled = 1;
 static ReclaimPolicy reclaim_policy = RECLAIM_NONE;
 static ReclaimSelection reclaim_selection = RECLAIM_SELECT_OLDEST;
 static int profile_enabled = 0;
@@ -730,6 +736,155 @@ static size_t sample_process_rss_bytes(void) {
     }
 
     return (size_t)resident_pages * page_size;
+}
+
+static int read_size_file(const char* path, size_t* out) {
+    char buffer[128];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+        return -1;
+    }
+
+    ssize_t bytes_read = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (bytes_read <= 0) {
+        return -1;
+    }
+    buffer[bytes_read] = '\0';
+
+    char* cursor = buffer;
+    while (*cursor && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+    if (strncmp(cursor, "max", 3) == 0) {
+        return -1;
+    }
+
+    errno = 0;
+    char* end = NULL;
+    unsigned long long parsed = strtoull(cursor, &end, 10);
+    if (errno != 0 || end == cursor || parsed > (unsigned long long)SIZE_MAX ||
+        parsed >= MAI_CGROUP_LIMIT_SENTINEL) {
+        return -1;
+    }
+
+    *out = (size_t)parsed;
+    return 0;
+}
+
+static size_t sample_physical_memory_bytes(void) {
+    long pages = sysconf(_SC_PHYS_PAGES);
+    if (pages <= 0 || (unsigned long)pages > SIZE_MAX / page_size) {
+        return 0;
+    }
+    return (size_t)pages * page_size;
+}
+
+static size_t sample_mem_available_bytes(void) {
+    char buffer[4096];
+    int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
+    if (fd == -1) {
+        return 0;
+    }
+
+    ssize_t bytes_read = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (bytes_read <= 0) {
+        return 0;
+    }
+    buffer[bytes_read] = '\0';
+
+    const char* key = "MemAvailable:";
+    char* line = strstr(buffer, key);
+    if (!line) {
+        return 0;
+    }
+    line += strlen(key);
+    while (*line && isspace((unsigned char)*line)) {
+        line++;
+    }
+
+    errno = 0;
+    char* end = NULL;
+    unsigned long long kib = strtoull(line, &end, 10);
+    if (errno != 0 || end == line ||
+        kib > (unsigned long long)(SIZE_MAX / 1024ULL)) {
+        return 0;
+    }
+
+    return (size_t)kib * 1024ULL;
+}
+
+static size_t sample_cgroup_limit_bytes(void) {
+    size_t value = 0;
+    if (read_size_file("/sys/fs/cgroup/memory.max", &value) == 0) {
+        return value;
+    }
+    if (read_size_file("/sys/fs/cgroup/memory/memory.limit_in_bytes", &value) == 0) {
+        return value;
+    }
+    return 0;
+}
+
+static size_t sample_cgroup_current_bytes(void) {
+    size_t value = 0;
+    if (read_size_file("/sys/fs/cgroup/memory.current", &value) == 0) {
+        return value;
+    }
+    if (read_size_file("/sys/fs/cgroup/memory/memory.usage_in_bytes", &value) == 0) {
+        return value;
+    }
+    return 0;
+}
+
+static size_t min_nonzero_size(size_t a, size_t b) {
+    if (a == 0) {
+        return b;
+    }
+    if (b == 0) {
+        return a;
+    }
+    return a < b ? a : b;
+}
+
+static size_t apply_auto_cap_headroom(size_t bytes) {
+    if (bytes == 0) {
+        return 0;
+    }
+
+    size_t capped = (bytes / 100) * MAI_AUTO_MEMORY_CAP_PERCENT +
+        ((bytes % 100) * MAI_AUTO_MEMORY_CAP_PERCENT) / 100;
+    if (capped == 0) {
+        return bytes;
+    }
+    if (capped < page_size && bytes >= page_size) {
+        return page_size;
+    }
+    return capped;
+}
+
+static size_t detect_auto_max_rss_bytes(size_t current_rss) {
+    size_t cgroup_limit = sample_cgroup_limit_bytes();
+    size_t cap = min_nonzero_size(sample_physical_memory_bytes(), cgroup_limit);
+    size_t cgroup_current = sample_cgroup_current_bytes();
+    if (cgroup_limit != 0 && cgroup_current != 0) {
+        size_t cgroup_cap = current_rss;
+        if (cgroup_limit > cgroup_current) {
+            size_t remaining = cgroup_limit - cgroup_current;
+            cgroup_cap = current_rss > SIZE_MAX - remaining ? SIZE_MAX :
+                current_rss + remaining;
+        }
+        cap = min_nonzero_size(cap, cgroup_cap);
+    }
+
+    size_t mem_available = sample_mem_available_bytes();
+    if (mem_available != 0) {
+        size_t available_cap = current_rss > SIZE_MAX - mem_available ? SIZE_MAX :
+            current_rss + mem_available;
+        cap = min_nonzero_size(cap, available_cap);
+    }
+
+    return apply_auto_cap_headroom(cap);
 }
 
 static size_t update_observed_rss_locked(void) {
@@ -2116,7 +2271,7 @@ static int should_manage(size_t size) {
            size >= threshold_bytes && size > 0;
 }
 
-static int reclaim_record_locked(AllocationRecord* record) {
+static int reclaim_record_locked(AllocationRecord* record, ReclaimPolicy policy) {
     void* range_start = NULL;
     size_t range_length = record_page_range(record, &range_start);
     int rc = 0;
@@ -2137,7 +2292,7 @@ static int reclaim_record_locked(AllocationRecord* record) {
 
     int advice = MADV_DONTNEED;
 #ifdef MADV_PAGEOUT
-    if (reclaim_policy == RECLAIM_PAGEOUT) {
+    if (policy == RECLAIM_PAGEOUT) {
         advice = MADV_PAGEOUT;
     }
 #endif
@@ -2270,20 +2425,26 @@ static AllocationRecord* select_reclaim_candidate_locked(size_t* estimated_bytes
     return selected;
 }
 
-static void maybe_policy_reclaim_locked(void) {
+static int reclaim_to_rss_locked(size_t target_rss, ReclaimPolicy policy,
+                                 int count_policy_call) {
     size_t current_rss = update_observed_rss_locked();
 
-    if (target_rss_bytes == 0 ||
-        reclaim_policy == RECLAIM_NONE ||
+    if (target_rss == 0 && current_rss == 0) {
+        return 0;
+    }
+    if (policy == RECLAIM_NONE ||
         current_rss == 0 ||
-        current_rss <= target_rss_bytes) {
-        return;
+        current_rss <= target_rss) {
+        return 0;
     }
 
-    size_t needed = current_rss - target_rss_bytes;
+    size_t needed = current_rss - target_rss;
     size_t attempted = 0;
+    int rc = 0;
     reclaim_epoch++;
-    stats_snapshot.policy_reclaim_calls++;
+    if (count_policy_call) {
+        stats_snapshot.policy_reclaim_calls++;
+    }
 
     while (attempted < needed) {
         size_t estimated_bytes = 0;
@@ -2292,10 +2453,13 @@ static void maybe_policy_reclaim_locked(void) {
             break;
         }
 
-        int rc = reclaim_record_locked(candidate);
+        int record_rc = reclaim_record_locked(candidate, policy);
+        if (record_rc != 0) {
+            rc = -1;
+        }
         if (estimated_bytes > 0) {
             attempted += estimated_bytes;
-        } else if (rc == 0) {
+        } else if (record_rc == 0) {
             attempted += page_size;
         } else {
             attempted += candidate->user_size;
@@ -2307,6 +2471,116 @@ static void maybe_policy_reclaim_locked(void) {
     }
 
     update_observed_rss_locked();
+    return rc;
+}
+
+static int reclaim_all_candidates_locked(ReclaimPolicy policy) {
+    int rc = 0;
+
+    if (policy == RECLAIM_NONE) {
+        return 0;
+    }
+
+    reclaim_epoch++;
+    for (AllocationRecord* record = live_head; record; record = record->live_next) {
+        if (reclaim_record_locked(record, policy) != 0) {
+            rc = -1;
+        }
+    }
+
+    update_observed_rss_locked();
+    return rc;
+}
+
+static size_t effective_max_rss_locked(size_t current_rss) {
+    if (!max_rss_enabled) {
+        stats_snapshot.max_rss = 0;
+        return 0;
+    }
+
+    if (max_rss_auto) {
+        max_rss_bytes = detect_auto_max_rss_bytes(current_rss);
+    }
+    stats_snapshot.max_rss = max_rss_bytes;
+    return max_rss_bytes;
+}
+
+static int rss_has_headroom(size_t current_rss, size_t cap, size_t incoming_resident_bytes) {
+    if (cap == 0) {
+        return 1;
+    }
+    if (current_rss > cap) {
+        return 0;
+    }
+    return incoming_resident_bytes <= cap - current_rss;
+}
+
+static int ensure_memory_cap_headroom_locked(size_t incoming_resident_bytes) {
+    size_t current_rss = update_observed_rss_locked();
+    size_t cap = effective_max_rss_locked(current_rss);
+    if (rss_has_headroom(current_rss, cap, incoming_resident_bytes)) {
+        return 0;
+    }
+
+    ReclaimPolicy cap_policy =
+        reclaim_policy == RECLAIM_NONE ? RECLAIM_DONTNEED : reclaim_policy;
+    size_t target = incoming_resident_bytes >= cap ? 0 : cap - incoming_resident_bytes;
+
+    stats_snapshot.memory_cap_reclaim_calls++;
+    (void)reclaim_to_rss_locked(target, cap_policy, 0);
+
+    current_rss = update_observed_rss_locked();
+    cap = effective_max_rss_locked(current_rss);
+    if (rss_has_headroom(current_rss, cap, incoming_resident_bytes)) {
+        return 0;
+    }
+
+    (void)reclaim_all_candidates_locked(cap_policy);
+
+    current_rss = update_observed_rss_locked();
+    cap = effective_max_rss_locked(current_rss);
+    if (rss_has_headroom(current_rss, cap, incoming_resident_bytes)) {
+        return 0;
+    }
+
+    stats_snapshot.memory_cap_failures++;
+    errno = ENOMEM;
+    return -1;
+}
+
+static void maybe_policy_reclaim_locked(void) {
+    if (target_rss_bytes == 0 || reclaim_policy == RECLAIM_NONE) {
+        return;
+    }
+
+    (void)reclaim_to_rss_locked(target_rss_bytes, reclaim_policy, 1);
+}
+
+static int zero_fill_managed_allocation(void* ptr, size_t size) {
+    unsigned char* cursor = (unsigned char*)ptr;
+    size_t offset = 0;
+
+    while (offset < size) {
+        size_t remaining = size - offset;
+        size_t chunk = remaining < MAI_ZERO_FILL_CHUNK ? remaining : MAI_ZERO_FILL_CHUNK;
+
+        pthread_mutex_lock(&runtime_lock);
+        int headroom_rc = ensure_memory_cap_headroom_locked(chunk);
+        pthread_mutex_unlock(&runtime_lock);
+        if (headroom_rc != 0) {
+            return -1;
+        }
+
+        memset(cursor + offset, 0, chunk);
+        offset += chunk;
+
+        pthread_mutex_lock(&runtime_lock);
+        maybe_policy_reclaim_locked();
+        (void)ensure_memory_cap_headroom_locked(0);
+        pthread_mutex_unlock(&runtime_lock);
+    }
+
+    return 0;
 }
 
 static void* allocate_by_policy(size_t size, size_t alignment, int zero_fill, int* managed,
@@ -2316,6 +2590,11 @@ static void* allocate_by_policy(size_t size, size_t alignment, int zero_fill, in
     *managed = 0;
     if (should_manage(size)) {
         pthread_mutex_lock(&runtime_lock);
+        if (ensure_memory_cap_headroom_locked(0) != 0) {
+            pthread_mutex_unlock(&runtime_lock);
+            errno = ENOMEM;
+            return NULL;
+        }
         AllocationRecord* record = managed_alloc_locked(size, alignment, call_site);
         if (record) {
             ptr = record->user_ptr;
@@ -2325,10 +2604,18 @@ static void* allocate_by_policy(size_t size, size_t alignment, int zero_fill, in
 
         if (ptr) {
             if (zero_fill) {
-                memset(ptr, 0, size);
+                if (zero_fill_managed_allocation(ptr, size) != 0) {
+                    pthread_mutex_lock(&runtime_lock);
+                    AllocationRecord* old_record = free_managed_pointer_locked(ptr);
+                    pthread_mutex_unlock(&runtime_lock);
+                    meta_free(old_record);
+                    errno = ENOMEM;
+                    return NULL;
+                }
             }
             pthread_mutex_lock(&runtime_lock);
             maybe_policy_reclaim_locked();
+            (void)ensure_memory_cap_headroom_locked(0);
             pthread_mutex_unlock(&runtime_lock);
             return ptr;
         }
@@ -2375,20 +2662,13 @@ int mai_reclaim_all(void) {
     pthread_mutex_lock(&runtime_lock);
 
     stats_snapshot.reclaim_calls++;
-    reclaim_epoch++;
 
     if (reclaim_policy == RECLAIM_NONE) {
         pthread_mutex_unlock(&runtime_lock);
         return 0;
     }
 
-    for (AllocationRecord* record = live_head; record; record = record->live_next) {
-        if (reclaim_record_locked(record) != 0) {
-            rc = -1;
-        }
-    }
-
-    update_observed_rss_locked();
+    rc = reclaim_all_candidates_locked(reclaim_policy);
     pthread_mutex_unlock(&runtime_lock);
     return rc;
 }
@@ -2427,6 +2707,7 @@ int mai_get_stats(MaiStats* out) {
     out->threshold = threshold_bytes;
     out->arena_size = arena_size_bytes;
     out->target_rss = target_rss_bytes;
+    out->max_rss = effective_max_rss_locked(stats_snapshot.current_rss_bytes);
     pthread_mutex_unlock(&runtime_lock);
 
     return 0;
@@ -2441,10 +2722,11 @@ static void print_stats(void) {
 
     fprintf(stderr,
             "MAI stats: enabled=%d configured=%d config_error=%d threshold=%zu arena_size=%zu "
-            "target_rss=%zu current_rss=%zu high_water_rss=%zu "
+            "target_rss=%zu max_rss=%zu current_rss=%zu high_water_rss=%zu "
             "segments=%zu arena_bytes=%zu managed_total=%zu pass_through_total=%zu "
             "live_managed=%zu high_water=%zu managed_allocs=%zu pass_through_allocs=%zu "
-            "managed_frees=%zu reclaim_calls=%zu policy_reclaim_calls=%zu reclaimed_bytes=%zu "
+            "managed_frees=%zu reclaim_calls=%zu policy_reclaim_calls=%zu "
+            "memory_cap_reclaim_calls=%zu memory_cap_failures=%zu reclaimed_bytes=%zu "
             "mmap_calls=%zu munmap_calls=%zu mremap_calls=%zu brk_calls=%zu sbrk_calls=%zu "
             "profile_sites=%zu hotness_samples=%zu hotness_sampled_pages=%zu "
             "hotness_resident_pages=%zu allocator_hook_mode=%zu allocator_libc_patches=%zu "
@@ -2453,12 +2735,14 @@ static void print_stats(void) {
             "reclaim_skipped_excluded=%zu reclaim_skipped_excluded_bytes=%zu "
             "safety_hook_patches=%zu\n",
             stats.enabled, stats.configured, stats.config_error, stats.threshold,
-            stats.arena_size, stats.target_rss, stats.current_rss_bytes,
-            stats.high_water_rss_bytes, stats.arena_segments, stats.arena_bytes,
+            stats.arena_size, stats.target_rss, stats.max_rss,
+            stats.current_rss_bytes, stats.high_water_rss_bytes,
+            stats.arena_segments, stats.arena_bytes,
             stats.managed_bytes_total, stats.pass_through_bytes_total,
             stats.live_managed_bytes, stats.high_water_managed_bytes,
             stats.managed_allocations, stats.pass_through_allocations,
             stats.managed_frees, stats.reclaim_calls, stats.policy_reclaim_calls,
+            stats.memory_cap_reclaim_calls, stats.memory_cap_failures,
             stats.reclaimed_bytes, stats.mmap_calls, stats.munmap_calls,
             stats.mremap_calls, stats.brk_calls, stats.sbrk_calls,
             stats.profile_sites, stats.hotness_samples, stats.hotness_sampled_pages,
@@ -2604,6 +2888,7 @@ static int configure_runtime(void) {
     const char* threshold = getenv("MAI_THRESHOLD");
     const char* arena_size = getenv("MAI_ARENA_SIZE");
     const char* target_rss = getenv("MAI_TARGET_RSS");
+    const char* max_rss = getenv("MAI_MAX_RSS");
     const char* reclaim = getenv("MAI_RECLAIM_POLICY");
     const char* reclaim_select = getenv("MAI_RECLAIM_SELECTION");
     const char* hotness_sample = getenv("MAI_HOTNESS_SAMPLE_PAGES");
@@ -2628,6 +2913,9 @@ static int configure_runtime(void) {
     threshold_bytes = MAI_DEFAULT_THRESHOLD;
     arena_size_bytes = MAI_DEFAULT_ARENA_SIZE;
     target_rss_bytes = 0;
+    max_rss_bytes = 0;
+    max_rss_auto = 1;
+    max_rss_enabled = 1;
     hotness_sample_pages = MAI_DEFAULT_HOTNESS_SAMPLE_PAGES;
 
     memset(&stats_snapshot, 0, sizeof(stats_snapshot));
@@ -2670,6 +2958,24 @@ static int configure_runtime(void) {
         runtime_config_error = 1;
         return -1;
     }
+    if (max_rss && max_rss[0] != '\0') {
+        if (strcmp(max_rss, "auto") == 0) {
+            max_rss_auto = 1;
+            max_rss_enabled = 1;
+        } else if (strcmp(max_rss, "off") == 0 || strcmp(max_rss, "none") == 0 ||
+                   strcmp(max_rss, "0") == 0) {
+            max_rss_auto = 0;
+            max_rss_enabled = 0;
+            max_rss_bytes = 0;
+        } else {
+            if (parse_size_env(max_rss, &max_rss_bytes) != 0) {
+                runtime_config_error = 1;
+                return -1;
+            }
+            max_rss_auto = 0;
+            max_rss_enabled = max_rss_bytes != 0;
+        }
+    }
     if (hotness_sample && parse_count_env(hotness_sample, &hotness_sample_pages) != 0) {
         runtime_config_error = 1;
         return -1;
@@ -2686,6 +2992,10 @@ static int configure_runtime(void) {
     }
     if (hotness_sample_pages > MAI_MAX_HOTNESS_SAMPLE_PAGES) {
         hotness_sample_pages = MAI_MAX_HOTNESS_SAMPLE_PAGES;
+    }
+    if (max_rss_enabled && max_rss_auto) {
+        max_rss_bytes = detect_auto_max_rss_bytes(sample_process_rss_bytes());
+        stats_snapshot.max_rss = max_rss_bytes;
     }
 
     if (reclaim) {
@@ -2956,7 +3266,10 @@ static int custom_posix_memalign_from_site(void** memptr, size_t alignment, size
 
     if (should_manage(size)) {
         pthread_mutex_lock(&runtime_lock);
-        AllocationRecord* record = managed_alloc_locked(size, alignment, call_site);
+        AllocationRecord* record = NULL;
+        if (ensure_memory_cap_headroom_locked(0) == 0) {
+            record = managed_alloc_locked(size, alignment, call_site);
+        }
         if (record) {
             *memptr = record->user_ptr;
         }
@@ -5077,9 +5390,11 @@ int malloc_interceptor_attach(void) {
         (size_t)rdma_dereg_mr_replaced;
     if (verbose_logging) {
         fprintf(stderr,
-                "MAI: enabled path=%s threshold=%zu arena_size=%zu reclaim=%d "
+                "MAI: enabled path=%s threshold=%zu arena_size=%zu target_rss=%zu "
+                "max_rss=%zu reclaim=%d "
                 "allocator_hooks=%s\n",
-                mai_path, threshold_bytes, arena_size_bytes, reclaim_policy,
+                mai_path, threshold_bytes, arena_size_bytes, target_rss_bytes,
+                max_rss_bytes, reclaim_policy,
                 patch_libc_allocators ? "frida" : "preload");
     }
 

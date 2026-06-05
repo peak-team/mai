@@ -4,6 +4,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,6 +29,10 @@ static const char* allocator_source = "default";
 static double seconds_since(const struct timespec* start, const struct timespec* end) {
     time_t sec = end->tv_sec - start->tv_sec;
     long nsec = end->tv_nsec - start->tv_nsec;
+    if (nsec < 0) {
+        sec -= 1;
+        nsec += 1000000000L;
+    }
     return (double)sec + (double)nsec / 1000000000.0;
 }
 
@@ -35,7 +40,8 @@ static int parse_size(const char* value, size_t* out) {
     char* end = NULL;
     errno = 0;
     unsigned long long parsed = strtoull(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0') {
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed > (unsigned long long)SIZE_MAX) {
         return -1;
     }
     *out = (size_t)parsed;

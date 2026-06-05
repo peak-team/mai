@@ -572,15 +572,16 @@ static int mode_alignment(void) {
         return fail("mai_get_stats failed before small alignment test");
     }
 
-    void* small_aligned = aligned_alloc(4, 128);
-    if (!small_aligned || !aligned_ptr(small_aligned, 4)) {
+    size_t small_alignment = sizeof(void*);
+    void* small_aligned = aligned_alloc(small_alignment, 128);
+    if (!small_aligned || !aligned_ptr(small_aligned, small_alignment)) {
         free(small_aligned);
         return fail("below-threshold aligned_alloc did not preserve small-alignment libc behavior");
     }
     free(small_aligned);
 
-    void* small_memalign = memalign(4, 128);
-    if (!small_memalign || !aligned_ptr(small_memalign, 4)) {
+    void* small_memalign = memalign(small_alignment, 128);
+    if (!small_memalign || !aligned_ptr(small_memalign, small_alignment)) {
         free(small_memalign);
         return fail("below-threshold memalign did not preserve small-alignment libc behavior");
     }
@@ -870,6 +871,60 @@ static int mode_target_rss(void) {
         free(ptrs[i]);
     }
 
+    return 0;
+}
+
+static int mode_memory_cap_auto(void) {
+    MaiStats stats;
+    if (load_stats(&stats) != 0) {
+        return fail("mai_get_stats failed for memory cap auto test");
+    }
+    if (stats.max_rss == 0 || stats.current_rss_bytes == 0) {
+        return fail("auto memory cap was not detected");
+    }
+    return 0;
+}
+
+static int mode_memory_cap_off(void) {
+    MaiStats stats;
+    if (load_stats(&stats) != 0) {
+        return fail("mai_get_stats failed for memory cap off test");
+    }
+    if (stats.max_rss != 0) {
+        return fail("MAI_MAX_RSS=off did not disable memory cap");
+    }
+    return 0;
+}
+
+static int mode_memory_cap_chunked_calloc(void) {
+    MaiStats before;
+    MaiStats after;
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before memory cap chunked calloc test");
+    }
+
+    size_t size = 96 * 1024 * 1024;
+    unsigned char* ptr = calloc(1, size);
+    if (!ptr) {
+        return fail("memory cap chunked calloc failed");
+    }
+    if (ptr[0] != 0 || ptr[size / 2] != 0 || ptr[size - 1] != 0) {
+        free(ptr);
+        return fail("memory cap chunked calloc did not return zeroed memory");
+    }
+
+    if (load_stats(&after) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after memory cap chunked calloc test");
+    }
+    if (!stats_show_managed_alloc(&before, &after, size) ||
+        after.memory_cap_reclaim_calls <= before.memory_cap_reclaim_calls ||
+        after.reclaimed_bytes <= before.reclaimed_bytes ||
+        after.memory_cap_failures != before.memory_cap_failures) {
+        free(ptr);
+        return fail("memory cap chunked calloc was not reclaimed correctly");
+    }
+    free(ptr);
     return 0;
 }
 
@@ -1819,6 +1874,11 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "reclaim") == 0) return mode_reclaim();
     if (strcmp(argv[1], "mlock_exclusion") == 0) return mode_mlock_exclusion();
     if (strcmp(argv[1], "target_rss") == 0) return mode_target_rss();
+    if (strcmp(argv[1], "memory_cap_auto") == 0) return mode_memory_cap_auto();
+    if (strcmp(argv[1], "memory_cap_off") == 0) return mode_memory_cap_off();
+    if (strcmp(argv[1], "memory_cap_chunked_calloc") == 0) {
+        return mode_memory_cap_chunked_calloc();
+    }
     if (strcmp(argv[1], "profile") == 0) return mode_profile();
     if (strcmp(argv[1], "hotness") == 0) return mode_hotness();
     if (strcmp(argv[1], "hotness_live_exit") == 0) return mode_hotness_live_exit();

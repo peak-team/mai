@@ -47,6 +47,9 @@ class MaiStats(ctypes.Structure):
         ("reclaim_skipped_excluded", ctypes.c_size_t),
         ("reclaim_skipped_excluded_bytes", ctypes.c_size_t),
         ("safety_hook_patches", ctypes.c_size_t),
+        ("max_rss", ctypes.c_size_t),
+        ("memory_cap_reclaim_calls", ctypes.c_size_t),
+        ("memory_cap_failures", ctypes.c_size_t),
     ]
 
 

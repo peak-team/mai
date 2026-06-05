@@ -11,10 +11,11 @@ FORBIDDEN = {
         r"\bswapon\b",
         r"\bswapoff\b",
     ],
-    "cgroup or system-control dependency": [
-        r"/sys/fs/cgroup",
+    "cgroup control or system-control dependency": [
         r"/proc/sys",
-        r"\bcgroup\b",
+        r"cgroup\.procs",
+        r"cgroup\.subtree_control",
+        r"cgroup\.threads",
     ],
     "root or capability dependency": [
         r"\bcapget\b",

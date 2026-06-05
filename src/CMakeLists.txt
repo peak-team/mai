@@ -10,6 +10,12 @@ add_library(mai
         ${sources_mai}
 )
 
+target_compile_features(mai
+    PRIVATE
+        c_std_11
+        cxx_std_17
+)
+
 target_include_directories(mai
     PUBLIC 
         ${PROJECT_SOURCE_DIR}/include

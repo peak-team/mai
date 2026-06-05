@@ -14,6 +14,12 @@
 #include <pthread.h>
 #include <stdint.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define MAI_DEPRECATED(message) __attribute__((deprecated(message)))
+#else
+#define MAI_DEPRECATED(message)
+#endif
+
 /**
  * @file malloc_interceptor.h
  * @brief Public API for MAI lifecycle, stats, and reclaim controls.
@@ -68,6 +74,9 @@ typedef struct {
     size_t reclaim_skipped_excluded;
     size_t reclaim_skipped_excluded_bytes;
     size_t safety_hook_patches;
+    size_t max_rss;
+    size_t memory_cap_reclaim_calls;
+    size_t memory_cap_failures;
 } MaiStats;
 
 #ifdef __cplusplus
@@ -85,6 +94,7 @@ int malloc_interceptor_attach(void);
  */
 void malloc_interceptor_detach(void);
 
+MAI_DEPRECATED("use malloc_interceptor_detach")
 void malloc_interceptor_dettach(void);
 
 __attribute__((visibility("default")))

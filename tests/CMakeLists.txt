@@ -369,6 +369,44 @@ add_test(
 )
 
 add_test(
+    NAME mai_memory_cap_auto_detected
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        memory_cap_auto
+)
+
+add_test(
+    NAME mai_memory_cap_off
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_MAX_RSS=off"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        memory_cap_off
+)
+
+add_test(
+    NAME mai_memory_cap_chunked_calloc
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_MAX_RSS=32M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        memory_cap_chunked_calloc
+)
+
+add_test(
     NAME mai_backing_file_creation_failure
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"
