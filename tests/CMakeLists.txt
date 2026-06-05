@@ -49,6 +49,7 @@ function(add_mai_runtime_test name mode)
             "MAI_PATH=${MAI_TEST_SCRATCH}"
             "MAI_THRESHOLD=4K"
             "MAI_ARENA_SIZE=1M"
+            ${ARGN}
             "LD_PRELOAD=$<TARGET_FILE:mai>"
             $<TARGET_FILE:mai_runtime_test>
             ${mode}
@@ -56,14 +57,19 @@ function(add_mai_runtime_test name mode)
 endfunction()
 
 add_mai_runtime_test(mai_small_pass_through small)
+add_mai_runtime_test(mai_pass_through_stats_default_off pass_through_stats_default_off)
 add_mai_runtime_test(mai_direct_preload_symbols preload_symbols)
 add_mai_runtime_test(mai_large_managed large)
 add_mai_runtime_test(mai_calloc calloc)
 add_mai_runtime_test(mai_realloc realloc)
-add_mai_runtime_test(mai_alignment alignment)
+add_mai_runtime_test(mai_alignment alignment "MAI_STATS=1")
 add_mai_runtime_test(mai_many_allocations many)
 add_mai_runtime_test(mai_multithreaded thread)
-add_mai_runtime_test(mai_multithreaded_small_pass_through_stats thread_small_stats)
+add_mai_runtime_test(
+    mai_multithreaded_small_pass_through_stats
+    thread_small_stats
+    "MAI_STATS=1"
+)
 add_mai_runtime_test(mai_mmap_brk_diagnostics diagnostics)
 
 add_test(

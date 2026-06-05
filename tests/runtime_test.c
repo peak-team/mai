@@ -120,6 +120,33 @@ static int mode_small(void) {
     return 0;
 }
 
+static int mode_pass_through_stats_default_off(void) {
+    MaiStats before;
+    MaiStats after;
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before default pass-through stats test");
+    }
+
+    void* ptr = malloc(128);
+    if (!ptr) {
+        return fail("small malloc failed in default pass-through stats test");
+    }
+    free(ptr);
+
+    if (load_stats(&after) != 0) {
+        return fail("mai_get_stats failed after default pass-through stats test");
+    }
+    if (after.managed_allocations != before.managed_allocations) {
+        return fail("default pass-through stats test routed a small allocation to MAI arena");
+    }
+    if (after.pass_through_allocations != before.pass_through_allocations ||
+        after.pass_through_bytes_total != before.pass_through_bytes_total) {
+        return fail("pass-through counters changed while MAI_STATS was disabled");
+    }
+
+    return 0;
+}
+
 static int mode_preload_symbols(void) {
     static const char* symbols[] = {
         "malloc",
@@ -1044,6 +1071,9 @@ int main(int argc, char** argv) {
 
     if (strcmp(argv[1], "disabled") == 0) return mode_disabled();
     if (strcmp(argv[1], "small") == 0) return mode_small();
+    if (strcmp(argv[1], "pass_through_stats_default_off") == 0) {
+        return mode_pass_through_stats_default_off();
+    }
     if (strcmp(argv[1], "preload_symbols") == 0) return mode_preload_symbols();
     if (strcmp(argv[1], "preload_path_stats") == 0) return mode_preload_path_stats();
     if (strcmp(argv[1], "frida_hook_mode") == 0) return mode_frida_hook_mode();

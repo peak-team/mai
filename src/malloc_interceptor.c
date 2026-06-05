@@ -26,6 +26,14 @@
 #define MAI_ALLOCATOR_HOOK_MODE_PRELOAD 1
 #define MAI_ALLOCATOR_HOOK_MODE_FRIDA 2
 
+#if defined(__GNUC__) || defined(__clang__)
+#define MAI_LIKELY(value) __builtin_expect(!!(value), 1)
+#define MAI_UNLIKELY(value) __builtin_expect(!!(value), 0)
+#else
+#define MAI_LIKELY(value) (value)
+#define MAI_UNLIKELY(value) (value)
+#endif
+
 typedef enum {
     RECLAIM_NONE = 0,
     RECLAIM_DONTNEED,
@@ -1060,6 +1068,9 @@ static void stats_note_pass_through(size_t size) {
 }
 
 static void stats_note_pass_through_threadsafe(size_t size) {
+    if (!stats_logging) {
+        return;
+    }
     stats_note_pass_through(size);
 }
 
@@ -1095,21 +1106,21 @@ static void stats_note_frida_allocator_path(void) {
 
 #define NOTE_PRELOAD_ALLOCATOR_PATH() \
     do { \
-        if (path_stats_enabled) { \
+        if (MAI_UNLIKELY(path_stats_enabled)) { \
             stats_note_preload_allocator_path(); \
         } \
     } while (0)
 
 #define NOTE_FRIDA_ALLOCATOR_PATH() \
     do { \
-        if (path_stats_enabled) { \
+        if (MAI_UNLIKELY(path_stats_enabled)) { \
             stats_note_frida_allocator_path(); \
         } \
     } while (0)
 
 static void* fast_pass_through_malloc(size_t size) {
     void* ptr = pass_through_malloc(size);
-    if (ptr) {
+    if (ptr && stats_logging) {
         stats_note_pass_through_threadsafe(size);
     }
     return ptr;
@@ -1117,7 +1128,7 @@ static void* fast_pass_through_malloc(size_t size) {
 
 static void* fast_pass_through_calloc(size_t nmemb, size_t size, size_t total) {
     void* ptr = pass_through_calloc(nmemb, size);
-    if (ptr) {
+    if (ptr && stats_logging) {
         stats_note_pass_through_threadsafe(total);
     }
     return ptr;
@@ -1637,7 +1648,7 @@ static void* allocate_by_policy(size_t size, size_t alignment, int zero_fill, in
         }
     }
 
-    if (ptr) {
+    if (ptr && stats_logging) {
         stats_note_pass_through_threadsafe(size);
     }
 
@@ -2126,7 +2137,7 @@ static void* custom_realloc_from_site(void* ptr, size_t size, void* call_site) {
         }
 
         void* result = pass_through_realloc(ptr, size);
-        if (result) {
+        if (result && stats_logging) {
             stats_note_pass_through_threadsafe(size);
         }
         in_mai_hook--;
@@ -2181,7 +2192,7 @@ static void* custom_realloc_from_site(void* ptr, size_t size, void* call_site) {
     }
 
     void* result = pass_through_realloc(ptr, size);
-    if (result) {
+    if (result && stats_logging) {
         stats_note_pass_through_threadsafe(size);
     }
 
@@ -2196,7 +2207,8 @@ static void* custom_realloc(void* ptr, size_t size) {
 static void* custom_aligned_alloc_from_site(size_t alignment, size_t size, void* call_site) {
     if (in_mai_hook || cleanup_in_progress || !runtime_configured || !should_manage(size)) {
         void* ptr = pass_through_aligned_alloc(alignment, size);
-        if (ptr && !in_mai_hook && !cleanup_in_progress && runtime_configured) {
+        if (ptr && stats_logging && !in_mai_hook && !cleanup_in_progress &&
+            runtime_configured) {
             stats_note_pass_through_threadsafe(size);
         }
         return ptr;
@@ -2252,7 +2264,7 @@ static int custom_posix_memalign_from_site(void** memptr, size_t alignment, size
     }
 
     int ret = pass_through_posix_memalign(memptr, alignment, size);
-    if (ret == 0) {
+    if (ret == 0 && stats_logging) {
         stats_note_pass_through_threadsafe(size);
     }
 
@@ -2268,7 +2280,8 @@ static int custom_posix_memalign(void** memptr, size_t alignment, size_t size) {
 static void* custom_memalign_from_site(size_t alignment, size_t size, void* call_site) {
     if (in_mai_hook || cleanup_in_progress || !runtime_configured || !should_manage(size)) {
         void* ptr = pass_through_memalign(alignment, size);
-        if (ptr && !in_mai_hook && !cleanup_in_progress && runtime_configured) {
+        if (ptr && stats_logging && !in_mai_hook && !cleanup_in_progress &&
+            runtime_configured) {
             stats_note_pass_through_threadsafe(size);
         }
         return ptr;
@@ -2327,16 +2340,16 @@ static size_t custom_malloc_usable_size(void* ptr) {
 
 __attribute__((visibility("default")))
 void* malloc(size_t size) {
-    if (resolving_original_allocators) {
+    if (MAI_UNLIKELY(resolving_original_allocators)) {
         return fallback_malloc(size);
     }
     NOTE_PRELOAD_ALLOCATOR_PATH();
-    if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
+    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress || !runtime_configured)) {
         return call_libc_malloc(size);
     }
-    if (!should_manage(size)) {
+    if (MAI_LIKELY(size < threshold_bytes || size == 0)) {
         void* ptr = call_libc_malloc(size);
-        if (ptr) {
+        if (ptr && MAI_UNLIKELY(stats_logging)) {
             stats_note_pass_through_threadsafe(size);
         }
         return ptr;
@@ -2346,16 +2359,21 @@ void* malloc(size_t size) {
 
 __attribute__((visibility("default")))
 void free(void* ptr) {
-    if (resolving_original_allocators) {
+    if (MAI_UNLIKELY(resolving_original_allocators)) {
         fallback_free(ptr);
         return;
     }
     NOTE_PRELOAD_ALLOCATOR_PATH();
-    if (!ptr) {
+    if (MAI_UNLIKELY(!ptr)) {
         return;
     }
-    if (in_mai_hook || cleanup_in_progress || !runtime_configured ||
-        !pointer_may_be_managed(ptr)) {
+    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress || !runtime_configured)) {
+        int saved_errno = errno;
+        call_libc_free(ptr);
+        errno = saved_errno;
+        return;
+    }
+    if (MAI_LIKELY(!pointer_may_be_managed(ptr))) {
         int saved_errno = errno;
         call_libc_free(ptr);
         errno = saved_errno;
@@ -2366,20 +2384,20 @@ void free(void* ptr) {
 
 __attribute__((visibility("default")))
 void* calloc(size_t nmemb, size_t size) {
-    if (resolving_original_allocators) {
+    if (MAI_UNLIKELY(resolving_original_allocators)) {
         return fallback_calloc(nmemb, size);
     }
     NOTE_PRELOAD_ALLOCATOR_PATH();
     size_t total = 0;
-    if (mul_overflow(nmemb, size, &total) != 0) {
+    if (MAI_UNLIKELY(mul_overflow(nmemb, size, &total) != 0)) {
         return NULL;
     }
-    if (in_mai_hook || cleanup_in_progress || !runtime_configured) {
+    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress || !runtime_configured)) {
         return call_libc_calloc(nmemb, size);
     }
-    if (!should_manage(total)) {
+    if (MAI_LIKELY(total < threshold_bytes || total == 0)) {
         void* ptr = call_libc_calloc(nmemb, size);
-        if (ptr) {
+        if (ptr && MAI_UNLIKELY(stats_logging)) {
             stats_note_pass_through_threadsafe(total);
         }
         return ptr;
@@ -2389,21 +2407,29 @@ void* calloc(size_t nmemb, size_t size) {
 
 __attribute__((visibility("default")))
 void* realloc(void* ptr, size_t size) {
-    if (resolving_original_allocators) {
+    if (MAI_UNLIKELY(resolving_original_allocators)) {
         return fallback_realloc(ptr, size);
     }
     NOTE_PRELOAD_ALLOCATOR_PATH();
-    if (!ptr) {
+    if (MAI_UNLIKELY(!ptr)) {
         return malloc(size);
     }
-    if (size == 0) {
+    if (MAI_UNLIKELY(size == 0)) {
         free(ptr);
         return NULL;
     }
-    if (in_mai_hook || cleanup_in_progress || !runtime_configured ||
-        (!pointer_may_be_managed(ptr) && !should_manage(size))) {
+    if (MAI_UNLIKELY(in_mai_hook || cleanup_in_progress || !runtime_configured)) {
         void* result = call_libc_realloc(ptr, size);
-        if (result && runtime_configured && !in_mai_hook && !cleanup_in_progress) {
+        if (result && MAI_UNLIKELY(stats_logging) && runtime_configured &&
+            !in_mai_hook && !cleanup_in_progress) {
+            stats_note_pass_through_threadsafe(size);
+        }
+        return result;
+    }
+    if (MAI_LIKELY(!pointer_may_be_managed(ptr) &&
+                   (size < threshold_bytes || size == 0))) {
+        void* result = call_libc_realloc(ptr, size);
+        if (result && MAI_UNLIKELY(stats_logging)) {
             stats_note_pass_through_threadsafe(size);
         }
         return result;

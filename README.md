@@ -126,6 +126,11 @@ diagnostic hooks.
 preload allocator entries from Frida/Gum replacement entries. It is intended
 for tests and troubleshooting; leave it disabled for performance measurements.
 
+`MAI_STATS=1` prints a shutdown summary and enables pass-through allocation
+byte/count counters. Managed allocation counters are always maintained, but
+small pass-through allocation counters are disabled by default to keep the
+common below-threshold path lightweight.
+
 `MAI_RECLAIM_POLICY` may be:
 
 - `none`
