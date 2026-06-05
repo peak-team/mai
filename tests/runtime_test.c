@@ -650,6 +650,51 @@ static int mode_backing_failure(void) {
     return 0;
 }
 
+static int mode_unprivileged(void) {
+    if (geteuid() == 0) {
+        return 77;
+    }
+
+    reclaim_all_fn reclaim_all = (reclaim_all_fn)dlsym(RTLD_DEFAULT, "mai_reclaim_all");
+    if (!reclaim_all) {
+        return fail("mai_reclaim_all is unavailable");
+    }
+
+    MaiStats before;
+    MaiStats after;
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before unprivileged smoke test");
+    }
+
+    unsigned char* ptr = malloc(8192);
+    if (!ptr) {
+        return fail("unprivileged large allocation failed");
+    }
+    memset(ptr, 0x61, 8192);
+
+    if (reclaim_all() != 0) {
+        free(ptr);
+        return fail("unprivileged reclaim failed");
+    }
+    if (ptr[0] != 0x61 || ptr[8191] != 0x61) {
+        free(ptr);
+        return fail("unprivileged reclaim corrupted allocation contents");
+    }
+
+    if (load_stats(&after) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after unprivileged smoke test");
+    }
+    if (after.managed_allocations <= before.managed_allocations ||
+        after.reclaim_calls <= before.reclaim_calls) {
+        free(ptr);
+        return fail("unprivileged smoke test did not exercise managed allocation and reclaim");
+    }
+
+    free(ptr);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) {
         return fail("expected exactly one mode argument");
@@ -669,6 +714,7 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "diagnostics") == 0) return mode_diagnostics();
     if (strcmp(argv[1], "dlopen") == 0) return mode_dlopen();
     if (strcmp(argv[1], "backing_failure") == 0) return mode_backing_failure();
+    if (strcmp(argv[1], "unprivileged") == 0) return mode_unprivileged();
 
     return fail("unknown mode");
 }

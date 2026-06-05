@@ -6,6 +6,18 @@ set(MAI_TEST_SCRATCH "${CMAKE_CURRENT_BINARY_DIR}/scratch")
 set(MAI_TEST_INVALID "${CMAKE_CURRENT_BINARY_DIR}/invalid-path")
 file(MAKE_DIRECTORY "${MAI_TEST_SCRATCH}")
 
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.12")
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        set(MAI_PYTHON_EXECUTABLE "${Python3_EXECUTABLE}")
+    endif()
+else()
+    find_package(PythonInterp 3 QUIET)
+    if(PYTHONINTERP_FOUND)
+        set(MAI_PYTHON_EXECUTABLE "${PYTHON_EXECUTABLE}")
+    endif()
+endif()
+
 add_executable(mai_runtime_test runtime_test.c)
 target_compile_features(mai_runtime_test PRIVATE c_std_11)
 target_include_directories(mai_runtime_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
@@ -43,6 +55,38 @@ add_mai_runtime_test(mai_multithreaded thread)
 add_mai_runtime_test(mai_mmap_brk_diagnostics diagnostics)
 
 add_test(
+    NAME mai_scratch_env_discovery
+    COMMAND ${CMAKE_COMMAND} -E env
+        --unset=MAI_PATH
+        --unset=PBS_JOBFS
+        --unset=TMPDIR
+        --unset=LOCAL_SCRATCH
+        --unset=SCRATCH
+        --unset=JOBSCRATCH
+        "SLURM_TMPDIR=${MAI_TEST_SCRATCH}"
+        "MAI_ENABLE=1"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        large
+)
+
+add_test(
+    NAME mai_unprivileged_runtime
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_RECLAIM_POLICY=donthneed"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        unprivileged
+)
+set_tests_properties(mai_unprivileged_runtime PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
     NAME mai_dlopen_allocations
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"
@@ -65,6 +109,48 @@ add_test(
         "LD_PRELOAD=$<TARGET_FILE:mai>"
         $<TARGET_FILE:mai_cxx_runtime_test>
 )
+
+if(MAI_PYTHON_EXECUTABLE)
+    add_test(
+        NAME mai_python_ctypes_dlopen
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ENABLE=1"
+            "MAI_PATH=${MAI_TEST_SCRATCH}"
+            "MAI_THRESHOLD=1M"
+            "MAI_ARENA_SIZE=8M"
+            "MAI_TEST_ALLOC_SIZE=2097152"
+            "MAI_TEST_PLUGIN=$<TARGET_FILE:mai_runtime_plugin>"
+            "LD_PRELOAD=$<TARGET_FILE:mai>"
+            ${MAI_PYTHON_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/python_runtime_test.py
+    )
+
+    add_test(
+        NAME mai_source_policy_no_privileged_kernel_dependencies
+        COMMAND ${MAI_PYTHON_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/source_policy_test.py
+            ${PROJECT_SOURCE_DIR}/src
+            ${PROJECT_SOURCE_DIR}/include
+    )
+endif()
+
+include(CheckLanguage)
+check_language(Fortran)
+if(CMAKE_Fortran_COMPILER)
+    enable_language(Fortran)
+    add_executable(mai_fortran_runtime_test fortran_runtime_test.f90)
+    target_link_libraries(mai_fortran_runtime_test PRIVATE mai)
+    add_test(
+        NAME mai_fortran_iso_c_binding_malloc
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ENABLE=1"
+            "MAI_PATH=${MAI_TEST_SCRATCH}"
+            "MAI_THRESHOLD=4K"
+            "MAI_ARENA_SIZE=1M"
+            "LD_PRELOAD=$<TARGET_FILE:mai>"
+            $<TARGET_FILE:mai_fortran_runtime_test>
+    )
+endif()
 
 add_test(
     NAME mai_reclaim_dontneed

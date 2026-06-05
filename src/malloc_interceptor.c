@@ -1817,13 +1817,21 @@ static int replace_fast(gpointer address, gpointer replacement, gpointer* origin
     }
 
     ret = gum_interceptor_replace_fast(malloc_interceptor, address, replacement, original);
-    if (ret != GUM_REPLACE_OK) {
-        fprintf(stderr, "MAI: failed to replace %s: %d\n", name, ret);
-        return -1;
+    if (ret == GUM_REPLACE_OK) {
+        *replaced = 1;
+        return 0;
     }
 
-    *replaced = 1;
-    return 0;
+    GumReplaceReturn regular_ret =
+        gum_interceptor_replace(malloc_interceptor, address, replacement, NULL, original);
+    if (regular_ret == GUM_REPLACE_OK) {
+        *replaced = 1;
+        return 0;
+    }
+
+    fprintf(stderr, "MAI: failed to replace %s: fast=%d regular=%d\n",
+            name, ret, regular_ret);
+    return -1;
 }
 
 static int replace_regular(gpointer address, gpointer replacement, gpointer* original,

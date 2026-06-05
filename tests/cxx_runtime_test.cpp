@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
+#include <vector>
 
 struct alignas(128) OverAlignedBlock {
     unsigned char data[8192];
@@ -48,6 +49,28 @@ int main() {
         return 1;
     }
     delete[] nothrow_bytes;
+
+    MaiStats before_vector{};
+    if (load_stats(&before_vector) != 0) {
+        return 1;
+    }
+    {
+        std::vector<unsigned char> vector_bytes(8192);
+        for (std::size_t i = 0; i < vector_bytes.size(); i++) {
+            vector_bytes[i] = static_cast<unsigned char>((i * 3) & 0xff);
+        }
+        for (std::size_t i = 0; i < vector_bytes.size(); i++) {
+            if (vector_bytes[i] != static_cast<unsigned char>((i * 3) & 0xff)) {
+                return 1;
+            }
+        }
+    }
+    MaiStats after_vector{};
+    if (load_stats(&after_vector) != 0 ||
+        after_vector.managed_allocations <= before_vector.managed_allocations ||
+        after_vector.managed_frees <= before_vector.managed_frees) {
+        return 1;
+    }
 
     if (load_stats(&after) != 0) {
         return 1;
