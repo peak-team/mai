@@ -60,10 +60,16 @@ program mai_fortran_runtime_test
     type(mai_stats) :: before
     type(mai_stats) :: after_alloc
     type(mai_stats) :: after_free
+    type(mai_stats) :: before_native
+    type(mai_stats) :: after_native_alloc
+    type(mai_stats) :: after_native_free
     type(c_ptr) :: raw
     integer(c_int) :: rc
     integer(c_size_t), parameter :: bytes = 8192_c_size_t
+    integer(c_size_t), parameter :: native_bytes = 16384_c_size_t
     integer(c_signed_char), pointer :: values(:)
+    real(c_double), allocatable :: native(:)
+    integer :: alloc_stat
     integer :: i
 
     rc = mai_get_stats(before)
@@ -101,4 +107,38 @@ program mai_fortran_runtime_test
     if (rc /= 0) error stop 6
     if (after_free%managed_frees <= before%managed_frees .or. &
         after_free%live_managed_bytes /= before%live_managed_bytes) error stop 7
+
+    before_native = after_free
+
+    allocate(native(2048), stat=alloc_stat)
+    if (alloc_stat /= 0) error stop 8
+
+    do i = 1, 2048
+        native(i) = real(i, c_double) * 0.5_c_double
+    end do
+    do i = 1, 2048
+        if (native(i) /= real(i, c_double) * 0.5_c_double) then
+            deallocate(native)
+            error stop 9
+        end if
+    end do
+
+    rc = mai_get_stats(after_native_alloc)
+    if (rc /= 0) then
+        deallocate(native)
+        error stop 10
+    end if
+    if (after_native_alloc%managed_allocations <= before_native%managed_allocations .or. &
+        after_native_alloc%managed_bytes_total < before_native%managed_bytes_total + native_bytes .or. &
+        after_native_alloc%live_managed_bytes < before_native%live_managed_bytes + native_bytes .or. &
+        after_native_alloc%arena_segments == 0_c_size_t) then
+        deallocate(native)
+        error stop 11
+    end if
+
+    deallocate(native)
+    rc = mai_get_stats(after_native_free)
+    if (rc /= 0) error stop 12
+    if (after_native_free%managed_frees <= before_native%managed_frees .or. &
+        after_native_free%live_managed_bytes /= before_native%live_managed_bytes) error stop 13
 end program mai_fortran_runtime_test

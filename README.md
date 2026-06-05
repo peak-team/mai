@@ -54,6 +54,18 @@ MAI currently intercepts:
 - C++ `operator new/delete` and `new[]/delete[]`, including sized, nothrow,
   and aligned forms where supported by the compiler/runtime
 
+Language/runtime coverage:
+
+- C and C++ large heap allocations are covered through the malloc-family
+  interceptors and C++ global `new`/`delete` wrappers.
+- Fortran programs are covered when the compiler/runtime implements
+  allocatable arrays and heap allocation through the process allocator
+  symbols. MAI does not depend on a compiler-specific Fortran ABI.
+- Python raw allocator calls and NumPy data buffers can be managed when they
+  ultimately allocate through malloc-family APIs. MAI does not install a
+  Python or NumPy allocator policy by default; this remains an extension on
+  top of the core storage-backed heap tiering model.
+
 MAI also hooks the following functions for diagnostics only:
 
 - `mmap`
@@ -189,8 +201,6 @@ LD_PRELOAD=/path/to/libmai.so \
 
 ## Development Direction
 
-The next phases are:
-
-1. Extend runtime support for Fortran runtimes and optional Python/NumPy-specific
-   integration.
-2. Add exclusion hooks for pinned, mlocked, MPI/RDMA, and GPU memory.
+The next major direction is adding explicit exclusion hooks for pinned,
+`mlock`ed, MPI/RDMA, and GPU memory, plus richer optional runtime-specific
+extensions where they do not compromise the core allocator model.

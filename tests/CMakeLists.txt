@@ -198,6 +198,35 @@ if(MAI_PYTHON_EXECUTABLE)
     )
 
     add_test(
+        NAME mai_python_raw_allocator
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ENABLE=1"
+            "MAI_PATH=${MAI_TEST_SCRATCH}"
+            "MAI_THRESHOLD=1M"
+            "MAI_ARENA_SIZE=8M"
+            "MAI_TEST_ALLOC_SIZE=2097152"
+            "LD_PRELOAD=$<TARGET_FILE:mai>"
+            ${MAI_PYTHON_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/python_language_runtime_test.py
+            raw
+    )
+
+    add_test(
+        NAME mai_python_numpy_array_optional
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ENABLE=1"
+            "MAI_PATH=${MAI_TEST_SCRATCH}"
+            "MAI_THRESHOLD=1M"
+            "MAI_ARENA_SIZE=8M"
+            "MAI_TEST_ALLOC_SIZE=2097152"
+            "LD_PRELOAD=$<TARGET_FILE:mai>"
+            ${MAI_PYTHON_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/python_language_runtime_test.py
+            numpy
+    )
+    set_tests_properties(mai_python_numpy_array_optional PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_test(
         NAME mai_source_policy_no_privileged_kernel_dependencies
         COMMAND ${MAI_PYTHON_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/source_policy_test.py
@@ -213,7 +242,7 @@ if(CMAKE_Fortran_COMPILER)
     add_executable(mai_fortran_runtime_test fortran_runtime_test.f90)
     target_link_libraries(mai_fortran_runtime_test PRIVATE mai)
     add_test(
-        NAME mai_fortran_iso_c_binding_malloc
+        NAME mai_fortran_runtime_allocations
         COMMAND ${CMAKE_COMMAND} -E env
             "MAI_ENABLE=1"
             "MAI_PATH=${MAI_TEST_SCRATCH}"

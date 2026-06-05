@@ -50,6 +50,35 @@ int main() {
     }
     delete[] nothrow_bytes;
 
+    void* explicit_new = ::operator new(8192);
+    std::memset(explicit_new, 0x42, 8192);
+    ::operator delete(explicit_new, static_cast<std::size_t>(8192));
+
+    void* explicit_array_new = ::operator new[](8192);
+    std::memset(explicit_array_new, 0x43, 8192);
+    ::operator delete[](explicit_array_new, static_cast<std::size_t>(8192));
+
+    void* explicit_aligned_new =
+        ::operator new(8192, std::align_val_t{256});
+    if (!aligned_ptr(explicit_aligned_new, 256)) {
+        ::operator delete(explicit_aligned_new, std::align_val_t{256});
+        return 1;
+    }
+    std::memset(explicit_aligned_new, 0x44, 8192);
+    ::operator delete(explicit_aligned_new, static_cast<std::size_t>(8192),
+                      std::align_val_t{256});
+
+    void* explicit_aligned_nothrow =
+        ::operator new[](8192, std::align_val_t{256}, std::nothrow);
+    if (!explicit_aligned_nothrow || !aligned_ptr(explicit_aligned_nothrow, 256)) {
+        ::operator delete[](explicit_aligned_nothrow, std::align_val_t{256},
+                            std::nothrow);
+        return 1;
+    }
+    std::memset(explicit_aligned_nothrow, 0x45, 8192);
+    ::operator delete[](explicit_aligned_nothrow, std::align_val_t{256},
+                        std::nothrow);
+
     MaiStats before_vector{};
     if (load_stats(&before_vector) != 0) {
         return 1;
@@ -79,7 +108,7 @@ int main() {
     }
     if (after.managed_allocations <= before.managed_allocations ||
         after.managed_frees <= before.managed_frees ||
-        after.managed_bytes_total < before.managed_bytes_total + 8192 * 4 ||
+        after.managed_bytes_total < before.managed_bytes_total + 8192 * 8 ||
         after.live_managed_bytes != before.live_managed_bytes) {
         return 1;
     }
