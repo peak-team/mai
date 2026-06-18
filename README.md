@@ -235,6 +235,31 @@ make
 ctest --output-on-failure
 ```
 
+To exercise behavior when a managed allocation is larger than the available
+physical/cgroup memory, enable the Docker-backed test:
+
+```
+cmake -S . -B build -DMAI_ENABLE_DOCKER_TESTS=ON
+cmake --build build
+ctest --test-dir build -R mai_docker_cgroup_memory_limit --output-on-failure
+```
+
+The Docker test runs with `--memory` and `--memory-swap` set to the same limit
+and validates that `MAI_MAX_RSS=auto` detects the container cgroup cap while a
+larger chunked allocation is backed by MAI scratch storage and reclaimed
+without an OOM kill. `MAI_DOCKER_MEMORY`, `MAI_DOCKER_IMAGE`, and
+`MAI_DOCKER_SCRATCH` can be set to override the default `64m`,
+`ubuntu:24.04`, and build-local scratch directory.
+
+GitHub Actions separates correctness from performance:
+
+- `.github/workflows/ci.yml` runs the correctness suite on pushes, pull
+  requests, and manual dispatch.
+- `.github/workflows/benchmarks.yml` runs Docker access-pattern benchmarks on a
+  weekly schedule or manual dispatch and uploads the measurements as artifacts.
+
+See `benchmarks/README.md` for the benchmark design and tuning knobs.
+
 ## Use
 
 ```

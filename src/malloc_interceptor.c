@@ -5208,8 +5208,39 @@ static int replace_fast(gpointer address, gpointer replacement, gpointer* origin
     return -1;
 }
 
-static int replace_regular(gpointer address, gpointer replacement, gpointer* original,
-                           int* replaced, const char* name) {
+static int replace_fast_optional(gpointer address, gpointer replacement,
+                                 gpointer* original, int* replaced,
+                                 const char* name) {
+    GumReplaceReturn ret;
+
+    if (!address) {
+        return 0;
+    }
+
+    ret = gum_interceptor_replace_fast(malloc_interceptor, address, replacement, original);
+    if (ret == GUM_REPLACE_OK) {
+        *replaced = 1;
+        return 0;
+    }
+
+    GumReplaceReturn regular_ret =
+        gum_interceptor_replace(malloc_interceptor, address, replacement, NULL, original);
+    if (regular_ret == GUM_REPLACE_OK) {
+        *replaced = 1;
+        return 0;
+    }
+
+    if (verbose_logging) {
+        fprintf(stderr,
+                "MAI: skipping optional replacement for %s: fast=%d regular=%d\n",
+                name, ret, regular_ret);
+    }
+    return 0;
+}
+
+static int replace_regular_optional(gpointer address, gpointer replacement,
+                                    gpointer* original, int* replaced,
+                                    const char* name) {
     GumReplaceReturn ret;
 
     if (!address) {
@@ -5217,12 +5248,14 @@ static int replace_regular(gpointer address, gpointer replacement, gpointer* ori
     }
 
     ret = gum_interceptor_replace(malloc_interceptor, address, replacement, NULL, original);
-    if (ret != GUM_REPLACE_OK) {
-        fprintf(stderr, "MAI: failed to replace %s: %d\n", name, ret);
-        return -1;
+    if (ret == GUM_REPLACE_OK) {
+        *replaced = 1;
+        return 0;
     }
 
-    *replaced = 1;
+    if (verbose_logging) {
+        fprintf(stderr, "MAI: skipping optional replacement for %s: %d\n", name, ret);
+    }
     return 0;
 }
 
@@ -5449,18 +5482,19 @@ int malloc_interceptor_attach(void) {
         failed |= replace_fast(aligned_alloc_addr, (gpointer)frida_aligned_alloc,
                                (gpointer*)&original_aligned_alloc,
                                &aligned_alloc_replaced, "aligned_alloc");
-        failed |= replace_regular(posix_memalign_addr, (gpointer)frida_posix_memalign,
-                                  (gpointer*)&original_posix_memalign,
-                                  &posix_memalign_replaced, "posix_memalign");
-        failed |= replace_fast(memalign_addr, (gpointer)frida_memalign,
-                               (gpointer*)&original_memalign, &memalign_replaced, "memalign");
-        failed |= replace_fast(valloc_addr, (gpointer)frida_valloc,
-                               (gpointer*)&original_valloc, &valloc_replaced, "valloc");
-        failed |= replace_fast(pvalloc_addr, (gpointer)frida_pvalloc,
-                               (gpointer*)&original_pvalloc, &pvalloc_replaced, "pvalloc");
-        failed |= replace_fast(malloc_usable_size_addr, (gpointer)frida_malloc_usable_size,
-                               (gpointer*)&original_malloc_usable_size,
-                               &malloc_usable_size_replaced, "malloc_usable_size");
+        replace_regular_optional(posix_memalign_addr, (gpointer)frida_posix_memalign,
+                                 (gpointer*)&original_posix_memalign,
+                                 &posix_memalign_replaced, "posix_memalign");
+        replace_fast_optional(memalign_addr, (gpointer)frida_memalign,
+                              (gpointer*)&original_memalign, &memalign_replaced,
+                              "memalign");
+        replace_fast_optional(valloc_addr, (gpointer)frida_valloc,
+                              (gpointer*)&original_valloc, &valloc_replaced, "valloc");
+        replace_fast_optional(pvalloc_addr, (gpointer)frida_pvalloc,
+                              (gpointer*)&original_pvalloc, &pvalloc_replaced, "pvalloc");
+        replace_fast_optional(malloc_usable_size_addr, (gpointer)frida_malloc_usable_size,
+                              (gpointer*)&original_malloc_usable_size,
+                              &malloc_usable_size_replaced, "malloc_usable_size");
     }
     failed |= replace_fast(dlopen_addr, (gpointer)custom_dlopen,
                            (gpointer*)&original_dlopen, &dlopen_replaced, "dlopen");

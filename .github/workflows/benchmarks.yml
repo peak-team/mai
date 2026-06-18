@@ -1,0 +1,55 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_memory:
+        description: Docker memory limit for access-pattern benchmarks
+        required: false
+        default: 64m
+      allocation_size:
+        description: MAI-managed allocation size used by the benchmark
+        required: false
+        default: 96M
+  schedule:
+    - cron: "17 8 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  docker-access-patterns:
+    name: Docker access-pattern benchmarks
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: Configure benchmark build
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMAI_BUILD_BENCHMARKS=ON
+
+      - name: Build benchmark targets
+        run: cmake --build build --parallel --target mai mai_access_pattern_benchmark
+
+      - name: Run Docker access-pattern benchmarks
+        env:
+          MAI_BENCH_DOCKER_MEMORY: ${{ github.event.inputs.docker_memory || '64m' }}
+          MAI_BENCH_ALLOCATION_SIZE: ${{ github.event.inputs.allocation_size || '96M' }}
+        run: |
+          mkdir -p benchmark-results
+          benchmarks/docker_access_patterns.sh \
+            build/src/libmai.so \
+            build/benchmarks/mai_access_pattern_benchmark \
+            | tee benchmark-results/docker-access-patterns.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-access-patterns
+          path: benchmark-results/docker-access-patterns.txt

@@ -406,6 +406,20 @@ add_test(
         memory_cap_chunked_calloc
 )
 
+if(MAI_ENABLE_DOCKER_TESTS)
+    add_test(
+        NAME mai_docker_cgroup_memory_limit
+        COMMAND sh
+            ${CMAKE_CURRENT_SOURCE_DIR}/docker_memory_limit_test.sh
+            $<TARGET_FILE:mai>
+            $<TARGET_FILE:mai_runtime_test>
+    )
+    set_tests_properties(mai_docker_cgroup_memory_limit PROPERTIES
+        SKIP_RETURN_CODE 77
+        LABELS docker
+    )
+endif()
+
 add_test(
     NAME mai_backing_file_creation_failure
     COMMAND ${CMAKE_COMMAND} -E env

@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.9)
 
 project(mai C CXX)
 
+option(MAI_ENABLE_DOCKER_TESTS "Enable Docker-backed cgroup memory-limit tests" OFF)
+option(MAI_BUILD_BENCHMARKS "Build MAI benchmark utilities" OFF)
+
 # Set build type to Release by default if CMAKE_BUILD_TYPE is not given
 set(default_build_type "Debug")
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -55,4 +58,7 @@ endif()
 add_subdirectory(src)
 if(BUILD_TESTING AND EXISTS "${PROJECT_SOURCE_DIR}/tests/CMakeLists.txt")
     add_subdirectory(tests)
+endif()
+if(MAI_BUILD_BENCHMARKS AND EXISTS "${PROJECT_SOURCE_DIR}/benchmarks/CMakeLists.txt")
+    add_subdirectory(benchmarks)
 endif()
