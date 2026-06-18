@@ -99,4 +99,4 @@ dkms.conf
 
 # build directory 
 build/
-
+build-*/
