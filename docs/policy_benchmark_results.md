@@ -25,6 +25,41 @@ The component pressure matrix is evidence for individual predictors. The
 end-to-end no-oracle migration check and show that the full STREAM migration
 goal is not solved yet.
 
+## Current Retained-Pipeline Checkpoint
+
+The latest retained `policy_stream_pipeline 16M` six-seed checkpoint uses the
+workload-aware retained runner defaults plus explicit high/low pressure shapes.
+The runner now records cross-record cohort activity through
+`policy_hybrid_cohort_*` counters and resolves `--active-record-epochs auto` to
+a short two-epoch active-record window for this workload.
+
+With a 64 MiB high watermark and 48 MiB low watermark:
+
+| Policy | End-to-end MiB/s | Ratio to MAI sufficient | Demand faults | Read MiB | Write MiB | Unused prefetch evictions | Hot-evicted MiB | Cohort admitted |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `legacy` | 5725 | 0.406 | 89.8 | 239 | 327 | 87.7 | 151 | 0.0 |
+| `markov_adaptive` | 6110 | 0.434 | 180.5 | 244 | 330 | 13.3 | 303 | 0.0 |
+| `wtinylfu` | 5592 | 0.397 | 157.0 | 271 | 360 | 49.7 | 261 | 0.0 |
+| `hybrid_adaptive` | 5752 | 0.409 | 174.5 | 248 | 339 | 21.0 | 297 | 10.3 |
+
+With a 64 MiB high watermark and 64 MiB low watermark:
+
+| Policy | End-to-end MiB/s | Ratio to MAI sufficient | Demand faults | Read MiB | Write MiB | Unused prefetch evictions | Hot-evicted MiB | Cohort admitted |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `legacy` | 5895 | 0.425 | 88.0 | 240 | 320 | 88.0 | 144 | 0.0 |
+| `markov_adaptive` | 6253 | 0.451 | 192.0 | 240 | 320 | 0.0 | 320 | 0.0 |
+| `wtinylfu` | 6166 | 0.444 | 182.3 | 243 | 323 | 11.2 | 301 | 0.0 |
+| `hybrid_adaptive` | 6033 | 0.436 | 187.3 | 260 | 340 | 14.8 | 311 | 5.7 |
+
+Interpretation: the cross-record cohort predictor activates on the no-oracle
+9-matrix pipeline, and active-record control plus adaptive gating keeps its
+pollution bounded. It still does not beat `markov_adaptive` on this host and
+build. Treat cohort as useful policy infrastructure, not as a promoted default
+strategy. Write-protect useful-prefetch observation was also checked on the
+same shape; it produced useful prefetch counters, but increased demand faults
+and migration traffic enough to reduce `hybrid_adaptive` to 5318 MiB/s, so it
+should remain a diagnostic mode rather than a default performance path.
+
 ## Sufficient Memory Baseline
 
 These rows have no UFFD demand faults or MAI migration bytes. `stream_bandwidth`

@@ -3566,6 +3566,286 @@ static int mode_uffd_pager_hybrid_stream_policy(void) {
     return 0;
 }
 
+static int mode_uffd_pager_hybrid_cohort_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t allocations = 3;
+    const size_t size = 16 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t passes = 4;
+    unsigned char* ptrs[3] = {0};
+    unsigned char expected[3][8] = {{0}};
+
+    if (allocations > 3 || units > 8) {
+        return fail("hybrid cohort policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD hybrid cohort test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for hybrid cohort test");
+    }
+
+    for (size_t allocation = 0; allocation < allocations; allocation++) {
+        ptrs[allocation] = malloc(size);
+        if (!ptrs[allocation]) {
+            for (size_t free_index = 0; free_index < allocation; free_index++) {
+                free(ptrs[free_index]);
+            }
+            return fail("UFFD hybrid cohort allocation failed");
+        }
+    }
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t index = 0; index < units; index++) {
+            for (size_t allocation = 0; allocation < allocations; allocation++) {
+                expected[allocation][index]++;
+                ptrs[allocation][index * unit] = expected[allocation][index];
+                if (ptrs[allocation][index * unit] !=
+                    expected[allocation][index]) {
+                    for (size_t free_index = 0; free_index < allocations;
+                         free_index++) {
+                        free(ptrs[free_index]);
+                    }
+                    return fail("UFFD hybrid cohort lost write data");
+                }
+            }
+        }
+    }
+    for (size_t allocation = 0; allocation < allocations; allocation++) {
+        for (size_t index = 0; index < units; index++) {
+            if (ptrs[allocation][index * unit] !=
+                expected[allocation][index]) {
+                for (size_t free_index = 0; free_index < allocations;
+                     free_index++) {
+                    free(ptrs[free_index]);
+                }
+                return fail("UFFD hybrid cohort lost read data");
+            }
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("mai_get_stats failed after UFFD hybrid cohort touches");
+    }
+    size_t cohort_candidates =
+        after_touch.policy_hybrid_cohort_candidates -
+        before.policy_hybrid_cohort_candidates;
+    size_t cohort_admitted =
+        after_touch.policy_hybrid_cohort_admitted -
+        before.policy_hybrid_cohort_admitted;
+    size_t cohort_completed =
+        after_touch.policy_hybrid_cohort_completed -
+        before.policy_hybrid_cohort_completed;
+    size_t cohort_useful =
+        after_touch.policy_hybrid_cohort_useful -
+        before.policy_hybrid_cohort_useful;
+    if (!stats_show_managed_alloc(&before, &after_touch,
+                                  allocations * size) ||
+        after_touch.uffd_pager_allocations <
+            before.uffd_pager_allocations + allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("UFFD hybrid cohort test did not exercise pager pressure");
+    }
+    if (cohort_candidates == 0 || cohort_admitted == 0 ||
+        cohort_completed == 0 || cohort_useful == 0) {
+        fprintf(stderr,
+                "hybrid cohort stats: candidates=%zu admitted=%zu "
+                "completed=%zu useful=%zu\n",
+                cohort_candidates, cohort_admitted, cohort_completed,
+                cohort_useful);
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("UFFD hybrid cohort test did not exercise cohort prefetch");
+    }
+
+    for (size_t allocation = 0; allocation < allocations; allocation++) {
+        free(ptrs[allocation]);
+    }
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD hybrid cohort free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD hybrid cohort allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_hybrid_cross_record_cohort_policy(void) {
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t delta = 8;
+    const size_t train_indices[] = {0, 5, 2, 7, 1};
+    const size_t train_len = sizeof(train_indices) / sizeof(train_indices[0]);
+    const size_t trigger_index = 3;
+    const size_t target_index = trigger_index + delta;
+    MaiStats before;
+    MaiStats before_trigger;
+    MaiStats after_prefetch;
+    MaiStats after_use;
+    MaiStats after_free;
+    unsigned char expected_a[16] = {0};
+    unsigned char expected_b[16] = {0};
+
+    if (units > sizeof(expected_a) || units > sizeof(expected_b) ||
+        target_index >= units) {
+        return fail("hybrid cross-record cohort expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD hybrid cross-record cohort test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for hybrid cross-record cohort test");
+    }
+
+    unsigned char* a = malloc(size);
+    unsigned char* b = malloc(size);
+    if (!a || !b) {
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort allocation failed");
+    }
+
+    for (size_t i = 0; i < train_len; i++) {
+        size_t source = train_indices[i];
+        size_t target = source + delta;
+        expected_a[source]++;
+        a[source * unit] = expected_a[source];
+        if (a[source * unit] != expected_a[source]) {
+            free(a);
+            free(b);
+            return fail("UFFD hybrid cross-record cohort lost A training data");
+        }
+        expected_b[target]++;
+        b[target * unit] = expected_b[target];
+        if (b[target * unit] != expected_b[target]) {
+            free(a);
+            free(b);
+            return fail("UFFD hybrid cross-record cohort lost B training data");
+        }
+    }
+
+    if (load_stats(&before_trigger) != 0) {
+        free(a);
+        free(b);
+        return fail("mai_get_stats failed before UFFD hybrid cross-record trigger");
+    }
+
+    expected_a[trigger_index]++;
+    a[trigger_index * unit] = expected_a[trigger_index];
+    if (a[trigger_index * unit] != expected_a[trigger_index]) {
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort lost A trigger data");
+    }
+    if (load_stats(&after_prefetch) != 0) {
+        free(a);
+        free(b);
+        return fail("mai_get_stats failed after UFFD hybrid cross-record trigger");
+    }
+
+    size_t cohort_candidates =
+        after_prefetch.policy_hybrid_cohort_candidates -
+        before_trigger.policy_hybrid_cohort_candidates;
+    size_t cohort_admitted =
+        after_prefetch.policy_hybrid_cohort_admitted -
+        before_trigger.policy_hybrid_cohort_admitted;
+    size_t cohort_completed =
+        after_prefetch.policy_hybrid_cohort_completed -
+        before_trigger.policy_hybrid_cohort_completed;
+    size_t prefetch_requests =
+        after_prefetch.policy_prefetch_requests -
+        before_trigger.policy_prefetch_requests;
+    size_t prefetch_admitted =
+        after_prefetch.policy_prefetch_admitted -
+        before_trigger.policy_prefetch_admitted;
+    size_t prefetch_completed =
+        after_prefetch.policy_prefetch_completed -
+        before_trigger.policy_prefetch_completed;
+    if (cohort_candidates != 1 || cohort_admitted != 1 ||
+        cohort_completed != 1 || prefetch_requests < 1 ||
+        prefetch_admitted != 1 || prefetch_completed != 1) {
+        fprintf(stderr,
+                "hybrid cross-record cohort prefetch stats: "
+                "cohort candidates=%zu admitted=%zu completed=%zu "
+                "prefetch requests=%zu admitted=%zu completed=%zu\n",
+                cohort_candidates, cohort_admitted, cohort_completed,
+                prefetch_requests, prefetch_admitted, prefetch_completed);
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort did not prefetch target chunk");
+    }
+
+    expected_b[target_index]++;
+    b[target_index * unit] = expected_b[target_index];
+    if (b[target_index * unit] != expected_b[target_index]) {
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort lost prefetched B data");
+    }
+    if (load_stats(&after_use) != 0) {
+        free(a);
+        free(b);
+        return fail("mai_get_stats failed after UFFD hybrid cross-record use");
+    }
+    size_t cohort_useful =
+        after_use.policy_hybrid_cohort_useful -
+        after_prefetch.policy_hybrid_cohort_useful;
+    size_t prefetch_useful =
+        after_use.policy_prefetch_useful -
+        after_prefetch.policy_prefetch_useful;
+    size_t useful_bytes =
+        after_use.policy_prefetch_useful_bytes -
+        after_prefetch.policy_prefetch_useful_bytes;
+    if (cohort_useful != 1 || prefetch_useful != 1 ||
+        useful_bytes < unit) {
+        fprintf(stderr,
+                "hybrid cross-record cohort useful stats: "
+                "cohort=%zu prefetch=%zu useful_bytes=%zu\n",
+                cohort_useful, prefetch_useful, useful_bytes);
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort prefetch was not useful");
+    }
+    if (!stats_show_managed_alloc(&before, &after_use, size * 2) ||
+        after_use.uffd_pager_allocations <
+            before.uffd_pager_allocations + 2 ||
+        after_use.uffd_faults <= before.uffd_faults) {
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort test did not exercise pager");
+    }
+
+    free(a);
+    free(b);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD hybrid cross-record cohort free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD hybrid cross-record cohort allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
 static int mode_uffd_pager_hybrid_default_low_window(void) {
     MaiStats before;
     MaiStats before_trigger;
@@ -5007,6 +5287,12 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_hybrid_stream_policy") == 0) {
         return mode_uffd_pager_hybrid_stream_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_hybrid_cohort_policy") == 0) {
+        return mode_uffd_pager_hybrid_cohort_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_hybrid_cross_record_cohort_policy") == 0) {
+        return mode_uffd_pager_hybrid_cross_record_cohort_policy();
     }
     if (strcmp(argv[1], "uffd_pager_hybrid_default_low_window") == 0) {
         return mode_uffd_pager_hybrid_default_low_window();

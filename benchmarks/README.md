@@ -36,7 +36,11 @@ developer guardrail sizes, not sufficient for memory-bandwidth claims.
 Pressure high/low resident limits default to workload-aware values:
 `policy_stream_pipeline` uses `4 * matrix_size` and `3 * matrix_size`, while
 single-allocation guardrails use one quarter and three sixteenths of the
-allocation size.
+allocation size. `--active-record-epochs auto` is also workload-aware:
+it enables a short two-epoch active-record window for
+`policy_stream_pipeline` pressure rows and resolves to `0` for the
+single-allocation guardrails. Pass an explicit value such as
+`--active-record-epochs 0` to disable that comparison knob.
 
 For every workload/seed/repetition, the runner records native sufficient,
 MAI pass-through, MAI managed sufficient, and policy-pressure rows. Pressure
@@ -48,9 +52,9 @@ observed accuracy/coverage counters.
 
 Pressure rows also accept runtime mechanism controls such as
 `--async-prefetch`, `--async-slack-chunks`, `--record-protect-epochs`,
-`--active-record-epochs`, and `--active-record-slack-chunks`. Use these to
-compare policy changes against existing async and record-aware migration
-mechanisms under the same sufficient-memory ratio baseline.
+`--active-record-epochs`, and `--active-record-slack-chunks`. Use explicit
+values to compare policy changes against existing async and record-aware
+migration mechanisms under the same sufficient-memory ratio baseline.
 
 For bandwidth claims, rerun the same matrix with working sets well beyond CPU
 cache, for example:

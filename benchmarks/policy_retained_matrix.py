@@ -49,6 +49,10 @@ KEY_METRICS = [
     "policy_prefetch_late",
     "policy_prefetch_unused_evictions",
     "policy_evicted_hot_bytes",
+    "policy_hybrid_cohort_candidates",
+    "policy_hybrid_cohort_admitted",
+    "policy_hybrid_cohort_completed",
+    "policy_hybrid_cohort_useful",
     "policy_demand_fault_stall_p50_ns",
     "policy_demand_fault_stall_p90_ns",
     "policy_demand_fault_stall_p99_ns",
@@ -71,6 +75,10 @@ SUMMARY_METRICS = [
     "policy_migration_write_bytes",
     "policy_prefetch_unused_evictions",
     "policy_evicted_hot_bytes",
+    "policy_hybrid_cohort_candidates",
+    "policy_hybrid_cohort_admitted",
+    "policy_hybrid_cohort_completed",
+    "policy_hybrid_cohort_useful",
     "policy_demand_fault_stall_p90_ns",
 ]
 
@@ -203,6 +211,14 @@ def workload_auto_resident_bytes(workload: str, size: str) -> tuple[int, int]:
     high = max(size_bytes // 4, 4096)
     low = max((high * 3) // 4, 4096)
     return high, low
+
+
+def workload_auto_active_record_epochs(workload: str, value: str) -> str:
+    if value.strip().lower() != "auto":
+        return value
+    if workload in {"policy_stream_pipeline", "stream_kernel_pipeline"}:
+        return "2"
+    return "0"
 
 
 def expected_managed_allocations(workload: str) -> float | None:
@@ -560,7 +576,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--async-slack-chunks", default=os.environ.get("MAI_UFFD_ASYNC_SLACK_CHUNKS", "2"))
     parser.add_argument("--migration-chunk", default=os.environ.get("MAI_MIGRATION_CHUNK", "2M"))
     parser.add_argument("--record-protect-epochs", default=os.environ.get("MAI_RECORD_PROTECT_EPOCHS", "0"))
-    parser.add_argument("--active-record-epochs", default=os.environ.get("MAI_ACTIVE_RECORD_EPOCHS", "0"))
+    parser.add_argument("--active-record-epochs", default=os.environ.get("MAI_ACTIVE_RECORD_EPOCHS", "auto"))
     parser.add_argument("--active-record-slack-chunks", default=os.environ.get("MAI_ACTIVE_RECORD_SLACK_CHUNKS", "8"))
     parser.add_argument("--successor-chain-depth", default=os.environ.get("MAI_POLICY_SUCCESSOR_CHAIN_DEPTH", "2"))
     parser.add_argument("--observe-prefetch-writes", default=os.environ.get("MAI_POLICY_OBSERVE_PREFETCH_WRITES", "0"))
@@ -687,7 +703,9 @@ def main(argv: list[str]) -> int:
                                 "MAI_MIGRATION_CHUNK": args.migration_chunk,
                                 "MAI_MIGRATION_POLICY": migration_policy,
                                 "MAI_RECORD_PROTECT_EPOCHS": args.record_protect_epochs,
-                                "MAI_ACTIVE_RECORD_EPOCHS": args.active_record_epochs,
+                                "MAI_ACTIVE_RECORD_EPOCHS": workload_auto_active_record_epochs(
+                                    workload, args.active_record_epochs
+                                ),
                                 "MAI_ACTIVE_RECORD_SLACK_CHUNKS": args.active_record_slack_chunks,
                                 "MAI_POLICY_SUCCESSOR_CHAIN_DEPTH": args.successor_chain_depth,
                                 "MAI_POLICY_OBSERVE_PREFETCH_WRITES": args.observe_prefetch_writes,

@@ -186,6 +186,10 @@ typedef struct {
     size_t policy_hybrid_signature_useful;
     size_t policy_hybrid_successor_useful;
     size_t policy_hybrid_stream_useful;
+    size_t policy_hybrid_cohort_candidates;
+    size_t policy_hybrid_cohort_admitted;
+    size_t policy_hybrid_cohort_completed;
+    size_t policy_hybrid_cohort_useful;
 } MaiStats;
 
 /**

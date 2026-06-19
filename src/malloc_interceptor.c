@@ -91,6 +91,9 @@
 #define MAI_POLICY_SIGNATURE_DECAY_INTERVAL 512
 #define MAI_POLICY_SIGNATURE_MAX_SCORE 255
 #define MAI_POLICY_SIGNATURE_CHAIN_DEPTH 2
+#define MAI_POLICY_COHORT_SLOTS 32
+#define MAI_POLICY_COHORT_MAX_SCORE 255
+#define MAI_POLICY_COHORT_MIN_SCORE 3
 #define MAI_HUGEPAGE_SIZE (2ULL * 1024ULL * 1024ULL)
 #define MAI_ACCESS_TRACE_RETIRED_GRACE_NS (10ULL * 1000ULL * 1000ULL)
 
@@ -171,14 +174,15 @@ enum {
     MAI_CHUNK_POLICY_SUCCESSOR_VALID = 1u << 6,
     MAI_CHUNK_POLICY_HYBRID_SOURCE_SHIFT = 7,
     MAI_CHUNK_POLICY_HYBRID_SOURCE_MASK =
-        3u << MAI_CHUNK_POLICY_HYBRID_SOURCE_SHIFT
+        7u << MAI_CHUNK_POLICY_HYBRID_SOURCE_SHIFT
 };
 
 typedef enum {
     MAI_HYBRID_SOURCE_NONE = 0,
     MAI_HYBRID_SOURCE_SIGNATURE = 1,
     MAI_HYBRID_SOURCE_SUCCESSOR = 2,
-    MAI_HYBRID_SOURCE_STREAM = 3
+    MAI_HYBRID_SOURCE_STREAM = 3,
+    MAI_HYBRID_SOURCE_COHORT = 4
 } MaiHybridSource;
 
 enum {
@@ -187,7 +191,9 @@ enum {
     MAI_CHUNK_POLICY_HYBRID_SOURCE_SUCCESSOR =
         MAI_HYBRID_SOURCE_SUCCESSOR << MAI_CHUNK_POLICY_HYBRID_SOURCE_SHIFT,
     MAI_CHUNK_POLICY_HYBRID_SOURCE_STREAM =
-        MAI_HYBRID_SOURCE_STREAM << MAI_CHUNK_POLICY_HYBRID_SOURCE_SHIFT
+        MAI_HYBRID_SOURCE_STREAM << MAI_CHUNK_POLICY_HYBRID_SOURCE_SHIFT,
+    MAI_CHUNK_POLICY_HYBRID_SOURCE_COHORT =
+        MAI_HYBRID_SOURCE_COHORT << MAI_CHUNK_POLICY_HYBRID_SOURCE_SHIFT
 };
 
 enum {
@@ -336,6 +342,17 @@ typedef struct {
     int active;
 } MaiSignaturePolicySlot;
 
+typedef struct {
+    AllocationRecord* source_record;
+    size_t source_seq;
+    AllocationRecord* target_record;
+    size_t target_seq;
+    ptrdiff_t delta;
+    uint16_t confidence;
+    size_t last_epoch;
+    int active;
+} MaiCohortPolicySlot;
+
 struct ArenaBlock {
     size_t offset;
     size_t size;
@@ -426,8 +443,8 @@ struct AllocationRecord {
 };
 
 typedef struct {
-    AllocationRecord* record;
-    size_t indices[MAI_MAX_UFFD_PREFETCH_CHUNKS + 1];
+    AllocationRecord* records[MAI_MAX_UFFD_PREFETCH_CHUNKS + 2];
+    size_t indices[MAI_MAX_UFFD_PREFETCH_CHUNKS + 2];
     size_t count;
 } MaiProtectedChunkSet;
 
@@ -599,6 +616,11 @@ static size_t policy_car_target_recent_chunks = 0;
 static unsigned char
     policy_tinylfu_sketch[MAI_POLICY_TINYLFU_ROWS][MAI_POLICY_TINYLFU_WIDTH];
 static size_t policy_tinylfu_updates_since_decay = 0;
+static MaiCohortPolicySlot policy_cohort_slots[MAI_POLICY_COHORT_SLOTS];
+static AllocationRecord* policy_cohort_last_record = NULL;
+static size_t policy_cohort_last_seq = 0;
+static size_t policy_cohort_last_index = 0;
+static int policy_cohort_has_last = 0;
 static size_t spatial_region_chunks =
     MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS;
 static size_t spatial_table_slots = MAI_POLICY_SPATIAL_DEFAULT_SLOTS;
@@ -907,6 +929,8 @@ static void remove_uffd_record_locked(AllocationRecord* record);
 static int evict_uffd_chunks_locked(size_t target_bytes,
                                    const MaiProtectedChunkSet* protected_set,
                                    int runtime_lock_held);
+static void policy_cohort_forget_record_locked(AllocationRecord* record);
+static int policy_resident_at_low_pressure_locked(void);
 static void stop_uffd_pager(void);
 static void access_trace_sigsegv_handler(int signo, siginfo_t* info, void* context);
 static void stop_record_access_trace_locked(AllocationRecord* record);
@@ -3982,6 +4006,7 @@ static void managed_free_record_locked(AllocationRecord* record) {
         if (record->backend == BACKEND_UFFD_PAGER) {
             pthread_mutex_lock(&uffd_fault_lock);
             record->uffd_closing = 1;
+            policy_cohort_forget_record_locked(record);
             remove_uffd_record_locked(record);
             pthread_mutex_unlock(&uffd_fault_lock);
         }
@@ -4270,29 +4295,25 @@ static void policy_protect_chunk_index(MaiProtectedChunkSet* set,
     if (!set || !record) {
         return;
     }
-    if (!set->record) {
-        set->record = record;
-    }
-    if (set->record != record) {
-        return;
-    }
     for (size_t i = 0; i < set->count; i++) {
-        if (set->indices[i] == index) {
+        if (set->records[i] == record && set->indices[i] == index) {
             return;
         }
     }
     if (set->count < sizeof(set->indices) / sizeof(set->indices[0])) {
-        set->indices[set->count++] = index;
+        set->records[set->count] = record;
+        set->indices[set->count] = index;
+        set->count++;
     }
 }
 
 static int policy_chunk_is_protected(AllocationRecord* record, size_t index,
                                      const MaiProtectedChunkSet* set) {
-    if (!set || record != set->record) {
+    if (!set) {
         return 0;
     }
     for (size_t i = 0; i < set->count; i++) {
-        if (set->indices[i] == index) {
+        if (set->records[i] == record && set->indices[i] == index) {
             return 1;
         }
     }
@@ -4833,6 +4854,9 @@ static void policy_hybrid_note_source_admitted_locked(MaiHybridSource source) {
     case MAI_HYBRID_SOURCE_STREAM:
         stats_snapshot.policy_hybrid_stream_admitted++;
         break;
+    case MAI_HYBRID_SOURCE_COHORT:
+        stats_snapshot.policy_hybrid_cohort_admitted++;
+        break;
     default:
         break;
     }
@@ -4849,6 +4873,9 @@ static void policy_hybrid_note_source_completed_locked(MaiChunkPolicyMeta* meta)
     case MAI_HYBRID_SOURCE_STREAM:
         stats_snapshot.policy_hybrid_stream_completed++;
         break;
+    case MAI_HYBRID_SOURCE_COHORT:
+        stats_snapshot.policy_hybrid_cohort_completed++;
+        break;
     default:
         break;
     }
@@ -4864,6 +4891,9 @@ static void policy_hybrid_note_source_useful_locked(MaiChunkPolicyMeta* meta) {
         break;
     case MAI_HYBRID_SOURCE_STREAM:
         stats_snapshot.policy_hybrid_stream_useful++;
+        break;
+    case MAI_HYBRID_SOURCE_COHORT:
+        stats_snapshot.policy_hybrid_cohort_useful++;
         break;
     default:
         break;
@@ -5786,6 +5816,240 @@ static size_t policy_successor_chain_emit_locked(AllocationRecord* record,
     return count;
 }
 
+static int policy_record_live_uffd_locked(AllocationRecord* record,
+                                          size_t seq) {
+    if (!record || seq == 0) {
+        return 0;
+    }
+    for (AllocationRecord* current = uffd_head; current;
+         current = current->uffd_next) {
+        if (current == record && current->allocation_seq == seq &&
+            current->backend == BACKEND_UFFD_PAGER &&
+            !current->uffd_closing && current->uffd_registered) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void policy_cohort_forget_record_locked(AllocationRecord* record) {
+    if (!record) {
+        return;
+    }
+    for (size_t i = 0; i < MAI_POLICY_COHORT_SLOTS; i++) {
+        MaiCohortPolicySlot* slot = &policy_cohort_slots[i];
+        if (slot->active &&
+            (slot->source_record == record || slot->target_record == record)) {
+            memset(slot, 0, sizeof(*slot));
+        }
+    }
+    if (policy_cohort_last_record == record) {
+        policy_cohort_last_record = NULL;
+        policy_cohort_last_seq = 0;
+        policy_cohort_last_index = 0;
+        policy_cohort_has_last = 0;
+    }
+}
+
+static MaiCohortPolicySlot*
+policy_cohort_select_slot_locked(AllocationRecord* source,
+                                 AllocationRecord* target,
+                                 size_t epoch) {
+    MaiCohortPolicySlot* victim = &policy_cohort_slots[0];
+    for (size_t i = 0; i < MAI_POLICY_COHORT_SLOTS; i++) {
+        MaiCohortPolicySlot* slot = &policy_cohort_slots[i];
+        if (slot->active &&
+            (!policy_record_live_uffd_locked(slot->source_record,
+                                             slot->source_seq) ||
+             !policy_record_live_uffd_locked(slot->target_record,
+                                             slot->target_seq))) {
+            memset(slot, 0, sizeof(*slot));
+        }
+        if (slot->active &&
+            slot->source_record == source &&
+            slot->source_seq == source->allocation_seq &&
+            slot->target_record == target &&
+            slot->target_seq == target->allocation_seq) {
+            return slot;
+        }
+        if (!slot->active) {
+            return slot;
+        }
+        if (slot->confidence < victim->confidence ||
+            (slot->confidence == victim->confidence &&
+             slot->last_epoch < victim->last_epoch)) {
+            victim = slot;
+        }
+    }
+    (void)epoch;
+    return victim;
+}
+
+static void policy_cohort_note_demand_locked(AllocationRecord* record,
+                                             size_t index) {
+    if (migration_policy != MIGRATION_POLICY_HYBRID || !record ||
+        record->backend != BACKEND_UFFD_PAGER ||
+        index >= record->chunk_count) {
+        return;
+    }
+
+    size_t epoch = uffd_touch_epoch + 1;
+    if (policy_cohort_has_last &&
+        policy_record_live_uffd_locked(policy_cohort_last_record,
+                                       policy_cohort_last_seq) &&
+        policy_cohort_last_record != record &&
+        policy_cohort_last_record->chunk_bytes == record->chunk_bytes) {
+        ptrdiff_t delta = (ptrdiff_t)index -
+            (ptrdiff_t)policy_cohort_last_index;
+        MaiCohortPolicySlot* slot =
+            policy_cohort_select_slot_locked(policy_cohort_last_record,
+                                             record, epoch);
+        if (slot) {
+            if (slot->active && slot->delta == delta) {
+                if (slot->confidence < MAI_POLICY_COHORT_MAX_SCORE) {
+                    slot->confidence++;
+                }
+            } else if (slot->active && slot->confidence > 1) {
+                slot->confidence--;
+            } else {
+                memset(slot, 0, sizeof(*slot));
+                slot->active = 1;
+                slot->source_record = policy_cohort_last_record;
+                slot->source_seq = policy_cohort_last_seq;
+                slot->target_record = record;
+                slot->target_seq = record->allocation_seq;
+                slot->delta = delta;
+                slot->confidence = 1;
+            }
+            slot->last_epoch = epoch;
+        }
+    }
+
+    policy_cohort_last_record = record;
+    policy_cohort_last_seq = record->allocation_seq;
+    policy_cohort_last_index = index;
+    policy_cohort_has_last = 1;
+}
+
+static int policy_cohort_candidate_locked(AllocationRecord* source,
+                                          size_t source_index,
+                                          AllocationRecord** target_out,
+                                          size_t* target_index_out,
+                                          size_t* confidence_out) {
+    if (migration_policy != MIGRATION_POLICY_HYBRID || !source ||
+        !target_out || !target_index_out || !confidence_out ||
+        !policy_record_live_uffd_locked(source, source->allocation_seq)) {
+        return 0;
+    }
+
+    int pressure = policy_resident_at_low_pressure_locked();
+    size_t threshold = pressure ? MAI_POLICY_COHORT_MIN_SCORE :
+        MAI_POLICY_COHORT_MIN_SCORE - 1;
+    MaiCohortPolicySlot* best = NULL;
+    size_t best_index = 0;
+    for (size_t i = 0; i < MAI_POLICY_COHORT_SLOTS; i++) {
+        MaiCohortPolicySlot* slot = &policy_cohort_slots[i];
+        if (!slot->active ||
+            slot->source_record != source ||
+            slot->source_seq != source->allocation_seq ||
+            slot->confidence < threshold ||
+            !policy_record_live_uffd_locked(slot->target_record,
+                                            slot->target_seq) ||
+            slot->target_record == source ||
+            slot->target_record->chunk_bytes != source->chunk_bytes ||
+            !slot->target_record->chunk_states) {
+            continue;
+        }
+        size_t predicted = 0;
+        if (!policy_index_add(source_index, slot->delta,
+                              slot->target_record->chunk_count,
+                              &predicted) ||
+            predicted >= slot->target_record->chunk_count ||
+            slot->target_record->chunk_states[predicted] == CHUNK_ANON_HOT) {
+            continue;
+        }
+        if (!best || slot->confidence > best->confidence ||
+            (slot->confidence == best->confidence &&
+             slot->last_epoch > best->last_epoch)) {
+            best = slot;
+            best_index = predicted;
+        }
+    }
+
+    if (!best) {
+        return 0;
+    }
+    *target_out = best->target_record;
+    *target_index_out = best_index;
+    *confidence_out = best->confidence;
+    stats_snapshot.policy_hybrid_cohort_candidates++;
+    return 1;
+}
+
+static size_t policy_cohort_confidence_locked(AllocationRecord* source,
+                                              size_t source_index,
+                                              AllocationRecord* target,
+                                              size_t target_index) {
+    if (!source || !target ||
+        !policy_record_live_uffd_locked(source, source->allocation_seq) ||
+        !policy_record_live_uffd_locked(target, target->allocation_seq)) {
+        return 0;
+    }
+    ptrdiff_t delta = 0;
+    if (!policy_bestoffset_delta(source_index, target_index, &delta)) {
+        return 0;
+    }
+    size_t best = 0;
+    for (size_t i = 0; i < MAI_POLICY_COHORT_SLOTS; i++) {
+        MaiCohortPolicySlot* slot = &policy_cohort_slots[i];
+        if (slot->active &&
+            slot->source_record == source &&
+            slot->source_seq == source->allocation_seq &&
+            slot->target_record == target &&
+            slot->target_seq == target->allocation_seq &&
+            slot->delta == delta &&
+            slot->confidence > best) {
+            best = slot->confidence;
+        }
+    }
+    return best;
+}
+
+static void policy_cohort_penalize_unused_locked(AllocationRecord* target,
+                                                 size_t target_index) {
+    if (!target ||
+        !policy_record_live_uffd_locked(target, target->allocation_seq)) {
+        return;
+    }
+    for (size_t i = 0; i < MAI_POLICY_COHORT_SLOTS; i++) {
+        MaiCohortPolicySlot* slot = &policy_cohort_slots[i];
+        if (!slot->active ||
+            slot->target_record != target ||
+            slot->target_seq != target->allocation_seq ||
+            !policy_record_live_uffd_locked(slot->source_record,
+                                            slot->source_seq)) {
+            continue;
+        }
+        ptrdiff_t source_index_signed =
+            (ptrdiff_t)target_index - slot->delta;
+        if (source_index_signed < 0 ||
+            (size_t)source_index_signed >= slot->source_record->chunk_count) {
+            continue;
+        }
+        size_t predicted = 0;
+        if (!policy_index_add((size_t)source_index_signed, slot->delta,
+                              target->chunk_count, &predicted) ||
+            predicted != target_index) {
+            continue;
+        }
+        if (slot->confidence > 1) {
+            slot->confidence--;
+        } else {
+            memset(slot, 0, sizeof(*slot));
+        }
+    }
+}
+
 static void policy_spatial_rebuild_mask_locked(MaiSpatialPolicyRegion* slot) {
     uint64_t learned = 0;
     for (size_t i = 0; i < spatial_region_chunks; i++) {
@@ -5896,6 +6160,8 @@ static void policy_update_stream_slots_locked(AllocationRecord* record,
     if (!record) {
         return;
     }
+
+    policy_cohort_note_demand_locked(record, index);
 
     int had_previous = record->policy_has_last_fault;
     size_t previous_index = record->policy_last_fault_index;
@@ -6230,8 +6496,13 @@ static int policy_adaptive_prefetch_admissible_locked(AllocationRecord* record,
         size_t successor =
             policy_successor_chain_min_confidence_locked(record, source_index,
                                                          index, NULL);
+        MaiHybridSource source = MAI_HYBRID_SOURCE_NONE;
         size_t confidence = policy_hybrid_prefetch_confidence_locked(
-            record, source_index, index, signature, successor, NULL);
+            record, source_index, index, signature, successor, &source);
+        if (policy_resident_at_low_pressure_locked() &&
+            source == MAI_HYBRID_SOURCE_STREAM) {
+            return 0;
+        }
         return confidence >=
             (policy_adaptive_throttle_level >= 2 ? 5 : 4);
     }
@@ -7195,6 +7466,100 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
     return 1;
 }
 
+static int policy_admit_cohort_prefetch_locked(
+    AllocationRecord* source_record,
+    size_t source_index,
+    AllocationRecord* target_record,
+    size_t target_index,
+    size_t length,
+    const MaiProtectedChunkSet* protected_set) {
+    if (!source_record || !target_record ||
+        target_index >= target_record->chunk_count) {
+        return 0;
+    }
+    stats_snapshot.policy_prefetch_requests++;
+    stats_snapshot.policy_admission_requests++;
+
+    policy_adaptive_update_locked();
+    size_t confidence =
+        policy_cohort_confidence_locked(source_record, source_index,
+                                        target_record, target_index);
+    size_t required_confidence =
+        policy_adaptive_throttle_level >= 2 ? 5 : MAI_POLICY_COHORT_MIN_SCORE;
+    int pressure = uffd_resident_limit_bytes != 0 &&
+        uffd_resident_bytes + length > uffd_resident_limit_bytes;
+    if (pressure && required_confidence < MAI_POLICY_COHORT_MIN_SCORE + 1) {
+        required_confidence = MAI_POLICY_COHORT_MIN_SCORE + 1;
+    }
+    if (pressure && policy_adaptive_control_enabled &&
+        policy_adaptive_throttle_level > 0) {
+        required_confidence += 3;
+    }
+
+    int admit = confidence >= required_confidence;
+    if (admit && active_record_epochs != 0 &&
+        uffd_resident_limit_bytes != 0 &&
+        uffd_resident_bytes + length > uffd_resident_limit_bytes &&
+        !policy_active_prefetch_has_safe_victim_locked(source_record,
+                                                       source_index,
+                                                       protected_set)) {
+        admit = 0;
+    }
+    if (admit && pressure) {
+        MaiChunkPolicyMeta* candidate = target_record->chunk_policy_meta ?
+            &target_record->chunk_policy_meta[target_index] : NULL;
+        size_t candidate_score =
+            policy_tinylfu_score_locked(target_record, target_index,
+                                        candidate);
+        size_t min_score = policy_tinylfu_min_score_locked();
+        AllocationRecord* victim_record = NULL;
+        size_t victim_index = 0;
+        if (policy_peek_uffd_victim_locked(&victim_record, &victim_index,
+                                           protected_set) &&
+            victim_record && victim_record->chunk_policy_meta) {
+            MaiChunkPolicyMeta* victim =
+                &victim_record->chunk_policy_meta[victim_index];
+            int victim_class = policy_wtinylfu_victim_class(victim);
+            size_t victim_score =
+                policy_tinylfu_score_locked(victim_record, victim_index,
+                                            victim);
+            size_t margin = policy_adaptive_throttle_level;
+            if (victim_class == 0) {
+                admit = confidence >= required_confidence;
+            } else if (candidate_score >= min_score) {
+                admit = candidate_score > victim_score + margin ||
+                    confidence >= required_confidence + 2 + margin;
+            } else {
+                admit = confidence >= required_confidence + 3 + margin;
+            }
+        } else {
+            admit = 0;
+        }
+    }
+
+    if (!admit) {
+        stats_snapshot.policy_hybrid_admission_rejected++;
+        stats_snapshot.policy_tinylfu_admission_rejected++;
+        stats_snapshot.policy_admission_rejected++;
+        return 0;
+    }
+
+    stats_snapshot.policy_prefetch_admitted++;
+    if (target_record->chunk_policy_meta) {
+        MaiChunkPolicyMeta* meta =
+            &target_record->chunk_policy_meta[target_index];
+        meta->flags |= MAI_CHUNK_POLICY_PREFETCHED |
+            MAI_CHUNK_POLICY_PROBATION;
+        meta->last_prefetch_epoch = uffd_touch_epoch + 1;
+        policy_wtinylfu_note_prefetch_locked(meta);
+        meta->confidence = confidence > UINT16_MAX ?
+            UINT16_MAX : (uint16_t)confidence;
+        policy_hybrid_set_source_locked(meta, MAI_HYBRID_SOURCE_COHORT);
+        policy_hybrid_note_source_admitted_locked(MAI_HYBRID_SOURCE_COHORT);
+    }
+    return 1;
+}
+
 static void policy_note_populate_locked(AllocationRecord* record, size_t index,
                                         int demand, int had_storage,
                                         size_t length) {
@@ -7317,6 +7682,10 @@ static void policy_note_evict_locked(AllocationRecord* record, size_t index,
                    meta->signature_context != 0 && meta->last_delta != 0) {
             policy_signature_penalize_locked(record, meta->signature_context,
                                              meta->last_delta);
+        }
+        if (migration_policy == MIGRATION_POLICY_HYBRID &&
+            policy_hybrid_source_locked(meta) == MAI_HYBRID_SOURCE_COHORT) {
+            policy_cohort_penalize_unused_locked(record, index);
         }
     } else if ((meta->flags & MAI_CHUNK_POLICY_DEMANDED) != 0 ||
                meta->frequency > 1) {
@@ -8085,11 +8454,18 @@ static size_t policy_resident_low_target_locked(size_t target) {
 
 static size_t policy_build_access_prefetch_plan_locked(AllocationRecord* record,
                                                        size_t index,
+                                                       AllocationRecord** prefetch_records,
                                                        size_t* prefetch_indices,
                                                        MaiHybridSource* prefetch_sources,
-                                                       size_t prefetch_cap) {
+                                                       size_t prefetch_cap,
+                                                       int include_cross_record) {
     if (!record || !prefetch_indices || prefetch_cap == 0) {
         return 0;
+    }
+    if (prefetch_records) {
+        for (size_t i = 0; i < prefetch_cap; i++) {
+            prefetch_records[i] = NULL;
+        }
     }
     if (prefetch_sources) {
         for (size_t i = 0; i < prefetch_cap; i++) {
@@ -8107,14 +8483,72 @@ static size_t policy_build_access_prefetch_plan_locked(AllocationRecord* record,
         }
     }
     prefetch_window = policy_adaptive_prefetch_cap_locked(prefetch_window);
-    return policy_build_prefetch_indices_locked(record, index, prefetch_window,
-                                                prefetch_indices,
-                                                prefetch_sources,
-                                                prefetch_cap);
+    size_t count = policy_build_prefetch_indices_locked(record, index,
+                                                        prefetch_window,
+                                                        prefetch_indices,
+                                                        prefetch_sources,
+                                                        prefetch_cap);
+    if (prefetch_records) {
+        for (size_t i = 0; i < count; i++) {
+            prefetch_records[i] = record;
+        }
+    }
+    if (include_cross_record && migration_policy == MIGRATION_POLICY_HYBRID &&
+        prefetch_records) {
+        AllocationRecord* cohort_record = NULL;
+        size_t cohort_index = 0;
+        size_t cohort_confidence = 0;
+        if (policy_cohort_candidate_locked(record, index, &cohort_record,
+                                           &cohort_index,
+                                           &cohort_confidence)) {
+            (void)cohort_confidence;
+            int duplicate = 0;
+            for (size_t i = 0; i < count; i++) {
+                if (prefetch_records[i] == cohort_record &&
+                    prefetch_indices[i] == cohort_index) {
+                    duplicate = 1;
+                    break;
+                }
+            }
+            int pressure = policy_resident_at_low_pressure_locked();
+            if (!duplicate && pressure) {
+                size_t new_count = count;
+                if (new_count < prefetch_cap) {
+                    new_count++;
+                }
+                if (new_count == 0) {
+                    new_count = 1;
+                }
+                for (size_t i = new_count - 1; i > 0; i--) {
+                    prefetch_records[i] = prefetch_records[i - 1];
+                    prefetch_indices[i] = prefetch_indices[i - 1];
+                    if (prefetch_sources) {
+                        prefetch_sources[i] = prefetch_sources[i - 1];
+                    }
+                }
+                prefetch_records[0] = cohort_record;
+                prefetch_indices[0] = cohort_index;
+                if (prefetch_sources) {
+                    prefetch_sources[0] = MAI_HYBRID_SOURCE_COHORT;
+                }
+                return new_count;
+            }
+            if (!duplicate && count < prefetch_cap) {
+                prefetch_records[count] = cohort_record;
+                prefetch_indices[count] = cohort_index;
+                if (prefetch_sources) {
+                    prefetch_sources[count] = MAI_HYBRID_SOURCE_COHORT;
+                }
+                count++;
+            }
+        }
+    }
+    return count;
 }
 
 static int policy_apply_prefetch_plan_locked(AllocationRecord* record,
                                              size_t index,
+                                             AllocationRecord* const* prefetch_records,
                                              const size_t* prefetch_indices,
                                              const MaiHybridSource* prefetch_sources,
                                              size_t prefetch_count,
@@ -8126,33 +8560,57 @@ static int policy_apply_prefetch_plan_locked(AllocationRecord* record,
     }
 
     MaiProtectedChunkSet protected_set = {0};
+    int pressure = policy_resident_at_low_pressure_locked();
     policy_protect_chunk_index(&protected_set, record, index);
     for (size_t candidate = 0; candidate < prefetch_count; candidate++) {
+        AllocationRecord* target_record =
+            prefetch_records && prefetch_records[candidate] ?
+            prefetch_records[candidate] : record;
         size_t prefetch_index = prefetch_indices[candidate];
         MaiHybridSource prefetch_source = prefetch_sources ?
             prefetch_sources[candidate] : MAI_HYBRID_SOURCE_NONE;
-        if (prefetch_index >= record->chunk_count) {
+        if (!target_record ||
+            target_record->backend != BACKEND_UFFD_PAGER ||
+            target_record->uffd_closing ||
+            !target_record->chunk_states ||
+            prefetch_index >= target_record->chunk_count) {
             continue;
         }
-        if (record->chunk_states[prefetch_index] == CHUNK_ANON_HOT) {
-            policy_protect_chunk_index(&protected_set, record, prefetch_index);
+        if (target_record->chunk_states[prefetch_index] == CHUNK_ANON_HOT) {
+            policy_protect_chunk_index(&protected_set, target_record,
+                                       prefetch_index);
             continue;
         }
         uintptr_t prefetch_start = 0;
         size_t prefetch_length =
-            uffd_record_chunk_length_locked(record, prefetch_index,
+            uffd_record_chunk_length_locked(target_record, prefetch_index,
                                             &prefetch_start);
-        if (prefetch_length == 0 ||
-            !policy_admit_prefetch_locked(record, index, prefetch_index,
-                                          prefetch_length, prefetch_source,
-                                          &protected_set)) {
+        int admit = 0;
+        if (prefetch_length != 0 && target_record == record) {
+            admit = policy_admit_prefetch_locked(record, index, prefetch_index,
+                                                 prefetch_length,
+                                                 prefetch_source,
+                                                 &protected_set);
+        } else if (prefetch_length != 0 &&
+                   migration_policy == MIGRATION_POLICY_HYBRID) {
+            admit = policy_admit_cohort_prefetch_locked(record, index,
+                                                        target_record,
+                                                        prefetch_index,
+                                                        prefetch_length,
+                                                        &protected_set);
+        }
+        if (!admit) {
             continue;
         }
-        if (populate_uffd_chunk_locked(record, prefetch_index, 0, 1,
+        if (populate_uffd_chunk_locked(target_record, prefetch_index, 0, 1,
                                        NULL) != 0) {
             break;
         }
-        policy_protect_chunk_index(&protected_set, record, prefetch_index);
+        policy_protect_chunk_index(&protected_set, target_record,
+                                   prefetch_index);
+        if (pressure) {
+            break;
+        }
     }
 
     int explicit_resident_limit = uffd_resident_limit_bytes != 0;
@@ -8171,14 +8629,18 @@ static int policy_apply_prefetch_plan_locked(AllocationRecord* record,
 static int policy_prefetch_and_reclaim_after_access_locked(AllocationRecord* record,
                                                            size_t index,
                                                            int runtime_lock_held) {
+    AllocationRecord* prefetch_records[MAI_MAX_UFFD_PREFETCH_CHUNKS];
     size_t prefetch_indices[MAI_MAX_UFFD_PREFETCH_CHUNKS];
     MaiHybridSource prefetch_sources[MAI_MAX_UFFD_PREFETCH_CHUNKS];
     size_t prefetch_count =
         policy_build_access_prefetch_plan_locked(record, index,
+                                                 prefetch_records,
                                                  prefetch_indices,
                                                  prefetch_sources,
-                                                 MAI_MAX_UFFD_PREFETCH_CHUNKS);
-    return policy_apply_prefetch_plan_locked(record, index, prefetch_indices,
+                                                 MAI_MAX_UFFD_PREFETCH_CHUNKS,
+                                                 1);
+    return policy_apply_prefetch_plan_locked(record, index, prefetch_records,
+                                             prefetch_indices,
                                              prefetch_sources,
                                              prefetch_count,
                                              runtime_lock_held);
@@ -8241,9 +8703,11 @@ static int policy_enqueue_async_after_access_locked(AllocationRecord* record,
     MaiHybridSource prefetch_sources[MAI_MAX_UFFD_PREFETCH_CHUNKS];
     size_t prefetch_count =
         policy_build_access_prefetch_plan_locked(record, index,
+                                                 NULL,
                                                  prefetch_indices,
                                                  prefetch_sources,
-                                                 MAI_MAX_UFFD_PREFETCH_CHUNKS);
+                                                 MAI_MAX_UFFD_PREFETCH_CHUNKS,
+                                                 0);
     size_t target = policy_effective_resident_target_locked(runtime_lock_held);
     int needs_reclaim = target != SIZE_MAX && uffd_resident_bytes > target;
     if (prefetch_count == 0 && !needs_reclaim) {
@@ -8421,7 +8885,7 @@ static void* uffd_async_policy_main(void* arg) {
             record->backend == BACKEND_UFFD_PAGER && !record->uffd_closing &&
             task.source_index < record->chunk_count) {
             if (policy_apply_prefetch_plan_locked(
-                    record, task.source_index, task.prefetch_indices,
+                    record, task.source_index, NULL, task.prefetch_indices,
                     task.prefetch_sources, task.prefetch_count, 0) != 0) {
                 stats_snapshot.policy_throttle_events++;
                 stats_snapshot.policy_async_prefetch_dropped++;
@@ -10275,7 +10739,11 @@ static void print_stats(void) {
             "policy_hybrid_stream_completed=%zu "
             "policy_hybrid_signature_useful=%zu "
             "policy_hybrid_successor_useful=%zu "
-            "policy_hybrid_stream_useful=%zu\n",
+            "policy_hybrid_stream_useful=%zu "
+            "policy_hybrid_cohort_candidates=%zu "
+            "policy_hybrid_cohort_admitted=%zu "
+            "policy_hybrid_cohort_completed=%zu "
+            "policy_hybrid_cohort_useful=%zu\n",
             stats.enabled, stats.configured, stats.config_error, stats.threshold,
             stats.arena_size, stats.target_rss, stats.max_rss,
             stats.current_rss_bytes, stats.high_water_rss_bytes,
@@ -10357,7 +10825,11 @@ static void print_stats(void) {
             stats.policy_hybrid_stream_completed,
             stats.policy_hybrid_signature_useful,
             stats.policy_hybrid_successor_useful,
-            stats.policy_hybrid_stream_useful);
+            stats.policy_hybrid_stream_useful,
+            stats.policy_hybrid_cohort_candidates,
+            stats.policy_hybrid_cohort_admitted,
+            stats.policy_hybrid_cohort_completed,
+            stats.policy_hybrid_cohort_useful);
 }
 
 static void print_profile_report(void) {
@@ -10611,6 +11083,11 @@ static int configure_runtime(void) {
     policy_car_target_recent_chunks = 0;
     memset(policy_tinylfu_sketch, 0, sizeof(policy_tinylfu_sketch));
     policy_tinylfu_updates_since_decay = 0;
+    memset(policy_cohort_slots, 0, sizeof(policy_cohort_slots));
+    policy_cohort_last_record = NULL;
+    policy_cohort_last_seq = 0;
+    policy_cohort_last_index = 0;
+    policy_cohort_has_last = 0;
 
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     if (page_size == 0) {
