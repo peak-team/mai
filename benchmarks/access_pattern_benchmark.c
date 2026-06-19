@@ -1239,6 +1239,128 @@ static int run_policy_hotset_scan(unsigned char* buffer, size_t size,
     return 0;
 }
 
+static int run_policy_phase_shift_hotset(unsigned char* buffer, size_t size,
+                                         uint64_t* checksum,
+                                         size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_PHASE_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t hotset_bytes =
+        env_size("MAI_BENCH_POLICY_PHASE_HOTSET", 8ULL * 1024ULL * 1024ULL);
+    size_t warm_rounds = env_count("MAI_BENCH_POLICY_PHASE_WARM_ROUNDS", 8);
+    size_t active_rounds =
+        env_count("MAI_BENCH_POLICY_PHASE_ACTIVE_ROUNDS", 4);
+    size_t scan_passes = env_count("MAI_BENCH_POLICY_PHASE_SCAN_PASSES", 3);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    hotset_bytes -= hotset_bytes % unit_bytes;
+    size_t hot_units = hotset_bytes / unit_bytes;
+    if (hot_units == 0) {
+        hot_units = 1;
+    }
+    size_t units = size / unit_bytes;
+    if (units < hot_units * 2 + 1) {
+        return -1;
+    }
+    if (warm_rounds == 0) {
+        warm_rounds = 1;
+    }
+    if (active_rounds == 0) {
+        active_rounds = 1;
+    }
+    if (scan_passes == 0) {
+        scan_passes = 1;
+    }
+
+    size_t phase_a = 0;
+    size_t phase_b = hot_units;
+    size_t scan_start = hot_units * 2;
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t round = 0; round < warm_rounds; round++) {
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = phase_a + unit;
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    for (size_t pass = 0; pass < scan_passes; pass++) {
+        for (size_t round = 0; round < active_rounds; round++) {
+            for (size_t unit = 0; unit < hot_units; unit++) {
+                size_t index = phase_b + unit;
+                size_t offset = index * unit_bytes;
+                expected[index]++;
+                buffer[offset] = expected[index];
+                if (buffer[offset] != expected[index]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+        for (size_t index = scan_start; index < units; index++) {
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = phase_b + unit;
+            size_t offset = index * unit_bytes;
+            if (buffer[offset] != expected[index]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "phase_shift_hotset";
+    stream_pipeline_prediction_recorded = "reuse_distance";
+    stream_pipeline_groups_recorded = hot_units;
+    stream_pipeline_group_visits_recorded = units - scan_start;
+    stream_pipeline_group_iterations_recorded = scan_passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_lag_recorded = warm_rounds;
+    stream_pipeline_reclaim_horizon_recorded = active_rounds;
+
+    free(expected);
+    return 0;
+}
+
 static int run_policy_successor_cycle(unsigned char* buffer, size_t size,
                                       uint64_t* checksum,
                                       size_t* touches) {
@@ -3226,6 +3348,7 @@ int main(int argc, char** argv) {
                 "stream_shared_file|stream_private_file|"
                 "stream_tiled_bandwidth|policy_stream_pipeline|"
                 "policy_multistream_stride|policy_hotset_scan|"
+                "policy_phase_shift_hotset|"
                 "policy_successor_cycle|policy_spatial_region_mask|"
                 "policy_spatial_interleaved_mask|"
                 "stream_kernel_pipeline|"
@@ -3311,6 +3434,8 @@ int main(int argc, char** argv) {
         rc = run_policy_multistream_stride(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_hotset_scan") == 0) {
         rc = run_policy_hotset_scan(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_phase_shift_hotset") == 0) {
+        rc = run_policy_phase_shift_hotset(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_successor_cycle") == 0) {
         rc = run_policy_successor_cycle(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_spatial_region_mask") == 0) {

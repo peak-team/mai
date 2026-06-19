@@ -2923,7 +2923,7 @@ static int mode_uffd_pager_stride_policy(void) {
     return 0;
 }
 
-static int mode_uffd_pager_lfu_hotset_scan(void) {
+static int mode_uffd_pager_hotset_scan_policy(const char* policy_name) {
     MaiStats before;
     MaiStats after_touch;
     MaiStats after_free;
@@ -2936,21 +2936,21 @@ static int mode_uffd_pager_lfu_hotset_scan(void) {
     unsigned char expected[16] = {0};
 
     if (units > sizeof(expected)) {
-        return fail("LFU hotset test expected array is too small");
+        return fail("UFFD hotset test expected array is too small");
     }
     if (load_stats(&before) != 0) {
-        return fail("mai_get_stats failed before UFFD LFU hotset test");
+        return fail("mai_get_stats failed before UFFD hotset test");
     }
     if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
         return skip("UFFD pager required mode is unavailable on this host");
     }
     if (before.config_error != 0 || before.uffd_pager_available == 0) {
-        return fail("UFFD pager is unavailable for LFU hotset test");
+        return fail("UFFD pager is unavailable for hotset test");
     }
 
     unsigned char* ptr = malloc(size);
     if (!ptr) {
-        return fail("UFFD LFU hotset allocation failed");
+        return fail("UFFD hotset allocation failed");
     }
     for (size_t pass = 0; pass < scan_passes; pass++) {
         for (size_t round = 0; round < hot_rounds; round++) {
@@ -2959,7 +2959,7 @@ static int mode_uffd_pager_lfu_hotset_scan(void) {
                 ptr[unit_index * unit] = expected[unit_index];
                 if (ptr[unit_index * unit] != expected[unit_index]) {
                     free(ptr);
-                    return fail("UFFD LFU hotset lost hot data");
+                    return fail("UFFD hotset lost hot data");
                 }
             }
         }
@@ -2968,20 +2968,20 @@ static int mode_uffd_pager_lfu_hotset_scan(void) {
             ptr[unit_index * unit] = expected[unit_index];
             if (ptr[unit_index * unit] != expected[unit_index]) {
                 free(ptr);
-                return fail("UFFD LFU hotset lost scan data");
+                return fail("UFFD hotset lost scan data");
             }
         }
         for (size_t unit_index = 0; unit_index < hot_units; unit_index++) {
             if (ptr[unit_index * unit] != expected[unit_index]) {
                 free(ptr);
-                return fail("UFFD LFU hotset verification failed");
+                return fail("UFFD hotset verification failed");
             }
         }
     }
 
     if (load_stats(&after_touch) != 0) {
         free(ptr);
-        return fail("mai_get_stats failed after UFFD LFU hotset touches");
+        return fail("mai_get_stats failed after UFFD hotset touches");
     }
     size_t admission_requests =
         after_touch.policy_admission_requests - before.policy_admission_requests;
@@ -2992,34 +2992,43 @@ static int mode_uffd_pager_lfu_hotset_scan(void) {
         after_touch.uffd_faults <= before.uffd_faults ||
         after_touch.uffd_evictions <= before.uffd_evictions) {
         fprintf(stderr,
-                "LFU hotset pager stats: managed before=%zu after=%zu "
+                "%s hotset pager stats: managed before=%zu after=%zu "
                 "live before=%zu after=%zu uffd_alloc before=%zu after=%zu "
                 "faults before=%zu after=%zu evictions before=%zu after=%zu\n",
+                policy_name,
                 before.managed_allocations, after_touch.managed_allocations,
                 before.live_managed_bytes, after_touch.live_managed_bytes,
                 before.uffd_pager_allocations, after_touch.uffd_pager_allocations,
                 before.uffd_faults, after_touch.uffd_faults,
                 before.uffd_evictions, after_touch.uffd_evictions);
         free(ptr);
-        return fail("UFFD LFU hotset test did not exercise pager pressure");
+        return fail("UFFD hotset test did not exercise pager pressure");
     }
     if (admission_requests == 0 || admission_rejected == 0) {
         fprintf(stderr,
-                "LFU hotset admission stats: requests=%zu rejected=%zu\n",
-                admission_requests, admission_rejected);
+                "%s hotset admission stats: requests=%zu rejected=%zu\n",
+                policy_name, admission_requests, admission_rejected);
         free(ptr);
-        return fail("UFFD LFU hotset test did not reject speculative admission");
+        return fail("UFFD hotset test did not reject speculative admission");
     }
 
     free(ptr);
     if (load_stats(&after_free) != 0) {
-        return fail("mai_get_stats failed after UFFD LFU hotset free");
+        return fail("mai_get_stats failed after UFFD hotset free");
     }
     if (after_free.live_managed_bytes != before.live_managed_bytes ||
         after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
-        return fail("UFFD LFU hotset allocation leaked managed or resident bytes");
+        return fail("UFFD hotset allocation leaked managed or resident bytes");
     }
     return 0;
+}
+
+static int mode_uffd_pager_lfu_hotset_scan(void) {
+    return mode_uffd_pager_hotset_scan_policy("LFU");
+}
+
+static int mode_uffd_pager_lruk_hotset_scan(void) {
+    return mode_uffd_pager_hotset_scan_policy("LRU-K");
 }
 
 static int mode_uffd_pager_successor_policy(void) {
@@ -4432,6 +4441,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_lfu_hotset_scan") == 0) {
         return mode_uffd_pager_lfu_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_lruk_hotset_scan") == 0) {
+        return mode_uffd_pager_lruk_hotset_scan();
     }
     if (strcmp(argv[1], "uffd_pager_successor_policy") == 0) {
         return mode_uffd_pager_successor_policy();

@@ -244,6 +244,33 @@ improve throughput. Mean end-to-end throughput was about 9356 MiB/s with
 clean-shadow off and 9038 MiB/s with it on. That supports keeping clean-shadow
 off by default for STREAM-like write-heavy workloads.
 
+### LRU-K Reuse-Distance Probe
+
+`MAI_MIGRATION_POLICY=lruk` is an opt-in LRU-2 approximation. It keeps compact
+two-reference history across demotion and uses that Kth-reference epoch for
+admission and eviction. The phase-shift workload warms hotset A, switches to
+hotset B, scans colder chunks, and verifies only the new hotset. These six-run
+means use `policy_phase_shift_hotset 64M`, 2 MiB units, 8 MiB hotsets, an 8 MiB
+resident high watermark, and a 6 MiB low watermark.
+
+| Workload | Policy | Events/s | Demand faults | Read MiB | Write MiB | Admission rejects | Unused evictions | Hot-evicted MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `policy_hotset_scan` | `legacy` | 2505 | 50 | 136 | 194 | 0 | 48 | 98 |
+| `policy_hotset_scan` | `2q` | 2299 | 98 | 136 | 192 | 93 | 2 | 188 |
+| `policy_hotset_scan` | `lfu` | 2292 | 67 | 138 | 194 | 31 | 34 | 126 |
+| `policy_hotset_scan` | `lruk` | 2401 | 98 | 136 | 192 | 93 | 2 | 188 |
+| `policy_phase_shift_hotset` | `legacy` | 3297 | 46 | 120 | 178 | 0 | 44 | 90 |
+| `policy_phase_shift_hotset` | `2q` | 3248 | 90 | 120 | 176 | 85 | 2 | 172 |
+| `policy_phase_shift_hotset` | `lfu` | 3212 | 50 | 124 | 182 | 3 | 44 | 94 |
+| `policy_phase_shift_hotset` | `lruk` | 2700 | 90 | 120 | 176 | 85 | 2 | 172 |
+
+The result is intentionally not promoted as a win. `lruk` behaves as a
+conservative reuse-distance baseline: it sharply rejects one-reference
+prefetch pollution, but in these pressure shapes that also increases demand
+faults and hot evictions versus `legacy` and `lfu`. Keep it benchmark-gated;
+its value is as a reference point for future LIRS/CAR-style policies, not as a
+default policy.
+
 ## Interpretation
 
 - Sufficient-memory MAI does not trigger migration in these runs; faster

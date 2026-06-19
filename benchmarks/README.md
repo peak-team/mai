@@ -166,7 +166,7 @@ Runtime policy knobs are intentionally separate from benchmark knobs:
 
 - `MAI_MIGRATION_POLICY` or `MAI_POLICY`: `legacy`, `lru`, `clock`, `fifo`,
   `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, or
-  `markov`/`successor`, or `spatial`/`spatial-mask`
+  `lruk`/`lru-k`, `markov`/`successor`, or `spatial`/`spatial-mask`
 - `MAI_UFFD_PREFETCH_CHUNKS`: maximum UFFD prefetch lookahead
 - `MAI_UFFD_RESIDENT_LIMIT` and `MAI_UFFD_RESIDENT_LOW_LIMIT`: resident
   high/low watermarks for UFFD-managed chunks
@@ -193,7 +193,7 @@ Policy pressure scenarios can use `mai_policy_pipeline` with
 `mai_policy_stream_pipeline`, `mai_policy_clock_pipeline`, or
 `mai_policy_2q_pipeline`. The runtime accepts `legacy`, `lru`, `clock`,
 `fifo`, `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, and
-`markov`/`successor`, and `spatial`/`spatial-mask`.
+`lruk`/`lru-k`, `markov`/`successor`, and `spatial`/`spatial-mask`.
 
 `policy_multistream_stride` is a focused no-oracle workload for stride
 predictors. It walks fixed-size units inside one allocation as independent
@@ -210,7 +210,7 @@ this workload.
 pollution. It repeatedly touches a hot chunk set, scans a larger cold region,
 then verifies the hot set. Control it with `MAI_BENCH_POLICY_HOTSET`,
 `MAI_BENCH_POLICY_HOTSET_UNIT`, `MAI_BENCH_POLICY_HOT_ROUNDS`, and
-`MAI_BENCH_POLICY_SCAN_PASSES`. Use it to compare `2q` and `lfu` against
+`MAI_BENCH_POLICY_SCAN_PASSES`. Use it to compare `2q`, `lfu`, and `lruk` against
 legacy prefetch admission under the same resident limit.
 On the local 32M allocation / 8M resident-limit smoke shape, `lfu` with
 write-protect observation reduced migration traffic versus `legacy`. In the
@@ -218,6 +218,16 @@ latest six-run policy matrix, observation-off `lfu` won the hotset scan
 event-rate row and tied `legacy` on lowest demand faults. Treat `lfu` as a
 frequency-admission baseline whose win is workload-specific, not a default
 policy.
+
+`policy_phase_shift_hotset` is a reuse-distance guardrail. It warms hotset A,
+switches to hotset B, scans colder chunks, and verifies only the new hotset.
+It does not give MAI phase hints. Control it with
+`MAI_BENCH_POLICY_PHASE_HOTSET`, `MAI_BENCH_POLICY_PHASE_UNIT`,
+`MAI_BENCH_POLICY_PHASE_WARM_ROUNDS`,
+`MAI_BENCH_POLICY_PHASE_ACTIVE_ROUNDS`, and
+`MAI_BENCH_POLICY_PHASE_SCAN_PASSES`. Use it to compare `lruk` with `lfu`:
+LFU can preserve old high-frequency chunks too long, while LRU-K should prefer
+chunks with more recent repeated demand references.
 
 `policy_successor_cycle` is a no-oracle workload for repeated irregular
 transitions. It walks fixed-size units through an affine successor cycle, so

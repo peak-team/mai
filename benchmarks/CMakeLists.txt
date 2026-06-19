@@ -74,6 +74,23 @@ if(BUILD_TESTING)
     )
 
     add_test(
+        NAME mai_policy_phase_shift_hotset_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_POLICY_PHASE_HOTSET=4M"
+            "MAI_BENCH_POLICY_PHASE_UNIT=2M"
+            "MAI_BENCH_POLICY_PHASE_WARM_ROUNDS=3"
+            "MAI_BENCH_POLICY_PHASE_ACTIVE_ROUNDS=2"
+            "MAI_BENCH_POLICY_PHASE_SCAN_PASSES=2"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            policy_phase_shift_hotset
+            16M
+    )
+    set_tests_properties(mai_policy_phase_shift_hotset_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=policy_phase_shift_hotset .*logical_mib=52\\.000 .*stream_pipeline_group_visits=4 .*stream_pipeline_groups=2 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=phase_shift_hotset .*stream_pipeline_prediction=reuse_distance .*stream_pipeline_reclaim_lag=3 .*stream_pipeline_reclaim_horizon=2"
+    )
+
+    add_test(
         NAME mai_policy_successor_cycle_smoke
         COMMAND ${CMAKE_COMMAND} -E env
             "MAI_ACCESS_EXPECT_MANAGED=0"
