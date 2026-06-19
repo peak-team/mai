@@ -5,9 +5,18 @@
 #include <stddef.h>
 #include <string.h>
 
-static unsigned char local_heap[32768];
+#if defined(__GNUC__)
+#define MAI_PLUGIN_API \
+    __attribute__((visibility("default"), noinline, used, optimize("O0")))
+#else
+#define MAI_PLUGIN_API
+#endif
 
-__attribute__((visibility("default")))
+static unsigned char local_heap[32768];
+static volatile size_t local_usable_zero = 0;
+static volatile void* local_free_sink = NULL;
+
+MAI_PLUGIN_API
 void* malloc(size_t size) {
     if (size > sizeof(local_heap)) {
         errno = ENOMEM;
@@ -17,18 +26,21 @@ void* malloc(size_t size) {
     return local_heap;
 }
 
-__attribute__((visibility("default")))
+MAI_PLUGIN_API
 void free(void* ptr) {
-    (void)ptr;
+    local_free_sink = ptr;
+    local_free_sink = NULL;
 }
 
-__attribute__((visibility("default")))
+MAI_PLUGIN_API
 size_t malloc_usable_size(void* ptr) {
-    (void)ptr;
-    return 0;
+    if (!ptr) {
+        return local_usable_zero;
+    }
+    return local_usable_zero;
 }
 
-__attribute__((visibility("default")))
+MAI_PLUGIN_API
 void* mai_local_alloc(size_t size) {
     unsigned char* ptr = malloc(size);
     if (!ptr) {
@@ -39,12 +51,12 @@ void* mai_local_alloc(size_t size) {
     return ptr;
 }
 
-__attribute__((visibility("default")))
+MAI_PLUGIN_API
 size_t mai_local_usable(void* ptr) {
     return malloc_usable_size(ptr);
 }
 
-__attribute__((visibility("default")))
+MAI_PLUGIN_API
 void mai_local_free(void* ptr) {
     free(ptr);
 }

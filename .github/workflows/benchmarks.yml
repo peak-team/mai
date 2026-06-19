@@ -35,7 +35,32 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMAI_BUILD_BENCHMARKS=ON
 
       - name: Build benchmark targets
-        run: cmake --build build --parallel --target mai mai_access_pattern_benchmark
+        run: cmake --build build --parallel --target mai mai_benchmark mai_access_pattern_benchmark
+
+      - name: Run sufficient-memory overhead matrix
+        run: |
+          mkdir -p benchmark-results
+          benchmarks/sufficient_memory_matrix.sh \
+            build/src/libmai.so \
+            build/tests/mai_benchmark \
+            build/benchmarks/mai_access_pattern_benchmark \
+            | tee benchmark-results/sufficient-memory-matrix.txt
+
+      - name: Run trace and heartbeat chunk matrix
+        run: |
+          mkdir -p benchmark-results
+          benchmarks/trace_heartbeat_matrix.sh \
+            build/src/libmai.so \
+            build/benchmarks/mai_access_pattern_benchmark \
+            | tee benchmark-results/trace-heartbeat-matrix.txt
+
+      - name: Run mprotect overhead matrix
+        run: |
+          mkdir -p benchmark-results
+          benchmarks/mprotect_overhead_matrix.sh \
+            build/src/libmai.so \
+            build/benchmarks/mai_access_pattern_benchmark \
+            | tee benchmark-results/mprotect-overhead-matrix.txt
 
       - name: Run Docker access-pattern benchmarks
         env:
@@ -48,8 +73,34 @@ jobs:
             build/benchmarks/mai_access_pattern_benchmark \
             | tee benchmark-results/docker-access-patterns.txt
 
+      - name: Run Docker STREAM pressure benchmarks
+        env:
+          MAI_BENCH_DOCKER_MEMORIES: "1536m 1g 768m 512m"
+          MAI_BENCH_DOCKER_SWAP_MEMORY: "2g"
+          MAI_BENCH_DOCKER_MEMORY_SWAPPINESS: "100"
+          MAI_BENCH_STREAM_ALLOCATION_SIZE: ${{ github.event.inputs.allocation_size || '128M' }}
+          MAI_BENCH_SCENARIOS: "linux_mmap_pipeline linux_swap_pipeline mai_auto_pipeline mai_uffd_pipeline"
+          MAI_BENCH_STREAM_PASSES: "6"
+          MAI_BENCH_STREAM_PIPELINE_GROUP_ITERATIONS: "4"
+          MAI_BENCH_STREAM_PIPELINE_ORDER: "sequential"
+          MAI_BENCH_STREAM_PIPELINE_SEED: "1"
+          MAI_BENCH_STREAM_PIPELINE_SCALAR: "0.25"
+          MAI_HEARTBEAT_BACKGROUND_INTERVAL_US: "1000"
+          MAI_HEARTBEAT_BACKGROUND_OBSERVE_PAGES: "64"
+          MAI_HEARTBEAT_BACKGROUND_CHUNK: "2M"
+          MAI_HEARTBEAT_BACKGROUND_MIGRATE: "0"
+          MAI_FILE_DEDICATED_MIN: "64M"
+          MAI_AUTO_LARGE_ALLOC_CAP_PERCENT: "12"
+          MAI_UFFD_PREFETCH_CHUNKS: "4"
+        run: |
+          mkdir -p benchmark-results
+          benchmarks/docker_stream_pressure_matrix.sh \
+            build/src/libmai.so \
+            build/benchmarks/mai_access_pattern_benchmark \
+            | tee benchmark-results/docker-stream-pressure-matrix.txt
+
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
-          name: docker-access-patterns
-          path: benchmark-results/docker-access-patterns.txt
+          name: mai-benchmark-results
+          path: benchmark-results/*.txt

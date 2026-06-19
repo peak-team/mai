@@ -10,6 +10,7 @@
 #include <string.h>
 
 typedef int (*get_stats_fn)(MaiStats*);
+typedef int (*get_stats_sized_fn)(MaiStats*, size_t);
 
 static int fail(const char* message) {
     fprintf(stderr, "%s\n", message);
@@ -22,6 +23,11 @@ static int skip(const char* message) {
 }
 
 static int load_stats(MaiStats* stats) {
+    get_stats_sized_fn get_stats_sized =
+        (get_stats_sized_fn)dlsym(RTLD_DEFAULT, "mai_get_stats_sized");
+    if (get_stats_sized) {
+        return get_stats_sized(stats, sizeof(*stats));
+    }
     get_stats_fn get_stats = (get_stats_fn)dlsym(RTLD_DEFAULT, "mai_get_stats");
     if (!get_stats) {
         return -1;

@@ -50,6 +50,16 @@ class MaiStats(ctypes.Structure):
         ("max_rss", ctypes.c_size_t),
         ("memory_cap_reclaim_calls", ctypes.c_size_t),
         ("memory_cap_failures", ctypes.c_size_t),
+        ("anon_allocations", ctypes.c_size_t),
+        ("file_allocations", ctypes.c_size_t),
+        ("migrated_to_file_bytes", ctypes.c_size_t),
+        ("promoted_to_anon_bytes", ctypes.c_size_t),
+        ("uffd_pager_available", ctypes.c_size_t),
+        ("uffd_pager_allocations", ctypes.c_size_t),
+        ("uffd_faults", ctypes.c_size_t),
+        ("uffd_evictions", ctypes.c_size_t),
+        ("uffd_resident_bytes", ctypes.c_size_t),
+        ("uffd_fallbacks", ctypes.c_size_t),
     ]
 
 
@@ -60,7 +70,10 @@ def fail(message):
 
 def load_stats(runtime):
     stats = MaiStats()
-    if runtime.mai_get_stats(ctypes.byref(stats)) != 0:
+    if hasattr(runtime, "mai_get_stats_sized"):
+        if runtime.mai_get_stats_sized(ctypes.byref(stats), ctypes.sizeof(stats)) != 0:
+            raise RuntimeError("mai_get_stats_sized failed")
+    elif runtime.mai_get_stats(ctypes.byref(stats)) != 0:
         raise RuntimeError("mai_get_stats failed")
     return stats
 
@@ -74,6 +87,9 @@ def main():
     runtime = ctypes.CDLL(None)
     runtime.mai_get_stats.argtypes = [ctypes.POINTER(MaiStats)]
     runtime.mai_get_stats.restype = ctypes.c_int
+    if hasattr(runtime, "mai_get_stats_sized"):
+        runtime.mai_get_stats_sized.argtypes = [ctypes.POINTER(MaiStats), ctypes.c_size_t]
+        runtime.mai_get_stats_sized.restype = ctypes.c_int
 
     plugin = ctypes.CDLL(plugin_path)
     plugin.mai_plugin_alloc.argtypes = [ctypes.c_size_t]
@@ -101,7 +117,11 @@ def main():
             after.managed_allocations <= before.managed_allocations
             or after.managed_bytes_total < before.managed_bytes_total + alloc_size
             or after.live_managed_bytes < before.live_managed_bytes + alloc_size
-            or after.arena_segments == 0
+            or (
+                after.anon_allocations <= before.anon_allocations
+                and after.file_allocations <= before.file_allocations
+                and after.arena_segments == 0
+            )
         ):
             return fail("Python-loaded plugin allocation was not managed")
     finally:
