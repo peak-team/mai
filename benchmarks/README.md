@@ -167,7 +167,8 @@ Runtime policy knobs are intentionally separate from benchmark knobs:
 - `MAI_MIGRATION_POLICY` or `MAI_POLICY`: `legacy`, `lru`, `clock`, `fifo`,
   `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, or
   `lruk`/`lru-k`, `car`/`car-lite`, `markov`/`successor`, or
-  `spatial`/`spatial-mask`, or `tinylfu`/`tiny-lfu`
+  `spatial`/`spatial-mask`, `tinylfu`/`tiny-lfu`, or
+  `wtinylfu`/`window-tinylfu`
 - `MAI_UFFD_PREFETCH_CHUNKS`: maximum UFFD prefetch lookahead
 - `MAI_UFFD_RESIDENT_LIMIT` and `MAI_UFFD_RESIDENT_LOW_LIMIT`: resident
   high/low watermarks for UFFD-managed chunks
@@ -261,6 +262,12 @@ and `car`: the expected signal is lower cold-tail pollution and migration
 traffic, not universal improvement on every phase-shift probe. Output includes
 `stream_pipeline_unique_cold_visits`, which should equal the cold-tail unit
 count times the number of cold-tail passes.
+
+`wtinylfu` uses the same long-tail, hotset, and pivot guardrails as `tinylfu`
+and `car`. Tune its recency window with `MAI_POLICY_WTINYLFU_WINDOW_PERCENT`.
+Useful runs should show fewer unused-prefetch evictions and lower migration
+bytes without a large increase in demand events, hot-evicted bytes, or tail
+stall.
 
 `policy_best_offset_lag` is a no-oracle workload for recurring non-adjacent
 offset predictors. It shuffles a source range, touches each anchor now, then

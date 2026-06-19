@@ -353,6 +353,42 @@ migration bytes versus `legacy`, but it does not beat exact `lfu` on throughput,
 demand faults, or hot-evicted bytes. Keep it experimental: this slice validates
 sketch-backed admission plumbing, not a production default.
 
+### W-TinyLFU Integrated Policy Probe
+
+`MAI_MIGRATION_POLICY=wtinylfu` composes prefetch confidence, demand-trained
+TinyLFU admission, a small recency window, probationary prefetches, protected
+demand-confirmed chunks, and throttle-raised victim-score margins. Demand
+faults always populate. Prefetches must be Markov-successor or clear sequential
+stream candidates, and under resident pressure they must beat the selected
+victim unless that victim is unused/probationary.
+
+These six-run means use the same 64 MiB policy-event workloads, 2 MiB chunks,
+an 8 MiB resident high watermark, a 6 MiB low watermark, `MAI_MAX_RSS=16M`,
+`MAI_POLICY_OBSERVE_PREFETCH_WRITES=0`, and the default 25% W-TinyLFU window.
+
+| Workload | Policy | Events/s | Demand events | Read MiB | Write MiB | Admission rejects | Unused evictions | Hot-evicted MiB | TinyLFU updates | TinyLFU rejects | Window | Probation | Protected | Window evictions | Main rejects | Victim-score rejects |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `policy_hotset_scan` | `legacy` | 2579 | 50 | 136 | 194 | 0 | 48 | 98 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `policy_hotset_scan` | `car` | 2386 | 55 | 143 | 201 | 2 | 48 | 106 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `policy_hotset_scan` | `tinylfu` | 2322 | 98 | 136 | 192 | 93 | 2 | 188 | 98 | 93 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `policy_hotset_scan` | `wtinylfu` | 2254 | 99 | 136 | 192 | 85 | 1 | 190 | 99 | 85 | 0 | 0 | 4 | 64 | 26 | 59 |
+| `policy_recency_frequency_pivot` | `legacy` | 2404 | 98 | 328 | 386 | 0 | 96 | 194 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `policy_recency_frequency_pivot` | `car` | 2197 | 116 | 347 | 405 | 18 | 88 | 229 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `policy_recency_frequency_pivot` | `tinylfu` | 2128 | 221 | 419 | 477 | 190 | 20 | 437 | 221 | 190 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `policy_recency_frequency_pivot` | `wtinylfu` | 2023 | 247 | 433 | 491 | 174 | 2 | 487 | 247 | 174 | 0 | 0 | 3 | 64 | 26 | 148 |
+| `policy_long_tail_admission` | `legacy` | 1956 | 124 | 310 | 368 | 0 | 61 | 246 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `policy_long_tail_admission` | `car` | 1855 | 132 | 308 | 366 | 5 | 53 | 260 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `policy_long_tail_admission` | `tinylfu` | 2022 | 161 | 294 | 350 | 75 | 18 | 314 | 161 | 75 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `policy_long_tail_admission` | `wtinylfu` | 1961 | 171 | 284 | 342 | 54 | 3 | 336 | 171 | 54 | 0 | 0 | 3 | 64 | 23 | 31 |
+
+This slice validates the integrated policy machinery but is not promotable as a
+default. W-TinyLFU consistently reduces unused-prefetch evictions and has the
+lowest long-tail write volume in this table, but the pivot row writes more than
+legacy/TinyLFU. It also raises demand events and hot-evicted bytes versus
+legacy and CAR on the hotset and pivot probes. The next design step should
+improve timeliness, not merely admission: fewer useless prefetches are not
+enough if demand faults rise.
+
 ### Best-Offset Lag Probe
 
 `MAI_MIGRATION_POLICY=best-offset` is an experimental top-1 offset prefetcher.
@@ -413,6 +449,11 @@ or multi-lookahead scoring before this policy can be promoted.
   on the small phase-shift probes. On the corrected long-tail workload, it
   reduces cold-tail prefetch pollution versus `legacy` but does not beat exact
   `lfu`; use it as infrastructure for future W-TinyLFU-style policies.
+- `wtinylfu` combines sketch admission, a recency window, and prefetch-aware
+  victim choice. It reduces unused-prefetch evictions and improves long-tail
+  write volume, but currently raises demand events and worsens pivot write
+  traffic; it is a useful negative/tuning result rather than a default
+  candidate.
 - `best-offset` is an experimental offset-learning guardrail. It should not be
   treated as successful unless the disjoint-source benchmark shows both the
   expected top offset and competitive stall/migration metrics.

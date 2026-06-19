@@ -151,6 +151,12 @@ typedef struct {
     size_t policy_bestoffset_top_offset_magnitude;
     size_t policy_bestoffset_top_offset_sign;
     size_t policy_bestoffset_top_score;
+    size_t policy_wtinylfu_window_chunks;
+    size_t policy_wtinylfu_probation_chunks;
+    size_t policy_wtinylfu_protected_chunks;
+    size_t policy_wtinylfu_window_evictions;
+    size_t policy_wtinylfu_main_admission_rejected;
+    size_t policy_wtinylfu_victim_score_rejected;
 } MaiStats;
 
 /**

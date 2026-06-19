@@ -4241,6 +4241,21 @@ int main(int argc, char** argv) {
         after.policy_bestoffset_top_offset_sign : 0;
     size_t policy_bestoffset_top_score = after_stats_available ?
         after.policy_bestoffset_top_score : 0;
+    size_t policy_wtinylfu_window_chunks = after_stats_available ?
+        after.policy_wtinylfu_window_chunks : 0;
+    size_t policy_wtinylfu_probation_chunks = after_stats_available ?
+        after.policy_wtinylfu_probation_chunks : 0;
+    size_t policy_wtinylfu_protected_chunks = after_stats_available ?
+        after.policy_wtinylfu_protected_chunks : 0;
+    size_t policy_wtinylfu_window_evictions = after_stats_available ?
+        after.policy_wtinylfu_window_evictions -
+        before.policy_wtinylfu_window_evictions : 0;
+    size_t policy_wtinylfu_main_admission_rejected = after_stats_available ?
+        after.policy_wtinylfu_main_admission_rejected -
+        before.policy_wtinylfu_main_admission_rejected : 0;
+    size_t policy_wtinylfu_victim_score_rejected = after_stats_available ?
+        after.policy_wtinylfu_victim_score_rejected -
+        before.policy_wtinylfu_victim_score_rejected : 0;
     const char* policy_prefetch_observation =
         after_stats_available && after.policy_prefetch_observation != 0 ?
         "write_protect" : "unobserved";
@@ -4342,6 +4357,12 @@ int main(int argc, char** argv) {
            "policy_bestoffset_top_offset_magnitude=%zu "
            "policy_bestoffset_top_offset_sign=%zu "
            "policy_bestoffset_top_score=%zu "
+           "policy_wtinylfu_window_chunks=%zu "
+           "policy_wtinylfu_probation_chunks=%zu "
+           "policy_wtinylfu_protected_chunks=%zu "
+           "policy_wtinylfu_window_evictions=%zu "
+           "policy_wtinylfu_main_admission_rejected=%zu "
+           "policy_wtinylfu_victim_score_rejected=%zu "
            "max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
@@ -4467,6 +4488,12 @@ int main(int argc, char** argv) {
            policy_bestoffset_top_offset_magnitude,
            policy_bestoffset_top_offset_sign,
            policy_bestoffset_top_score,
+           policy_wtinylfu_window_chunks,
+           policy_wtinylfu_probation_chunks,
+           policy_wtinylfu_protected_chunks,
+           policy_wtinylfu_window_evictions,
+           policy_wtinylfu_main_admission_rejected,
+           policy_wtinylfu_victim_score_rejected,
            after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,

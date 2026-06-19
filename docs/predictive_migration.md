@@ -147,9 +147,16 @@ runtime strategy:
   predictor for stable sparse spatial access inside fixed chunk groups.
 - `tinylfu`, `tiny-lfu`, or `sketch-lfu`: compact Count-Min-style admission
   classifier trained only by demand-observed chunk touches.
+- `wtinylfu`, `w-tinylfu`, `window-tinylfu`, or `window-tiny-lfu`: W-TinyLFU
+  approximation with demand-trained sketch admission, a small recency window,
+  prefetch probation, and protected demand-confirmed chunks.
 - `best-offset`, `bestoffset`, `offset`, or `offset-prefetch`: demand-trained
   top-offset prefetcher for recurring non-adjacent chunk offsets.
 
+For `wtinylfu`, `MAI_POLICY_WTINYLFU_WINDOW_PERCENT=N` controls the target
+window share of resident capacity. The default is 25. Demand faults always
+populate; speculative prefetches must carry Markov/stream confidence and, under
+pressure, must beat the victim score unless the victim is unused/probationary.
 For `best-offset`, `MAI_POLICY_BEST_OFFSET_MIN_CHUNKS=N` can exclude nearby
 offsets from training and candidate emission. The default `0` uses the current
 `MAI_UFFD_PREFETCH_CHUNKS` window as the floor, keeping adjacent chunks in the
@@ -176,6 +183,9 @@ recent/frequent resident and ghost chunk counts, recent/frequent ghost hits,
 target movement, and second-chance scans through `policy_car_*` counters.
 TinyLFU reports sketch updates, sketch decays, sketch admission rejects, and
 the current minimum admission score through `policy_tinylfu_*` counters.
+W-TinyLFU reuses the TinyLFU sketch counters and reports current
+window/probation/protected chunk counts, window evictions, main-admission
+rejects, and victim-score rejects through `policy_wtinylfu_*` counters.
 Best-offset reports training samples, validated training hits, created offset
 slots, score decays, emitted candidates, rejected candidates,
 unused-prefetch penalties, and the top learned forward offset through
@@ -255,6 +265,7 @@ default performance mode.
 | LIRS | Protect chunks with low inter-reference recency and demote high inter-reference recency chunks even if they were touched recently by a scan. | Simulator/reference first; exact LIRS stack metadata is still too heavy for the initial C runtime. |
 | Sequential readahead | Detect monotonic chunk faults and adapt the forward window with additive increase and multiplicative decrease from accuracy feedback. Admit only while headroom and budget permit. | Implemented as `stream` in first form. |
 | Stride and multi-stream | Track several `{last, delta, confidence, window}` streams per allocation. Admit only after repeated deltas. Evict chunks far behind active streams. | Implemented as `stride` in first form. |
+| W-TinyLFU / prefetch-aware replacement | Combine a small recency window, sketch admission, probationary prefetches, protected demand-confirmed chunks, and throttle-raised admission margins. | Implemented as `wtinylfu`/`window-tinylfu`. Local guardrails show it sharply reduces unused prefetch evictions and lowers long-tail write traffic, but it raises demand events and hot-evicted bytes on current pressure probes; experimental only. |
 | Best-offset and multi-lookahead offset | Score candidate offsets by later demand hits. Prefetch the highest-confidence forward offset, not necessarily the next chunk. Penalize unused offset-prefetch evictions and apply pressure admission before displacing resident chunks. | Implemented as `best-offset`/`offset-prefetch`, an experimental top-1 offset predictor. Corrected local results show it can reduce worst-case speculative traffic versus legacy-style prefetch, but dense footprints can make it learn nearby incidental offsets instead of the intended lagged offset; it does not beat conservative stream/markov rows on throughput or migration volume. |
 | Markov and delta-correlation | Keep one bounded successor edge per chunk. Admit only repeated high-confidence successors, and require stronger confidence under resident pressure. | Implemented as `markov`/`successor` in first form; no fanout or chaining yet. |
 | Signature/history-table | Use rolling delta signatures to predict multi-step sequences. Confidence controls depth and admission. | Later; best paired with a global budget and quick decay. |

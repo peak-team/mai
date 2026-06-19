@@ -86,6 +86,7 @@
 #define MAI_POLICY_BEST_OFFSET_DECAY_INTERVAL 256
 #define MAI_POLICY_BEST_OFFSET_MAX_SCORE 255
 #define MAI_POLICY_BEST_OFFSET_MIN_SCORE 6
+#define MAI_POLICY_WTINYLFU_WINDOW_PERCENT 25
 #define MAI_HUGEPAGE_SIZE (2ULL * 1024ULL * 1024ULL)
 #define MAI_ACCESS_TRACE_RETIRED_GRACE_NS (10ULL * 1000ULL * 1000ULL)
 
@@ -150,7 +151,8 @@ typedef enum {
     MIGRATION_POLICY_LRUK,
     MIGRATION_POLICY_CAR,
     MIGRATION_POLICY_TINYLFU,
-    MIGRATION_POLICY_BEST_OFFSET
+    MIGRATION_POLICY_BEST_OFFSET,
+    MIGRATION_POLICY_WTINYLFU
 } MigrationPolicy;
 
 enum {
@@ -168,7 +170,10 @@ enum {
     MAI_POLICY_STATE_CAR_RECENT = 1,
     MAI_POLICY_STATE_CAR_FREQUENT = 2,
     MAI_POLICY_STATE_CAR_RECENT_GHOST = 3,
-    MAI_POLICY_STATE_CAR_FREQUENT_GHOST = 4
+    MAI_POLICY_STATE_CAR_FREQUENT_GHOST = 4,
+    MAI_POLICY_STATE_WTINYLFU_WINDOW = 5,
+    MAI_POLICY_STATE_WTINYLFU_PROBATION = 6,
+    MAI_POLICY_STATE_WTINYLFU_PROTECTED = 7
 };
 
 enum {
@@ -527,6 +532,8 @@ static size_t uffd_scratch_length = 0;
 static size_t migration_chunk_bytes = MAI_DEFAULT_MIGRATION_CHUNK_BYTES;
 static size_t uffd_prefetch_chunks = MAI_DEFAULT_UFFD_PREFETCH_CHUNKS;
 static size_t policy_best_offset_min_chunks = 0;
+static size_t policy_wtinylfu_window_percent =
+    MAI_POLICY_WTINYLFU_WINDOW_PERCENT;
 static size_t record_protect_epochs = MAI_DEFAULT_RECORD_PROTECT_EPOCHS;
 static size_t active_record_epochs = MAI_DEFAULT_ACTIVE_RECORD_EPOCHS;
 static size_t active_record_slack_chunks =
@@ -1118,6 +1125,13 @@ static int parse_migration_policy_env(const char* value,
         strcmp(value, "tiny-lfu") == 0 ||
         strcmp(value, "sketch-lfu") == 0) {
         *out = MIGRATION_POLICY_TINYLFU;
+        return 0;
+    }
+    if (strcmp(value, "wtinylfu") == 0 ||
+        strcmp(value, "w-tinylfu") == 0 ||
+        strcmp(value, "window-tinylfu") == 0 ||
+        strcmp(value, "window-tiny-lfu") == 0) {
+        *out = MIGRATION_POLICY_WTINYLFU;
         return 0;
     }
     if (strcmp(value, "best-offset") == 0 ||
@@ -4579,6 +4593,11 @@ static size_t policy_tinylfu_score_locked(AllocationRecord* record,
     return policy_tinylfu_score_key_locked(policy_tinylfu_key(record, index));
 }
 
+static int policy_uses_tinylfu_sketch_locked(void) {
+    return migration_policy == MIGRATION_POLICY_TINYLFU ||
+        migration_policy == MIGRATION_POLICY_WTINYLFU;
+}
+
 static void policy_tinylfu_decay_locked(void) {
     for (size_t row = 0; row < MAI_POLICY_TINYLFU_ROWS; row++) {
         for (size_t slot = 0; slot < MAI_POLICY_TINYLFU_WIDTH; slot++) {
@@ -4593,7 +4612,7 @@ static void policy_tinylfu_note_touch_locked(AllocationRecord* record,
                                              size_t index,
                                              MaiChunkPolicyMeta* meta) {
     (void)meta;
-    if (migration_policy != MIGRATION_POLICY_TINYLFU || !record) {
+    if (!policy_uses_tinylfu_sketch_locked() || !record) {
         return;
     }
     uint64_t key = policy_tinylfu_key(record, index);
@@ -4624,6 +4643,134 @@ static int policy_tinylfu_candidate_class(MaiChunkPolicyMeta* meta) {
 
 static size_t policy_tinylfu_min_score_locked(void) {
     return 1 + policy_adaptive_throttle_level;
+}
+
+static size_t policy_wtinylfu_window_limit_locked(void) {
+    size_t limit = policy_resident_limit_chunks_locked();
+    if (limit == 0) {
+        return 1;
+    }
+    size_t percent = policy_wtinylfu_window_percent;
+    if (percent == 0) {
+        percent = MAI_POLICY_WTINYLFU_WINDOW_PERCENT;
+    }
+    if (percent > 90) {
+        percent = 90;
+    }
+    size_t window = (limit * percent + 99) / 100;
+    if (window == 0) {
+        window = 1;
+    }
+    if (window >= limit && limit > 1) {
+        window = limit - 1;
+    }
+    return window == 0 ? 1 : window;
+}
+
+static void policy_wtinylfu_count_states_locked(size_t* window,
+                                                size_t* probation,
+                                                size_t* protected) {
+    size_t window_count = 0;
+    size_t probation_count = 0;
+    size_t protected_count = 0;
+    for (AllocationRecord* record = uffd_head; record; record = record->uffd_next) {
+        if (!record->chunk_policy_meta || !record->chunk_states) {
+            continue;
+        }
+        for (size_t i = 0; i < record->chunk_count; i++) {
+            if (record->chunk_states[i] != CHUNK_ANON_HOT) {
+                continue;
+            }
+            uint16_t state = record->chunk_policy_meta[i].policy_state;
+            if (state == MAI_POLICY_STATE_WTINYLFU_WINDOW) {
+                window_count++;
+            } else if (state == MAI_POLICY_STATE_WTINYLFU_PROBATION) {
+                probation_count++;
+            } else if (state == MAI_POLICY_STATE_WTINYLFU_PROTECTED) {
+                protected_count++;
+            }
+        }
+    }
+    if (window) {
+        *window = window_count;
+    }
+    if (probation) {
+        *probation = probation_count;
+    }
+    if (protected) {
+        *protected = protected_count;
+    }
+}
+
+static void policy_wtinylfu_note_demand_locked(AllocationRecord* record,
+                                               size_t index,
+                                               MaiChunkPolicyMeta* meta) {
+    (void)record;
+    (void)index;
+    if (migration_policy != MIGRATION_POLICY_WTINYLFU || !meta) {
+        return;
+    }
+    size_t sketch_score = policy_tinylfu_score_locked(record, index, meta);
+    if (meta->policy_state == MAI_POLICY_STATE_WTINYLFU_PROBATION ||
+        (meta->flags & MAI_CHUNK_POLICY_PREFETCH_USED) != 0 ||
+        meta->frequency > 1 || sketch_score > 2) {
+        meta->policy_state = MAI_POLICY_STATE_WTINYLFU_PROTECTED;
+        meta->flags |= MAI_CHUNK_POLICY_PROTECTED;
+        meta->flags &= ~MAI_CHUNK_POLICY_PROBATION;
+    } else if (meta->policy_state != MAI_POLICY_STATE_WTINYLFU_PROTECTED) {
+        meta->policy_state = MAI_POLICY_STATE_WTINYLFU_WINDOW;
+        meta->flags &= ~MAI_CHUNK_POLICY_PROTECTED;
+    }
+}
+
+static void policy_wtinylfu_note_prefetch_locked(MaiChunkPolicyMeta* meta) {
+    if (migration_policy != MIGRATION_POLICY_WTINYLFU || !meta) {
+        return;
+    }
+    meta->policy_state = MAI_POLICY_STATE_WTINYLFU_PROBATION;
+    meta->flags |= MAI_CHUNK_POLICY_PROBATION;
+    meta->flags &= ~MAI_CHUNK_POLICY_PROTECTED;
+}
+
+static int policy_wtinylfu_victim_class(MaiChunkPolicyMeta* meta) {
+    if (policy_chunk_is_prefetched_unused(meta) ||
+        (meta && meta->policy_state == MAI_POLICY_STATE_WTINYLFU_PROBATION &&
+         (meta->flags & MAI_CHUNK_POLICY_PREFETCH_USED) == 0)) {
+        return 0;
+    }
+    if (!meta) {
+        return 1;
+    }
+    if (meta->policy_state == MAI_POLICY_STATE_WTINYLFU_WINDOW) {
+        return 1;
+    }
+    if (meta->policy_state == MAI_POLICY_STATE_WTINYLFU_PROTECTED ||
+        policy_chunk_is_demand_confirmed(meta)) {
+        return 3;
+    }
+    return 2;
+}
+
+static size_t policy_wtinylfu_prefetch_confidence_locked(
+    AllocationRecord* record,
+    size_t source_index,
+    size_t index) {
+    if (!record || index >= record->chunk_count) {
+        return 0;
+    }
+    if (record->chunk_policy_meta && source_index < record->chunk_count) {
+        MaiChunkPolicyMeta* source = &record->chunk_policy_meta[source_index];
+        if ((source->flags & MAI_CHUNK_POLICY_SUCCESSOR_VALID) != 0 &&
+            source->successor_index == index) {
+            return source->successor_confidence;
+        }
+    }
+    if (index == source_index + 1 && record->policy_last_delta == 1 &&
+        record->policy_run_length >= 2) {
+        return record->policy_run_length > UINT16_MAX ?
+            UINT16_MAX : record->policy_run_length;
+    }
+    return 0;
 }
 
 static int policy_index_add(size_t index, ptrdiff_t delta, size_t limit,
@@ -5153,6 +5300,7 @@ static void policy_note_demand_fault_locked(AllocationRecord* record,
     policy_lfu_note_touch_locked(meta);
     policy_car_note_demand_locked(meta);
     policy_tinylfu_note_touch_locked(record, index, meta);
+    policy_wtinylfu_note_demand_locked(record, index, meta);
     policy_bestoffset_note_demand_locked(record, index);
     size_t epoch = uffd_touch_epoch + 1;
     policy_lruk_note_touch_locked(meta, epoch);
@@ -5401,6 +5549,14 @@ static int policy_adaptive_prefetch_admissible_locked(AllocationRecord* record,
         return policy_tinylfu_score_locked(record, index, meta) >=
             policy_tinylfu_min_score_locked();
     }
+    if (migration_policy == MIGRATION_POLICY_WTINYLFU &&
+        record->chunk_policy_meta) {
+        size_t confidence =
+            policy_wtinylfu_prefetch_confidence_locked(record, source_index,
+                                                       index);
+        return confidence >=
+            (policy_adaptive_throttle_level >= 2 ? 4 : 3);
+    }
     if (migration_policy == MIGRATION_POLICY_LRUK && record->chunk_policy_meta) {
         MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
         int candidate_class = policy_lruk_candidate_class(meta);
@@ -5469,6 +5625,39 @@ static size_t policy_build_prefetch_indices_locked(AllocationRecord* record,
                policy_index_add(current, best->delta,
                                 record->chunk_count, &current)) {
             out[count++] = current;
+        }
+        return count;
+    }
+
+    if (migration_policy == MIGRATION_POLICY_WTINYLFU) {
+        size_t count = 0;
+        if (record->chunk_policy_meta) {
+            MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
+            size_t threshold =
+                policy_adaptive_throttle_level >= 2 ? 4 : 2;
+            if ((meta->flags & MAI_CHUNK_POLICY_SUCCESSOR_VALID) != 0 &&
+                meta->successor_confidence >= threshold &&
+                meta->successor_index < record->chunk_count &&
+                meta->successor_index != index) {
+                out[count++] = meta->successor_index;
+                return count;
+            }
+        }
+        if (record->policy_last_delta != 1 || record->policy_run_length < 2) {
+            return 0;
+        }
+        size_t stream_limit = limit;
+        size_t run_limit = record->policy_run_length;
+        if (stream_limit > run_limit) {
+            stream_limit = run_limit;
+        }
+        if (policy_adaptive_throttle_level >= 2 && stream_limit > 1) {
+            stream_limit = 1;
+        }
+        for (size_t offset = 1;
+             count < stream_limit && index + offset < record->chunk_count;
+             offset++) {
+            out[count++] = index + offset;
         }
         return count;
     }
@@ -5624,6 +5813,9 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
         stats_snapshot.policy_adaptive_admission_rejected++;
         if (migration_policy == MIGRATION_POLICY_TINYLFU) {
             stats_snapshot.policy_tinylfu_admission_rejected++;
+        } else if (migration_policy == MIGRATION_POLICY_WTINYLFU) {
+            stats_snapshot.policy_tinylfu_admission_rejected++;
+            stats_snapshot.policy_wtinylfu_main_admission_rejected++;
         } else if (migration_policy == MIGRATION_POLICY_BEST_OFFSET) {
             stats_snapshot.policy_bestoffset_pressure_rejected++;
         }
@@ -5690,6 +5882,60 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
                  margin == 0 && victim_class == 0);
         } else if (admit) {
             admit = candidate_score >= min_score;
+        }
+        if (!admit) {
+            stats_snapshot.policy_tinylfu_admission_rejected++;
+        }
+    } else if (migration_policy == MIGRATION_POLICY_WTINYLFU) {
+        MaiChunkPolicyMeta* candidate = record->chunk_policy_meta ?
+            &record->chunk_policy_meta[index] : NULL;
+        size_t confidence =
+            policy_wtinylfu_prefetch_confidence_locked(record, source_index,
+                                                       index);
+        size_t required_confidence =
+            policy_adaptive_throttle_level >= 2 ? 4 : 2;
+        if (confidence < required_confidence) {
+            admit = 0;
+            stats_snapshot.policy_wtinylfu_main_admission_rejected++;
+        }
+        int pressure = uffd_resident_limit_bytes != 0 &&
+            uffd_resident_bytes + length > uffd_resident_limit_bytes;
+        if (admit && pressure) {
+            size_t candidate_score =
+                policy_tinylfu_score_locked(record, index, candidate);
+            size_t min_score = policy_tinylfu_min_score_locked();
+            AllocationRecord* victim_record = NULL;
+            size_t victim_index = 0;
+            if (policy_peek_uffd_victim_locked(&victim_record, &victim_index,
+                                               protected_set) &&
+                victim_record && victim_record->chunk_policy_meta) {
+                MaiChunkPolicyMeta* victim =
+                    &victim_record->chunk_policy_meta[victim_index];
+                int victim_class = policy_wtinylfu_victim_class(victim);
+                size_t victim_score =
+                    policy_tinylfu_score_locked(victim_record, victim_index,
+                                                victim);
+                size_t margin = policy_adaptive_throttle_level;
+                if (victim_class >= 3) {
+                    margin += 2;
+                }
+                if (victim_class == 0) {
+                    admit = confidence >= required_confidence;
+                } else if (candidate_score < min_score) {
+                    admit = 0;
+                    stats_snapshot.policy_wtinylfu_main_admission_rejected++;
+                } else {
+                    admit = candidate_score > victim_score + margin;
+                    if (!admit) {
+                        stats_snapshot.policy_wtinylfu_victim_score_rejected++;
+                    }
+                }
+            } else {
+                admit = candidate_score >= min_score;
+                if (!admit) {
+                    stats_snapshot.policy_wtinylfu_main_admission_rejected++;
+                }
+            }
         }
         if (!admit) {
             stats_snapshot.policy_tinylfu_admission_rejected++;
@@ -5828,6 +6074,7 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
         meta->flags |= MAI_CHUNK_POLICY_PREFETCHED |
             MAI_CHUNK_POLICY_PROBATION;
         meta->last_prefetch_epoch = uffd_touch_epoch + 1;
+        policy_wtinylfu_note_prefetch_locked(meta);
         if (migration_policy == MIGRATION_POLICY_MARKOV &&
             record->chunk_policy_meta && source_index < record->chunk_count) {
             MaiChunkPolicyMeta* source = &record->chunk_policy_meta[source_index];
@@ -5941,6 +6188,7 @@ static void policy_note_resident_demand_locked(AllocationRecord* record,
     policy_lfu_note_touch_locked(meta);
     policy_car_note_resident_demand_locked(meta);
     policy_tinylfu_note_touch_locked(record, index, meta);
+    policy_wtinylfu_note_demand_locked(record, index, meta);
     policy_bestoffset_note_demand_locked(record, index);
     size_t epoch = uffd_touch_epoch + 1;
     policy_lruk_note_touch_locked(meta, epoch);
@@ -5967,6 +6215,10 @@ static void policy_note_evict_locked(AllocationRecord* record, size_t index,
                meta->frequency > 1) {
         stats_snapshot.policy_evicted_hot_bytes += length;
     }
+    if (migration_policy == MIGRATION_POLICY_WTINYLFU &&
+        meta->policy_state == MAI_POLICY_STATE_WTINYLFU_WINDOW) {
+        stats_snapshot.policy_wtinylfu_window_evictions++;
+    }
     size_t ghost_frequency = 0;
     size_t ghost_last_access_epoch = 0;
     size_t ghost_previous_access_epoch = 0;
@@ -5992,7 +6244,8 @@ static void policy_note_evict_locked(AllocationRecord* record, size_t index,
         }
     }
     int successor_valid =
-        (migration_policy == MIGRATION_POLICY_MARKOV &&
+        ((migration_policy == MIGRATION_POLICY_MARKOV ||
+          migration_policy == MIGRATION_POLICY_WTINYLFU) &&
          (meta->flags & MAI_CHUNK_POLICY_SUCCESSOR_VALID) != 0);
     size_t successor_index = meta->successor_index;
     uint16_t successor_confidence = meta->successor_confidence;
@@ -6044,10 +6297,9 @@ static void policy_note_promote_runtime_locked(AllocationRecord* record,
         stats_snapshot.policy_migration_read_bytes += length;
     }
     stats_snapshot.policy_promotions++;
-    pthread_mutex_unlock(&uffd_fault_lock);
-
     if (!record || index >= record->chunk_count ||
         !record->chunk_policy_meta) {
+        pthread_mutex_unlock(&uffd_fault_lock);
         return;
     }
     MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
@@ -6055,10 +6307,13 @@ static void policy_note_promote_runtime_locked(AllocationRecord* record,
         MAI_CHUNK_POLICY_PROTECTED | MAI_CHUNK_POLICY_REFERENCED;
     policy_lfu_note_touch_locked(meta);
     policy_car_note_resident_demand_locked(meta);
+    policy_tinylfu_note_touch_locked(record, index, meta);
+    policy_wtinylfu_note_demand_locked(record, index, meta);
     size_t epoch = reclaim_epoch + 1;
     policy_lruk_note_touch_locked(meta, epoch);
     meta->last_access_epoch = epoch;
     meta->first_resident_epoch = epoch;
+    pthread_mutex_unlock(&uffd_fault_lock);
 }
 
 static size_t policy_stall_bucket(size_t ns) {
@@ -6183,6 +6438,13 @@ static int policy_choose_uffd_victim_mode_locked(
         policy_car_clamp_target_locked();
         car_prefer_recent = recent_chunks > policy_car_target_recent_chunks;
     }
+    int wtinylfu_window_over_target = 0;
+    if (migration_policy == MIGRATION_POLICY_WTINYLFU) {
+        size_t window_chunks = 0;
+        policy_wtinylfu_count_states_locked(&window_chunks, NULL, NULL);
+        wtinylfu_window_over_target =
+            window_chunks > policy_wtinylfu_window_limit_locked();
+    }
 
     int passes = migration_policy == MIGRATION_POLICY_CAR ? 2 : 1;
     for (int pass = 0; pass < passes; pass++) {
@@ -6256,6 +6518,16 @@ static int policy_choose_uffd_victim_mode_locked(
                     candidate_class = policy_tinylfu_candidate_class(meta);
                     candidate_score =
                         policy_tinylfu_score_locked(record, i, meta);
+                } else if (migration_policy == MIGRATION_POLICY_WTINYLFU) {
+                    candidate_class = policy_wtinylfu_victim_class(meta);
+                    if (!wtinylfu_window_over_target && meta &&
+                        meta->policy_state ==
+                            MAI_POLICY_STATE_WTINYLFU_WINDOW &&
+                        candidate_class < 3) {
+                        candidate_class++;
+                    }
+                    candidate_score =
+                        policy_tinylfu_score_locked(record, i, meta);
                 } else if (migration_policy == MIGRATION_POLICY_BEST_OFFSET) {
                     candidate_class = policy_bestoffset_candidate_class(meta);
                     candidate_score = meta ? meta->confidence : 0;
@@ -6291,6 +6563,7 @@ static int policy_choose_uffd_victim_mode_locked(
                     (candidate_class == best_class &&
                      (migration_policy == MIGRATION_POLICY_LFU ||
                       migration_policy == MIGRATION_POLICY_TINYLFU ||
+                      migration_policy == MIGRATION_POLICY_WTINYLFU ||
                       migration_policy == MIGRATION_POLICY_BEST_OFFSET ||
                       migration_policy == MIGRATION_POLICY_LRUK ||
                       migration_policy == MIGRATION_POLICY_CAR ||
@@ -8100,8 +8373,14 @@ static void populate_stats_snapshot_locked(MaiStats* out) {
     out->policy_demand_fault_stall_max_ns = policy_fault_stall_max_ns;
     out->policy_adaptive_level = policy_adaptive_throttle_level;
     out->policy_tinylfu_min_score =
-        migration_policy == MIGRATION_POLICY_TINYLFU ?
+        policy_uses_tinylfu_sketch_locked() ?
         policy_tinylfu_min_score_locked() : 0;
+    if (migration_policy == MIGRATION_POLICY_WTINYLFU) {
+        policy_wtinylfu_count_states_locked(
+            &out->policy_wtinylfu_window_chunks,
+            &out->policy_wtinylfu_probation_chunks,
+            &out->policy_wtinylfu_protected_chunks);
+    }
     if (migration_policy == MIGRATION_POLICY_CAR) {
         policy_car_count_states_locked(&out->policy_car_recent_chunks,
                                        &out->policy_car_frequent_chunks,
@@ -9069,6 +9348,8 @@ static int configure_runtime(void) {
         getenv("MAI_SPATIAL_ADMIT_THRESHOLD");
     const char* best_offset_min =
         getenv("MAI_POLICY_BEST_OFFSET_MIN_CHUNKS");
+    const char* wtinylfu_window =
+        getenv("MAI_POLICY_WTINYLFU_WINDOW_PERCENT");
     const char* migration_policy_env = getenv("MAI_MIGRATION_POLICY");
     if (!migration_policy_env || migration_policy_env[0] == '\0') {
         migration_policy_env = getenv("MAI_POLICY");
@@ -9172,6 +9453,7 @@ static int configure_runtime(void) {
     migration_chunk_bytes = MAI_DEFAULT_MIGRATION_CHUNK_BYTES;
     uffd_prefetch_chunks = MAI_DEFAULT_UFFD_PREFETCH_CHUNKS;
     policy_best_offset_min_chunks = 0;
+    policy_wtinylfu_window_percent = MAI_POLICY_WTINYLFU_WINDOW_PERCENT;
     spatial_region_chunks = MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS;
     spatial_table_slots = MAI_POLICY_SPATIAL_DEFAULT_SLOTS;
     spatial_learn_threshold = MAI_POLICY_SPATIAL_DEFAULT_LEARN_THRESHOLD;
@@ -9322,6 +9604,11 @@ static int configure_runtime(void) {
     }
     if (best_offset_min &&
         parse_count_env(best_offset_min, &policy_best_offset_min_chunks) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (wtinylfu_window &&
+        parse_count_env(wtinylfu_window, &policy_wtinylfu_window_percent) != 0) {
         runtime_config_error = 1;
         return -1;
     }
@@ -9487,6 +9774,12 @@ static int configure_runtime(void) {
     }
     if (uffd_prefetch_chunks > MAI_MAX_UFFD_PREFETCH_CHUNKS) {
         uffd_prefetch_chunks = MAI_MAX_UFFD_PREFETCH_CHUNKS;
+    }
+    if (policy_wtinylfu_window_percent == 0) {
+        policy_wtinylfu_window_percent = MAI_POLICY_WTINYLFU_WINDOW_PERCENT;
+    }
+    if (policy_wtinylfu_window_percent > 90) {
+        policy_wtinylfu_window_percent = 90;
     }
     if (uffd_async_slack_chunks > MAI_MAX_UFFD_PREFETCH_CHUNKS) {
         uffd_async_slack_chunks = MAI_MAX_UFFD_PREFETCH_CHUNKS;

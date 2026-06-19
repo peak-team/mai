@@ -2925,7 +2925,8 @@ static int mode_uffd_pager_stride_policy(void) {
 
 static int mode_uffd_pager_hotset_scan_policy(const char* policy_name,
                                               int expect_car_activity,
-                                              int expect_tinylfu_activity) {
+                                              int expect_tinylfu_activity,
+                                              int expect_wtinylfu_activity) {
     MaiStats before;
     MaiStats after_touch;
     MaiStats after_free;
@@ -3046,6 +3047,34 @@ static int mode_uffd_pager_hotset_scan_policy(const char* policy_name,
             return fail("UFFD TinyLFU hotset test did not exercise sketch admission");
         }
     }
+    if (expect_wtinylfu_activity) {
+        size_t updates =
+            after_touch.policy_tinylfu_sketch_updates -
+            before.policy_tinylfu_sketch_updates;
+        size_t rejected =
+            after_touch.policy_wtinylfu_main_admission_rejected -
+            before.policy_wtinylfu_main_admission_rejected;
+        size_t state_chunks =
+            after_touch.policy_wtinylfu_window_chunks +
+            after_touch.policy_wtinylfu_probation_chunks +
+            after_touch.policy_wtinylfu_protected_chunks;
+        size_t victim_rejected =
+            after_touch.policy_wtinylfu_victim_score_rejected -
+            before.policy_wtinylfu_victim_score_rejected;
+        if (updates == 0 || rejected == 0 || victim_rejected == 0 ||
+            state_chunks == 0) {
+            fprintf(stderr,
+                    "W-TinyLFU hotset stats: updates=%zu rejected=%zu "
+                    "victim_rejected=%zu window=%zu probation=%zu "
+                    "protected=%zu\n",
+                    updates, rejected, victim_rejected,
+                    after_touch.policy_wtinylfu_window_chunks,
+                    after_touch.policy_wtinylfu_probation_chunks,
+                    after_touch.policy_wtinylfu_protected_chunks);
+            free(ptr);
+            return fail("UFFD W-TinyLFU hotset test did not exercise states");
+        }
+    }
 
     free(ptr);
     if (load_stats(&after_free) != 0) {
@@ -3059,19 +3088,23 @@ static int mode_uffd_pager_hotset_scan_policy(const char* policy_name,
 }
 
 static int mode_uffd_pager_lfu_hotset_scan(void) {
-    return mode_uffd_pager_hotset_scan_policy("LFU", 0, 0);
+    return mode_uffd_pager_hotset_scan_policy("LFU", 0, 0, 0);
 }
 
 static int mode_uffd_pager_lruk_hotset_scan(void) {
-    return mode_uffd_pager_hotset_scan_policy("LRU-K", 0, 0);
+    return mode_uffd_pager_hotset_scan_policy("LRU-K", 0, 0, 0);
 }
 
 static int mode_uffd_pager_car_hotset_scan(void) {
-    return mode_uffd_pager_hotset_scan_policy("CAR", 1, 0);
+    return mode_uffd_pager_hotset_scan_policy("CAR", 1, 0, 0);
 }
 
 static int mode_uffd_pager_tinylfu_hotset_scan(void) {
-    return mode_uffd_pager_hotset_scan_policy("TinyLFU", 0, 1);
+    return mode_uffd_pager_hotset_scan_policy("TinyLFU", 0, 1, 0);
+}
+
+static int mode_uffd_pager_wtinylfu_hotset_scan(void) {
+    return mode_uffd_pager_hotset_scan_policy("W-TinyLFU", 0, 1, 1);
 }
 
 static int mode_uffd_pager_bestoffset_policy(void) {
@@ -4597,6 +4630,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_tinylfu_hotset_scan") == 0) {
         return mode_uffd_pager_tinylfu_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_wtinylfu_hotset_scan") == 0) {
+        return mode_uffd_pager_wtinylfu_hotset_scan();
     }
     if (strcmp(argv[1], "uffd_pager_bestoffset_policy") == 0) {
         return mode_uffd_pager_bestoffset_policy();
