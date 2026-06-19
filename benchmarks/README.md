@@ -13,6 +13,50 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMAI_BUILD_BENCHMARKS=ON
 cmake --build build --target mai mai_benchmark mai_access_pattern_benchmark
 ```
 
+Run the retained no-oracle policy matrix with:
+
+```
+python3 benchmarks/policy_retained_matrix.py \
+  build/src/libmai.so \
+  build/benchmarks/mai_access_pattern_benchmark \
+  --output-dir policy-matrix-results
+```
+
+The runner writes `rows.ndjson`, `summary.csv`, and `summary.md`. Each row
+records the git SHA, dirty state, host kernel, build type, workload, scenario,
+policy, seed, repetition, runtime knobs, raw benchmark output, parsed metrics,
+and validation reasons. The default matrix includes the primary
+`policy_stream_pipeline` no-oracle workload plus long-tail admission,
+recency/frequency, and signature-context guardrails. Default policies are
+`legacy`, `markov`, `car`, `wtinylfu`, `hybrid`, `markov_adaptive`, and
+`hybrid_adaptive`; default seeds are `1,7,13,29,31,43`. The default sizes are
+developer guardrail sizes, not sufficient for memory-bandwidth claims.
+
+For every workload/seed/repetition, the runner records native sufficient,
+MAI pass-through, MAI managed sufficient, and policy-pressure rows. Pressure
+ratios are computed against the matching `mai_managed_sufficient` row. It does
+not call assisted range APIs or feed benchmark future-order variables into the
+runtime. Write-protect useful-prefetch observation defaults to off because it
+changes fault behavior; use `--observe-prefetch-writes 1` only when validating
+observed accuracy/coverage counters.
+
+For bandwidth claims, rerun the same matrix with working sets well beyond CPU
+cache, for example:
+
+```
+python3 benchmarks/policy_retained_matrix.py \
+  build/src/libmai.so \
+  build/benchmarks/mai_access_pattern_benchmark \
+  --output-dir policy-matrix-results-large \
+  --pipeline-matrix-size 128M \
+  --allocation-size 512M \
+  --resident-limit 384M \
+  --resident-low-limit 320M
+```
+
+For `policy_stream_pipeline`, choose a resident limit where three active
+matrices fit but all nine do not.
+
 Run sufficient-memory overhead benchmarks with:
 
 ```

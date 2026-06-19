@@ -428,6 +428,15 @@ guardrail rather than a spatial victory lap.
 
 ## Benchmarks
 
+Use `benchmarks/policy_retained_matrix.py` for retained policy comparisons.
+It records native sufficient, MAI pass-through, MAI managed sufficient, and
+policy-pressure rows for each workload, seed, and repetition, then computes
+pressure ratios against the matching sufficient-memory MAI row. The default
+matrix uses `policy_stream_pipeline` plus admission, recency/frequency, and
+context-sensitive guardrails without calling assisted range APIs. Its default
+sizes are developer guardrail sizes; rerun with matrix and allocation sizes
+well beyond CPU cache before using the results for bandwidth claims.
+
 The current local six-run comparison is retained in
 [`docs/policy_benchmark_results.md`](policy_benchmark_results.md). Re-run it
 before making host-independent performance claims.
