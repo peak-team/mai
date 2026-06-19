@@ -98,15 +98,32 @@ four group iterations, 64 MiB resident high watermark, and 48 MiB resident low
 watermark. The active triplet is 48 MiB and the full nine-matrix set is
 144 MiB.
 
-| Policy | End-to-end MiB/s | Kernel MiB/s | Demand faults | Read MiB | Write MiB | Unused prefetch evictions |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `legacy` | 8133 | 24277 | 48 | 240 | 336 | 126 |
-| `stream` | 7746 | 20539 | 158 | 280 | 364 | 54 |
-| `stride` | 6894 | 17626 | 138 | 346 | 432 | 107 |
-| `2q` | 6024 | 16479 | 137 | 534 | 630 | 202 |
-| `lfu` | 6957 | 14448 | 94 | 402 | 491 | 176 |
-| `markov` | 7825 | 23207 | 175 | 246 | 342 | 20 |
-| `spatial` | 7355 | 22477 | 113 | 296 | 380 | 86 |
+| Policy | End-to-end MiB/s | E2E SD | Kernel MiB/s | E2E/kernel | Demand faults | Read MiB | Write MiB | Unused prefetch evictions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `legacy` | 8133 | 691 | 24277 | 0.34 | 48 | 240 | 336 | 126 |
+| `stream` | 7746 | 258 | 20539 | 0.38 | 158 | 280 | 364 | 54 |
+| `stride` | 6894 | 257 | 17626 | 0.39 | 138 | 346 | 432 | 107 |
+| `2q` | 6024 | 261 | 16479 | 0.37 | 137 | 534 | 630 | 202 |
+| `lfu` | 6957 | 206 | 14448 | 0.48 | 94 | 402 | 491 | 176 |
+| `markov` | 7825 | 473 | 23207 | 0.34 | 175 | 246 | 342 | 20 |
+| `spatial` | 7355 | 454 | 22477 | 0.33 | 113 | 296 | 380 | 86 |
+
+### Low-Watermark Slack Probe
+
+These rows keep the same workload, resident high watermark, seed, and chunk
+size, but raise the low watermark from 48 MiB to 64 MiB. This preserves more
+headroom around the active 48 MiB triplet instead of reclaiming immediately
+back to the triplet size.
+
+| Policy | End-to-end MiB/s | E2E SD | Kernel MiB/s | E2E/kernel | Demand faults | Read MiB | Write MiB | Unused prefetch evictions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `legacy` | 8255 | 851 | 23477 | 0.35 | 48 | 240 | 320 | 120 |
+| `stream` | 6118 | 411 | 23523 | 0.26 | 186 | 592 | 672 | 179 |
+| `stride` | 6040 | 524 | 20804 | 0.29 | 182 | 642 | 722 | 206 |
+| `2q` | 8239 | 326 | 24475 | 0.34 | 168 | 240 | 320 | 24 |
+| `lfu` | 7527 | 377 | 19115 | 0.39 | 156 | 308 | 388 | 86 |
+| `markov` | 8452 | 427 | 25839 | 0.33 | 192 | 240 | 320 | 0 |
+| `spatial` | 5140 | 339 | 10629 | 0.48 | 443 | 970 | 1050 | 259 |
 
 ## Interpretation
 
@@ -121,11 +138,26 @@ watermark. The active triplet is 48 MiB and the full nine-matrix set is
   interleaved mixed-mask case shows higher prefetch traffic than `markov`.
 - `lfu` wins the current hotset scan event-rate row and ties `legacy` on lowest
   demand faults, but this remains workload-specific.
-- On the local six-run 9-matrix pressure shape, `legacy` is still the best of
-  the tested policies. It reaches only 22.9% of the matching MAI-managed
-  sufficient-memory end-to-end baseline. Its kernel throughput is higher, at
-  56.2% of the matching sufficient-memory kernel rate, so the main remaining
-  loss is end-to-end migration/fault overhead. That is the next design target.
+- On the local six-run 9-matrix pressure shape, `legacy` has the highest mean
+  end-to-end rate among the low-watermark 48 MiB rows. It reaches only 22.9%
+  of the matching MAI-managed sufficient-memory end-to-end baseline, while its
+  kernel-only loop reaches 56.2%. Because kernel rates exclude setup,
+  first-touch, and fault/migration costs, the largest visible gap is outside
+  the measured kernel loop. Demand-fault stall counters and migration counters
+  should be used before attributing the full gap to one policy mechanism.
+- Raising the low watermark to 64 MiB is a sensitivity probe, not a solved
+  policy or replacement headline.
+  It improves the best end-to-end row from `legacy` at 8133 MiB/s to `markov`
+  at 8452 MiB/s, and reduces the best write volume from 336 MiB to 320 MiB,
+  but the best tuned row still reaches only 23.8% of the MAI-managed
+  sufficient-memory end-to-end baseline. It also hurts `stream`, `stride`, and
+  `spatial`, so fixed extra slack is not enough without better admission,
+  eviction, and migration throttling.
+- A clean-shadow write-amplification experiment was attempted but rejected:
+  retaining storage shadows and using UFFD write-protect to avoid clean
+  write-back corrupted the successor-policy correctness workload. Any future
+  shadow-copy design needs explicit dirty-state tests before performance
+  benchmarking.
 - Write-protect observation is useful for lower-bound usefulness counters, but
   it changes fault behavior and should not be mixed with default performance
   rows.
