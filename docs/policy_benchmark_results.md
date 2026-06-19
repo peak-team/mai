@@ -4,7 +4,7 @@ These are local six-run means from the `predictive-migration-policy` branch on
 June 19, 2026. They are evidence for this host and build, not portable
 performance guarantees.
 
-Pressure rows use:
+Component pressure rows use:
 
 - `MAI_BACKEND=auto`
 - `MAI_UFFD_PAGER=required`
@@ -16,13 +16,14 @@ Pressure rows use:
 
 The policy-event workloads touch one byte per unit and report synthetic
 logical progress. Use their demand faults, migration bytes, prefetch counters,
-and relative event rate. Use `stream_bandwidth` and the 9-matrix STREAM
-pipeline for sustained bandwidth claims.
+and relative event rate. Use `stream_bandwidth` for pure sustained
+memory-bandwidth claims, and the 9-matrix STREAM pipeline for end-to-end
+STREAM-like migration throughput.
 
-This pressure matrix does not include pressure rows for the preferred
-`policy_stream_pipeline` 9-matrix workload. It is component evidence for
-individual predictors, not a final claim that MAI reaches the full no-oracle
-STREAM migration goal.
+The component pressure matrix is evidence for individual predictors. The
+9-matrix `policy_stream_pipeline` pressure rows below are the current
+end-to-end no-oracle migration check and show that the full STREAM migration
+goal is not solved yet.
 
 ## Sufficient Memory Baseline
 
@@ -39,6 +40,16 @@ matrix; policy-event probes use 64 MiB.
 | `policy_successor_cycle` | 232158 | 219497 | 0 / 0 |
 | `policy_spatial_region_mask` | 252283 | 258138 | 0 / 0 |
 | `policy_spatial_interleaved_mask` | 285182 | 246678 | 0 / 0 |
+
+For the matching 9-matrix pipeline shape used below
+(`policy_stream_pipeline 16M`, random no-repeat group order, four group
+iterations), sufficient-memory means were:
+
+| Scenario | End-to-end MiB/s | Kernel MiB/s | MAI migration read/write MiB |
+| --- | ---: | ---: | ---: |
+| native | 29409 | 39940 | 0 / 0 |
+| MAI pass-through | 33359 | 42384 | 0 / 0 |
+| MAI managed sufficient | 35551 | 43228 | 0 / 0 |
 
 ## Pressure Matrix
 
@@ -80,6 +91,23 @@ matrix; policy-event probes use 64 MiB.
 | `policy_spatial_interleaved_mask` | `markov` | 2117 | 67 | 116 | 125 | 3 |
 | `policy_spatial_interleaved_mask` | `spatial` | 1755 | 67 | 144 | 156 | 15 |
 
+## 9-Matrix Pipeline Pressure
+
+These rows use `policy_stream_pipeline 16M`, random no-repeat group order,
+four group iterations, 64 MiB resident high watermark, and 48 MiB resident low
+watermark. The active triplet is 48 MiB and the full nine-matrix set is
+144 MiB.
+
+| Policy | End-to-end MiB/s | Kernel MiB/s | Demand faults | Read MiB | Write MiB | Unused prefetch evictions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `legacy` | 8133 | 24277 | 48 | 240 | 336 | 126 |
+| `stream` | 7746 | 20539 | 158 | 280 | 364 | 54 |
+| `stride` | 6894 | 17626 | 138 | 346 | 432 | 107 |
+| `2q` | 6024 | 16479 | 137 | 534 | 630 | 202 |
+| `lfu` | 6957 | 14448 | 94 | 402 | 491 | 176 |
+| `markov` | 7825 | 23207 | 175 | 246 | 342 | 20 |
+| `spatial` | 7355 | 22477 | 113 | 296 | 380 | 86 |
+
 ## Interpretation
 
 - Sufficient-memory MAI does not trigger migration in these runs; faster
@@ -93,6 +121,11 @@ matrix; policy-event probes use 64 MiB.
   interleaved mixed-mask case shows higher prefetch traffic than `markov`.
 - `lfu` wins the current hotset scan event-rate row and ties `legacy` on lowest
   demand faults, but this remains workload-specific.
+- On the local six-run 9-matrix pressure shape, `legacy` is still the best of
+  the tested policies. It reaches only 22.9% of the matching MAI-managed
+  sufficient-memory end-to-end baseline. Its kernel throughput is higher, at
+  56.2% of the matching sufficient-memory kernel rate, so the main remaining
+  loss is end-to-end migration/fault overhead. That is the next design target.
 - Write-protect observation is useful for lower-bound usefulness counters, but
   it changes fault behavior and should not be mixed with default performance
   rows.
