@@ -1093,6 +1093,58 @@ set_tests_properties(mai_uffd_pager_successor_policy
     PROPERTIES SKIP_RETURN_CODE 77)
 
 add_test(
+    NAME mai_uffd_pager_successor_chain_policy
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=128M"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=32M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "MAI_UFFD_RESIDENT_LIMIT=16M"
+        "MAI_UFFD_RESIDENT_LOW_LIMIT=12M"
+        "MAI_UFFD_PREFETCH_CHUNKS=4"
+        "MAI_MIGRATION_CHUNK=2M"
+        "MAI_MIGRATION_POLICY=markov"
+        "MAI_POLICY_SUCCESSOR_CHAIN_DEPTH=2"
+        "MAI_EXPECT_SUCCESSOR_CHAIN=1"
+        "MAI_POLICY_OBSERVE_PREFETCH_WRITES=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_successor_policy
+)
+set_tests_properties(mai_uffd_pager_successor_chain_policy
+    PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
+    NAME mai_uffd_pager_wtinylfu_successor_chain_policy
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=128M"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=32M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "MAI_UFFD_RESIDENT_LIMIT=16M"
+        "MAI_UFFD_RESIDENT_LOW_LIMIT=12M"
+        "MAI_UFFD_PREFETCH_CHUNKS=4"
+        "MAI_MIGRATION_CHUNK=2M"
+        "MAI_MIGRATION_POLICY=wtinylfu"
+        "MAI_POLICY_SUCCESSOR_CHAIN_DEPTH=2"
+        "MAI_EXPECT_SUCCESSOR_CHAIN=1"
+        "MAI_POLICY_OBSERVE_PREFETCH_WRITES=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_successor_policy
+)
+set_tests_properties(mai_uffd_pager_wtinylfu_successor_chain_policy
+    PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
     NAME mai_uffd_pager_spatial_mask_policy
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"

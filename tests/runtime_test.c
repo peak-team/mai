@@ -3283,6 +3283,31 @@ static int mode_uffd_pager_successor_policy(void) {
         free(ptr);
         return fail("UFFD successor policy did not produce useful prefetches");
     }
+    if (getenv("MAI_EXPECT_SUCCESSOR_CHAIN")) {
+        size_t chain_candidates =
+            after_touch.policy_successor_chain_candidates -
+            before.policy_successor_chain_candidates;
+        if (chain_candidates == 0 ||
+            after_touch.policy_successor_chain_depth < 2) {
+            fprintf(stderr,
+                    "successor chain stats: candidates=%zu depth=%zu\n",
+                    chain_candidates,
+                    after_touch.policy_successor_chain_depth);
+            free(ptr);
+            return fail("UFFD successor chain did not emit candidates");
+        }
+    } else if (after_touch.policy_successor_chain_depth != 1 ||
+               after_touch.policy_successor_chain_candidates !=
+                   before.policy_successor_chain_candidates) {
+        fprintf(stderr,
+                "successor default chain stats: candidates_before=%zu "
+                "candidates_after=%zu depth=%zu\n",
+                before.policy_successor_chain_candidates,
+                after_touch.policy_successor_chain_candidates,
+                after_touch.policy_successor_chain_depth);
+        free(ptr);
+        return fail("UFFD successor default depth did not preserve one-step behavior");
+    }
 
     free(ptr);
     if (load_stats(&after_free) != 0) {

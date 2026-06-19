@@ -534,6 +534,7 @@ static size_t uffd_prefetch_chunks = MAI_DEFAULT_UFFD_PREFETCH_CHUNKS;
 static size_t policy_best_offset_min_chunks = 0;
 static size_t policy_wtinylfu_window_percent =
     MAI_POLICY_WTINYLFU_WINDOW_PERCENT;
+static size_t policy_successor_chain_depth = 1;
 static size_t record_protect_epochs = MAI_DEFAULT_RECORD_PROTECT_EPOCHS;
 static size_t active_record_epochs = MAI_DEFAULT_ACTIVE_RECORD_EPOCHS;
 static size_t active_record_slack_chunks =
@@ -5094,6 +5095,93 @@ static void policy_update_successor_locked(AllocationRecord* record,
     meta->successor_confidence = 1;
 }
 
+static size_t policy_successor_chain_min_confidence_locked(
+    AllocationRecord* record,
+    size_t source,
+    size_t target,
+    size_t* depth_out) {
+    if (depth_out) {
+        *depth_out = 0;
+    }
+    if (!record || !record->chunk_policy_meta ||
+        source >= record->chunk_count || target >= record->chunk_count ||
+        source == target) {
+        return 0;
+    }
+    size_t max_depth = policy_successor_chain_depth == 0 ?
+        1 : policy_successor_chain_depth;
+    size_t current = source;
+    size_t min_confidence = SIZE_MAX;
+    for (size_t depth = 1; depth <= max_depth; depth++) {
+        MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[current];
+        if ((meta->flags & MAI_CHUNK_POLICY_SUCCESSOR_VALID) == 0 ||
+            meta->successor_index >= record->chunk_count ||
+            meta->successor_index == current) {
+            return 0;
+        }
+        if (meta->successor_confidence == 0) {
+            return 0;
+        }
+        if ((size_t)meta->successor_confidence < min_confidence) {
+            min_confidence = meta->successor_confidence;
+        }
+        current = meta->successor_index;
+        if (current == target) {
+            if (depth_out) {
+                *depth_out = depth;
+            }
+            return min_confidence == SIZE_MAX ? 0 : min_confidence;
+        }
+        if (current == source) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static size_t policy_successor_chain_emit_locked(AllocationRecord* record,
+                                                 size_t index,
+                                                 size_t min_confidence,
+                                                 size_t limit,
+                                                 size_t* out) {
+    if (!record || !record->chunk_policy_meta || !out || limit == 0) {
+        return 0;
+    }
+    size_t max_depth = policy_successor_chain_depth == 0 ?
+        1 : policy_successor_chain_depth;
+    size_t count = 0;
+    size_t current = index;
+    for (size_t depth = 1; depth <= max_depth && count < limit; depth++) {
+        MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[current];
+        if ((meta->flags & MAI_CHUNK_POLICY_SUCCESSOR_VALID) == 0 ||
+            meta->successor_index >= record->chunk_count ||
+            meta->successor_index == current ||
+            meta->successor_confidence < min_confidence) {
+            break;
+        }
+        size_t next = meta->successor_index;
+        if (next == index) {
+            break;
+        }
+        int duplicate = 0;
+        for (size_t i = 0; i < count; i++) {
+            if (out[i] == next) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (duplicate) {
+            break;
+        }
+        out[count++] = next;
+        if (depth > 1) {
+            stats_snapshot.policy_successor_chain_candidates++;
+        }
+        current = next;
+    }
+    return count;
+}
+
 static void policy_spatial_rebuild_mask_locked(MaiSpatialPolicyRegion* slot) {
     uint64_t learned = 0;
     for (size_t i = 0; i < spatial_region_chunks; i++) {
@@ -5493,10 +5581,14 @@ static int policy_adaptive_prefetch_admissible_locked(AllocationRecord* record,
     if (migration_policy == MIGRATION_POLICY_MARKOV && record->chunk_policy_meta &&
         source_index < record->chunk_count) {
         MaiChunkPolicyMeta* source = &record->chunk_policy_meta[source_index];
-        return (source->flags & MAI_CHUNK_POLICY_SUCCESSOR_VALID) != 0 &&
-            source->successor_index == index &&
-            source->successor_confidence >=
-                (policy_adaptive_throttle_level >= 2 ? 5 : 4);
+        size_t confidence =
+            (source->flags & MAI_CHUNK_POLICY_SUCCESSOR_VALID) != 0 &&
+            source->successor_index == index ?
+            source->successor_confidence :
+            policy_successor_chain_min_confidence_locked(record, source_index,
+                                                         index, NULL);
+        return confidence >=
+            (policy_adaptive_throttle_level >= 2 ? 5 : 4);
     }
     if (migration_policy == MIGRATION_POLICY_STRIDE) {
         for (size_t i = 0; i < MAI_POLICY_STREAM_SLOTS; i++) {
@@ -5554,6 +5646,12 @@ static int policy_adaptive_prefetch_admissible_locked(AllocationRecord* record,
         size_t confidence =
             policy_wtinylfu_prefetch_confidence_locked(record, source_index,
                                                        index);
+        if (confidence == 0) {
+            confidence =
+                policy_successor_chain_min_confidence_locked(record,
+                                                             source_index,
+                                                             index, NULL);
+        }
         return confidence >=
             (policy_adaptive_throttle_level >= 2 ? 4 : 3);
     }
@@ -5639,8 +5737,12 @@ static size_t policy_build_prefetch_indices_locked(AllocationRecord* record,
                 meta->successor_confidence >= threshold &&
                 meta->successor_index < record->chunk_count &&
                 meta->successor_index != index) {
-                out[count++] = meta->successor_index;
-                return count;
+                count = policy_successor_chain_emit_locked(record, index,
+                                                           threshold, limit,
+                                                           out);
+                if (count != 0) {
+                    return count;
+                }
             }
         }
         if (record->policy_last_delta != 1 || record->policy_run_length < 2) {
@@ -5738,8 +5840,7 @@ static size_t policy_build_prefetch_indices_locked(AllocationRecord* record,
             meta->successor_index == index) {
             return 0;
         }
-        out[0] = meta->successor_index;
-        return 1;
+        return policy_successor_chain_emit_locked(record, index, 2, limit, out);
     }
 
     if (migration_policy == MIGRATION_POLICY_SPATIAL) {
@@ -5806,6 +5907,16 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
     stats_snapshot.policy_admission_requests++;
 
     int admit = 1;
+    size_t successor_chain_depth = 0;
+    size_t successor_chain_confidence = 0;
+    if ((migration_policy == MIGRATION_POLICY_MARKOV ||
+         migration_policy == MIGRATION_POLICY_WTINYLFU) &&
+        record->chunk_policy_meta) {
+        successor_chain_confidence =
+            policy_successor_chain_min_confidence_locked(record, source_index,
+                                                         index,
+                                                         &successor_chain_depth);
+    }
     policy_adaptive_update_locked();
     if (!policy_adaptive_prefetch_admissible_locked(record, source_index, index)) {
         admit = 0;
@@ -5892,6 +6003,9 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
         size_t confidence =
             policy_wtinylfu_prefetch_confidence_locked(record, source_index,
                                                        index);
+        if (confidence == 0) {
+            confidence = successor_chain_confidence;
+        }
         size_t required_confidence =
             policy_adaptive_throttle_level >= 2 ? 4 : 2;
         if (confidence < required_confidence) {
@@ -6035,13 +6149,8 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
     } else if (migration_policy == MIGRATION_POLICY_MARKOV &&
                uffd_resident_limit_bytes != 0 &&
                uffd_resident_bytes + length > uffd_resident_limit_bytes) {
-        MaiChunkPolicyMeta* source = record->chunk_policy_meta &&
-            source_index < record->chunk_count ?
-            &record->chunk_policy_meta[source_index] : NULL;
-        if (!source ||
-            (source->flags & MAI_CHUNK_POLICY_SUCCESSOR_VALID) == 0 ||
-            source->successor_index != index ||
-            source->successor_confidence < 3) {
+        size_t confidence = successor_chain_confidence;
+        if (confidence < 3) {
             admit = 0;
         }
     } else if (migration_policy == MIGRATION_POLICY_SPATIAL &&
@@ -6064,6 +6173,9 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
         }
     }
     if (!admit) {
+        if (successor_chain_depth > 1) {
+            stats_snapshot.policy_successor_chain_rejected++;
+        }
         stats_snapshot.policy_admission_rejected++;
         return 0;
     }
@@ -8372,6 +8484,7 @@ static void populate_stats_snapshot_locked(MaiStats* out) {
         policy_stall_percentile_locked(99);
     out->policy_demand_fault_stall_max_ns = policy_fault_stall_max_ns;
     out->policy_adaptive_level = policy_adaptive_throttle_level;
+    out->policy_successor_chain_depth = policy_successor_chain_depth;
     out->policy_tinylfu_min_score =
         policy_uses_tinylfu_sketch_locked() ?
         policy_tinylfu_min_score_locked() : 0;
@@ -9350,6 +9463,8 @@ static int configure_runtime(void) {
         getenv("MAI_POLICY_BEST_OFFSET_MIN_CHUNKS");
     const char* wtinylfu_window =
         getenv("MAI_POLICY_WTINYLFU_WINDOW_PERCENT");
+    const char* successor_chain =
+        getenv("MAI_POLICY_SUCCESSOR_CHAIN_DEPTH");
     const char* migration_policy_env = getenv("MAI_MIGRATION_POLICY");
     if (!migration_policy_env || migration_policy_env[0] == '\0') {
         migration_policy_env = getenv("MAI_POLICY");
@@ -9454,6 +9569,7 @@ static int configure_runtime(void) {
     uffd_prefetch_chunks = MAI_DEFAULT_UFFD_PREFETCH_CHUNKS;
     policy_best_offset_min_chunks = 0;
     policy_wtinylfu_window_percent = MAI_POLICY_WTINYLFU_WINDOW_PERCENT;
+    policy_successor_chain_depth = 1;
     spatial_region_chunks = MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS;
     spatial_table_slots = MAI_POLICY_SPATIAL_DEFAULT_SLOTS;
     spatial_learn_threshold = MAI_POLICY_SPATIAL_DEFAULT_LEARN_THRESHOLD;
@@ -9609,6 +9725,11 @@ static int configure_runtime(void) {
     }
     if (wtinylfu_window &&
         parse_count_env(wtinylfu_window, &policy_wtinylfu_window_percent) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (successor_chain &&
+        parse_count_env(successor_chain, &policy_successor_chain_depth) != 0) {
         runtime_config_error = 1;
         return -1;
     }
@@ -9774,6 +9895,12 @@ static int configure_runtime(void) {
     }
     if (uffd_prefetch_chunks > MAI_MAX_UFFD_PREFETCH_CHUNKS) {
         uffd_prefetch_chunks = MAI_MAX_UFFD_PREFETCH_CHUNKS;
+    }
+    if (policy_successor_chain_depth == 0) {
+        policy_successor_chain_depth = 1;
+    }
+    if (policy_successor_chain_depth > MAI_MAX_UFFD_PREFETCH_CHUNKS) {
+        policy_successor_chain_depth = MAI_MAX_UFFD_PREFETCH_CHUNKS;
     }
     if (policy_wtinylfu_window_percent == 0) {
         policy_wtinylfu_window_percent = MAI_POLICY_WTINYLFU_WINDOW_PERCENT;

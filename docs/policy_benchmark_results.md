@@ -91,6 +91,31 @@ iterations), sufficient-memory means were:
 | `policy_spatial_interleaved_mask` | `markov` | 2117 | 67 | 116 | 125 | 3 |
 | `policy_spatial_interleaved_mask` | `spatial` | 1755 | 67 | 144 | 156 | 15 |
 
+### Successor-Chain Timeliness Probe
+
+`MAI_POLICY_SUCCESSOR_CHAIN_DEPTH=2` lets `markov` follow a learned successor
+path beyond the immediate next chunk. It is opt-in and keeps normal
+one-successor behavior at the default depth of 1.
+
+These six-run means use `policy_successor_cycle 64M`, 2 MiB chunks, an 8 MiB
+resident high watermark, a 6 MiB low watermark, and `MAI_MAX_RSS=16M`.
+
+| Policy | Events/s | Demand events | Prefetches | Useful | Late events | Unused evictions | Read MiB | Write MiB | Hot-evicted MiB | Chain candidates | Chain rejects | Chain depth |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `legacy` | 931 | 174 | 144 | 0 | 174 | 143 | 572 | 630 | 344 | 0 | 0 | 1 |
+| `markov` | 1550 | 160 | 32 | 0 | 160 | 32 | 320 | 376 | 312 | 0 | 0 | 1 |
+| `markov-chain2` | 1546 | 160 | 32 | 0 | 160 | 32 | 320 | 376 | 312 | 0 | 0 | 2 |
+| `markov-chain2-observe` | 1590 | 160 | 61 | 29 | 131 | 31 | 320 | 377 | 314 | 0 | 0 | 2 |
+
+Depth-2 successor lookahead does not improve the observation-off row: it emits
+no deeper candidates and behaves like the current `markov` policy. With
+write-protect prefetch observation enabled, useful immediate-successor
+prefetches appear and late events fall, but the chain-candidate counter remains
+zero. That row is therefore evidence that write-protect observation improves
+successor training, not evidence that deeper chain lookahead is effective yet.
+The remaining timeliness problem is learning deeper successor confidence
+without depending on write-protect observation.
+
 ## 9-Matrix Pipeline Pressure
 
 These rows use `policy_stream_pipeline 16M`, random no-repeat group order,
@@ -437,6 +462,11 @@ or multi-lookahead scoring before this policy can be promoted.
   the only pressure row here that approaches its sufficient-memory baseline.
 - `markov` is the best current irregular-transition policy on
   `policy_successor_cycle`.
+- `markov` successor-chain depth 2 is implemented as an opt-in timeliness
+  probe, but the observation-off benchmark currently behaves the same as
+  one-step Markov. The write-protect row shows useful immediate-successor
+  prefetches with zero deeper-chain candidates, so this is not a default
+  performance win.
 - `spatial` reduces demand faults on both spatial workloads, but the
   interleaved mixed-mask case shows higher prefetch traffic than `markov`.
 - `lfu` wins the current hotset scan event-rate row and ties `legacy` on lowest

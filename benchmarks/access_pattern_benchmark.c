@@ -4256,6 +4256,14 @@ int main(int argc, char** argv) {
     size_t policy_wtinylfu_victim_score_rejected = after_stats_available ?
         after.policy_wtinylfu_victim_score_rejected -
         before.policy_wtinylfu_victim_score_rejected : 0;
+    size_t policy_successor_chain_candidates = after_stats_available ?
+        after.policy_successor_chain_candidates -
+        before.policy_successor_chain_candidates : 0;
+    size_t policy_successor_chain_rejected = after_stats_available ?
+        after.policy_successor_chain_rejected -
+        before.policy_successor_chain_rejected : 0;
+    size_t policy_successor_chain_depth = after_stats_available ?
+        after.policy_successor_chain_depth : 0;
     const char* policy_prefetch_observation =
         after_stats_available && after.policy_prefetch_observation != 0 ?
         "write_protect" : "unobserved";
@@ -4363,6 +4371,9 @@ int main(int argc, char** argv) {
            "policy_wtinylfu_window_evictions=%zu "
            "policy_wtinylfu_main_admission_rejected=%zu "
            "policy_wtinylfu_victim_score_rejected=%zu "
+           "policy_successor_chain_candidates=%zu "
+           "policy_successor_chain_rejected=%zu "
+           "policy_successor_chain_depth=%zu "
            "max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
@@ -4494,6 +4505,9 @@ int main(int argc, char** argv) {
            policy_wtinylfu_window_evictions,
            policy_wtinylfu_main_admission_rejected,
            policy_wtinylfu_victim_score_rejected,
+           policy_successor_chain_candidates,
+           policy_successor_chain_rejected,
+           policy_successor_chain_depth,
            after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,

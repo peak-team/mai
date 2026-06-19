@@ -173,6 +173,8 @@ Runtime policy knobs are intentionally separate from benchmark knobs:
 - `MAI_UFFD_RESIDENT_LIMIT` and `MAI_UFFD_RESIDENT_LOW_LIMIT`: resident
   high/low watermarks for UFFD-managed chunks
 - `MAI_MIGRATION_CHUNK`: chunk size used for migration and policy metadata
+- `MAI_POLICY_SUCCESSOR_CHAIN_DEPTH`: opt-in successor-chain lookahead depth
+  for `markov` and `wtinylfu`; default 1 preserves one-successor behavior
 - `MAI_SPATIAL_REGION_CHUNKS`: chunk count per spatial region-mask group
 - `MAI_SPATIAL_TABLE_SLOTS`: maximum active spatial region masks per
   allocation, default 64 and max 64

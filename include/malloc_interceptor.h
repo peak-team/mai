@@ -157,6 +157,9 @@ typedef struct {
     size_t policy_wtinylfu_window_evictions;
     size_t policy_wtinylfu_main_admission_rejected;
     size_t policy_wtinylfu_victim_score_rejected;
+    size_t policy_successor_chain_candidates;
+    size_t policy_successor_chain_rejected;
+    size_t policy_successor_chain_depth;
 } MaiStats;
 
 /**
