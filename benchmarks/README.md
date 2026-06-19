@@ -164,11 +164,16 @@ Runtime policy knobs are intentionally separate from benchmark knobs:
 
 - `MAI_MIGRATION_POLICY` or `MAI_POLICY`: `legacy`, `lru`, `clock`, `fifo`,
   `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, or
-  `markov`/`successor`
+  `markov`/`successor`, or `spatial`/`spatial-mask`
 - `MAI_UFFD_PREFETCH_CHUNKS`: maximum UFFD prefetch lookahead
 - `MAI_UFFD_RESIDENT_LIMIT` and `MAI_UFFD_RESIDENT_LOW_LIMIT`: resident
   high/low watermarks for UFFD-managed chunks
 - `MAI_MIGRATION_CHUNK`: chunk size used for migration and policy metadata
+- `MAI_SPATIAL_REGION_CHUNKS`: chunk count per spatial region-mask group
+- `MAI_SPATIAL_TABLE_SLOTS`: maximum active spatial region masks per
+  allocation, default 64 and max 64
+- `MAI_SPATIAL_LEARN_THRESHOLD` and `MAI_SPATIAL_ADMIT_THRESHOLD`: confidence
+  thresholds for mask learning and pressure admission
 - `MAI_POLICY_OBSERVE_PREFETCH_WRITES=1`: opt-in write-protect observation for
   useful-prefetch metrics on write-heavy workloads
 
@@ -177,7 +182,7 @@ Policy pressure scenarios can use `mai_policy_pipeline` with
 `mai_policy_stream_pipeline`, `mai_policy_clock_pipeline`, or
 `mai_policy_2q_pipeline`. The runtime accepts `legacy`, `lru`, `clock`,
 `fifo`, `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, and
-`markov`/`successor`.
+`markov`/`successor`, and `spatial`/`spatial-mask`.
 
 `policy_multistream_stride` is a focused no-oracle workload for stride
 predictors. It walks fixed-size units inside one allocation as independent
@@ -212,6 +217,35 @@ On the local 64M allocation / 16M resident-limit smoke shape, `markov`
 reduced demand faults versus `stride` and modestly improved sampled-unit rate
 when write-protect observation was disabled. Enable observation only when you
 need useful-prefetch accounting, because it changes fault behavior.
+
+`policy_spatial_region_mask` is a policy-event workload for region-mask
+predictors. It divides one allocation into eight-unit regions and repeatedly
+touches the same sparse offset mask inside each region, while rotating and
+reversing the in-region order so adjacent, stride, and one-successor predictors
+do not receive the same signal. Control it with
+`MAI_BENCH_POLICY_SPATIAL_UNIT`, `MAI_BENCH_POLICY_SPATIAL_REGION_UNITS`,
+and `MAI_BENCH_POLICY_PASSES`. `policy_spatial_interleaved_mask` is the harder
+guardrail: it interleaves regions and, at region widths of four chunks or
+larger, gives alternating regions different masks so a single allocation-wide
+mask would overfetch.
+
+Spatial-mask learning sees demand faults and optional write-protect faults, not
+all CPU reads. A resident prefetched read can help throughput without increasing
+observed usefulness. Table capacity is also finite; run
+`policy_spatial_interleaved_mask` with a deliberately small
+`MAI_SPATIAL_TABLE_SLOTS` setting when checking region churn behavior.
+
+These rows touch one byte per unit, so `logical_mib_per_sec` is synthetic
+logical progress, not sustained memory bandwidth. On the local 64M allocation /
+16M resident-limit shape with write-protect observation disabled, six-run
+means on `policy_spatial_region_mask` were: `spatial` 73 demand faults,
+170 MiB migration reads, 182 MiB migration writes, and 2204 logical MiB/s;
+`stream` 96 faults, 168/180 MiB, and 3144 logical MiB/s; `markov` 95 faults,
+174/186 MiB, and 2867 logical MiB/s. On
+`policy_spatial_interleaved_mask`, `spatial` and `markov` both reduced demand
+faults versus `stream` (67.0 and 67.3 versus 71.0), but `spatial` paid more
+prefetch traffic. Treat this as evidence about fault reduction and pollution,
+not a standalone throughput win.
 
 Benchmark-only knobs keep the `MAI_BENCH_` prefix. Source policy tests reject
 `MAI_BENCH_*` and `MAI_STREAM_*` references from runtime source files so MAI

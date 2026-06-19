@@ -88,4 +88,48 @@ if(BUILD_TESTING)
     set_tests_properties(mai_policy_successor_cycle_smoke PROPERTIES
         PASS_REGULAR_EXPRESSION "mode=policy_successor_cycle .*logical_mib=128\\.000 .*stream_pipeline_group_visits=2 .*stream_pipeline_groups=16 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=successor_cycle .*stream_pipeline_prediction=successor"
     )
+
+    add_test(
+        NAME mai_policy_spatial_region_mask_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_POLICY_PASSES=2"
+            "MAI_BENCH_POLICY_SPATIAL_UNIT=2M"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            policy_spatial_region_mask
+            32M
+    )
+    set_tests_properties(mai_policy_spatial_region_mask_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=policy_spatial_region_mask .*logical_mib=48\\.000 .*stream_pipeline_group_visits=3 .*stream_pipeline_groups=2 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=spatial_region_mask .*stream_pipeline_prediction=spatial"
+    )
+
+    add_test(
+        NAME mai_policy_spatial_interleaved_mask_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_POLICY_PASSES=2"
+            "MAI_BENCH_POLICY_SPATIAL_UNIT=2M"
+            "MAI_BENCH_POLICY_SPATIAL_REGION_UNITS=8"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            policy_spatial_interleaved_mask
+            32M
+    )
+    set_tests_properties(mai_policy_spatial_interleaved_mask_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=policy_spatial_interleaved_mask .*logical_mib=48\\.000 .*stream_pipeline_group_visits=3 .*stream_pipeline_groups=2 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=spatial_interleaved_mask .*stream_pipeline_prediction=spatial"
+    )
+
+    add_test(
+        NAME mai_policy_spatial_interleaved_small_width_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_POLICY_PASSES=2"
+            "MAI_BENCH_POLICY_SPATIAL_UNIT=2M"
+            "MAI_BENCH_POLICY_SPATIAL_REGION_UNITS=4"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            policy_spatial_interleaved_mask
+            32M
+    )
+    set_tests_properties(mai_policy_spatial_interleaved_small_width_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=policy_spatial_interleaved_mask .*logical_mib=96\\.000 .*stream_pipeline_group_visits=3 .*stream_pipeline_groups=4 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=spatial_interleaved_mask .*stream_pipeline_prediction=spatial"
+    )
 endif()

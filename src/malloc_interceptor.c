@@ -58,6 +58,12 @@
 #define MAI_MAX_UFFD_PREFETCH_CHUNKS 16
 #define MAI_POLICY_STALL_HIST_BUCKETS 64
 #define MAI_POLICY_STREAM_SLOTS 4
+#define MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS 8
+#define MAI_POLICY_SPATIAL_MAX_REGION_CHUNKS 64
+#define MAI_POLICY_SPATIAL_DEFAULT_SLOTS 64
+#define MAI_POLICY_SPATIAL_MAX_SLOTS 64
+#define MAI_POLICY_SPATIAL_DEFAULT_LEARN_THRESHOLD 1
+#define MAI_POLICY_SPATIAL_DEFAULT_ADMIT_THRESHOLD 1
 #define MAI_HUGEPAGE_SIZE (2ULL * 1024ULL * 1024ULL)
 #define MAI_ACCESS_TRACE_RETIRED_GRACE_NS (10ULL * 1000ULL * 1000ULL)
 
@@ -117,7 +123,8 @@ typedef enum {
     MIGRATION_POLICY_STRIDE,
     MIGRATION_POLICY_2Q,
     MIGRATION_POLICY_LFU,
-    MIGRATION_POLICY_MARKOV
+    MIGRATION_POLICY_MARKOV,
+    MIGRATION_POLICY_SPATIAL
 } MigrationPolicy;
 
 enum {
@@ -222,6 +229,16 @@ typedef struct {
     int active;
 } MaiStreamPolicySlot;
 
+typedef struct {
+    size_t region;
+    size_t last_epoch;
+    size_t touches_in_cycle;
+    uint64_t observed_mask;
+    uint64_t learned_mask;
+    uint8_t scores[MAI_POLICY_SPATIAL_MAX_REGION_CHUNKS];
+    int active;
+} MaiSpatialPolicyRegion;
+
 struct ArenaBlock {
     size_t offset;
     size_t size;
@@ -278,11 +295,15 @@ struct AllocationRecord {
     size_t resident_bytes;
     size_t policy_clock_hand;
     size_t policy_last_fault_index;
+    size_t policy_previous_fault_index;
     int policy_has_last_fault;
+    int policy_has_previous_fault;
     ptrdiff_t policy_last_delta;
     size_t policy_run_length;
     size_t policy_prefetch_window;
     MaiStreamPolicySlot policy_stream_slots[MAI_POLICY_STREAM_SLOTS];
+    MaiSpatialPolicyRegion
+        policy_spatial_regions[MAI_POLICY_SPATIAL_MAX_SLOTS];
     int uffd_registered;
     int uffd_closing;
     ArenaSegment* segment;
@@ -418,6 +439,13 @@ static void* uffd_scratch_buffer = NULL;
 static size_t uffd_scratch_length = 0;
 static size_t migration_chunk_bytes = MAI_DEFAULT_MIGRATION_CHUNK_BYTES;
 static size_t uffd_prefetch_chunks = MAI_DEFAULT_UFFD_PREFETCH_CHUNKS;
+static size_t spatial_region_chunks =
+    MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS;
+static size_t spatial_table_slots = MAI_POLICY_SPATIAL_DEFAULT_SLOTS;
+static size_t spatial_learn_threshold =
+    MAI_POLICY_SPATIAL_DEFAULT_LEARN_THRESHOLD;
+static size_t spatial_admit_threshold =
+    MAI_POLICY_SPATIAL_DEFAULT_ADMIT_THRESHOLD;
 static size_t file_dedicated_min_bytes = MAI_DEFAULT_FILE_DEDICATED_MIN_BYTES;
 static int profile_enabled = 0;
 static int hotness_enabled = 0;
@@ -955,6 +983,12 @@ static int parse_migration_policy_env(const char* value,
         *out = MIGRATION_POLICY_MARKOV;
         return 0;
     }
+    if (strcmp(value, "spatial") == 0 ||
+        strcmp(value, "spatial-mask") == 0 ||
+        strcmp(value, "region-mask") == 0) {
+        *out = MIGRATION_POLICY_SPATIAL;
+        return 0;
+    }
     return -1;
 }
 
@@ -975,7 +1009,9 @@ static int init_record_policy_meta_locked(AllocationRecord* record) {
     memset(record->chunk_policy_meta, 0, meta_bytes);
     record->policy_clock_hand = 0;
     record->policy_has_last_fault = 0;
+    record->policy_has_previous_fault = 0;
     record->policy_last_fault_index = 0;
+    record->policy_previous_fault_index = 0;
     record->policy_last_delta = 0;
     record->policy_run_length = 0;
     record->policy_prefetch_window = 0;
@@ -3296,6 +3332,7 @@ static AllocationRecord* carve_block_locked(ArenaBlock* block, size_t user_size,
         meta_free(suffix_block);
         return NULL;
     }
+    memset(record, 0, sizeof(*record));
 
     if (prefix_block) {
         prefix_block->offset = block->offset;
@@ -4131,12 +4168,121 @@ static void policy_update_successor_locked(AllocationRecord* record,
     meta->successor_confidence = 1;
 }
 
+static void policy_spatial_rebuild_mask_locked(MaiSpatialPolicyRegion* slot) {
+    uint64_t learned = 0;
+    for (size_t i = 0; i < spatial_region_chunks; i++) {
+        if (slot->scores[i] >= spatial_learn_threshold) {
+            learned |= 1ULL << i;
+        }
+    }
+    slot->learned_mask = learned;
+}
+
+static void policy_spatial_finalize_cycle_locked(MaiSpatialPolicyRegion* slot) {
+    if (!slot || !slot->active || slot->touches_in_cycle == 0) {
+        return;
+    }
+
+    uint64_t mask = slot->observed_mask;
+    for (size_t i = 0; i < spatial_region_chunks; i++) {
+        uint64_t bit = 1ULL << i;
+        if ((mask & bit) != 0) {
+            if (slot->scores[i] < UINT8_MAX) {
+                slot->scores[i]++;
+            }
+        } else if (slot->scores[i] > 0) {
+            slot->scores[i]--;
+        }
+    }
+    slot->observed_mask = 0;
+    slot->touches_in_cycle = 0;
+    policy_spatial_rebuild_mask_locked(slot);
+}
+
+static MaiSpatialPolicyRegion*
+policy_spatial_find_region_locked(AllocationRecord* record, size_t region,
+                                  int create) {
+    if (!record) {
+        return NULL;
+    }
+
+    MaiSpatialPolicyRegion* victim = &record->policy_spatial_regions[0];
+    for (size_t i = 0; i < spatial_table_slots; i++) {
+        MaiSpatialPolicyRegion* slot = &record->policy_spatial_regions[i];
+        if (slot->active && slot->region == region) {
+            return slot;
+        }
+        if (!slot->active) {
+            victim = slot;
+            if (create) {
+                break;
+            }
+        } else if (slot->last_epoch < victim->last_epoch) {
+            victim = slot;
+        }
+    }
+
+    if (!create) {
+        return NULL;
+    }
+
+    memset(victim, 0, sizeof(*victim));
+    victim->active = 1;
+    victim->region = region;
+    victim->last_epoch = uffd_touch_epoch + 1;
+    return victim;
+}
+
+static void policy_update_spatial_locked(AllocationRecord* record,
+                                         size_t index) {
+    if (!record || migration_policy != MIGRATION_POLICY_SPATIAL ||
+        spatial_region_chunks == 0) {
+        return;
+    }
+
+    size_t region = index / spatial_region_chunks;
+    size_t offset = index % spatial_region_chunks;
+    MaiSpatialPolicyRegion* slot =
+        policy_spatial_find_region_locked(record, region, 1);
+    if (!slot) {
+        return;
+    }
+
+    slot->observed_mask |= 1ULL << offset;
+    slot->touches_in_cycle++;
+    slot->last_epoch = uffd_touch_epoch + 1;
+    if (slot->touches_in_cycle >= spatial_region_chunks) {
+        policy_spatial_finalize_cycle_locked(slot);
+    }
+}
+
+static size_t policy_spatial_score_locked(AllocationRecord* record,
+                                          size_t index) {
+    if (!record || migration_policy != MIGRATION_POLICY_SPATIAL ||
+        spatial_region_chunks == 0) {
+        return 0;
+    }
+
+    size_t region = index / spatial_region_chunks;
+    size_t offset = index % spatial_region_chunks;
+    MaiSpatialPolicyRegion* slot =
+        policy_spatial_find_region_locked(record, region, 0);
+    if (!slot || (slot->learned_mask & (1ULL << offset)) == 0) {
+        return 0;
+    }
+    return slot->scores[offset];
+}
+
 static void policy_update_stream_slots_locked(AllocationRecord* record,
                                               size_t index) {
     if (!record) {
         return;
     }
 
+    int had_previous = record->policy_has_last_fault;
+    size_t previous_index = record->policy_last_fault_index;
+
+    policy_update_spatial_locked(record, index);
     policy_update_successor_locked(record, index);
 
     ptrdiff_t observed_delta = 0;
@@ -4206,6 +4352,8 @@ static void policy_update_stream_slots_locked(AllocationRecord* record,
         record->policy_run_length = 1;
         record->policy_last_delta = 0;
     }
+    record->policy_has_previous_fault = had_previous;
+    record->policy_previous_fault_index = previous_index;
     record->policy_last_fault_index = index;
 }
 
@@ -4310,6 +4458,49 @@ static size_t policy_build_prefetch_indices_locked(AllocationRecord* record,
         return 1;
     }
 
+    if (migration_policy == MIGRATION_POLICY_SPATIAL) {
+        size_t region = index / spatial_region_chunks;
+        size_t offset = index % spatial_region_chunks;
+        MaiSpatialPolicyRegion* slot =
+            policy_spatial_find_region_locked(record, region, 0);
+        if (!slot) {
+            return 0;
+        }
+        uint64_t current_bit = 1ULL << offset;
+        uint64_t mask = slot->learned_mask;
+        if ((mask & current_bit) == 0 ||
+            slot->scores[offset] < spatial_learn_threshold) {
+            return 0;
+        }
+        if (uffd_resident_limit_bytes != 0 && limit > 1) {
+            int same_region_transition = 0;
+            if (record->policy_has_previous_fault) {
+                same_region_transition =
+                    record->policy_previous_fault_index /
+                    spatial_region_chunks == region;
+            }
+            if (!same_region_transition) {
+                limit = 1;
+            }
+        }
+        size_t region_start = region * spatial_region_chunks;
+        size_t count = 0;
+        for (size_t step = 1;
+             step < spatial_region_chunks && count < limit;
+             step++) {
+            size_t i = (offset + step) % spatial_region_chunks;
+            uint64_t bit = 1ULL << i;
+            size_t candidate = region_start + i;
+            if ((mask & bit) == 0 || candidate == index ||
+                candidate >= record->chunk_count ||
+                slot->scores[i] < spatial_learn_threshold) {
+                continue;
+            }
+            out[count++] = candidate;
+        }
+        return count;
+    }
+
     size_t count = 0;
     for (size_t offset = 1;
          count < limit && index + offset < record->chunk_count;
@@ -4370,6 +4561,24 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
             source->successor_confidence < 3) {
             admit = 0;
         }
+    } else if (migration_policy == MIGRATION_POLICY_SPATIAL &&
+               uffd_resident_limit_bytes != 0 &&
+               uffd_resident_bytes + length > uffd_resident_limit_bytes) {
+        size_t source_region = source_index / spatial_region_chunks;
+        size_t target_region = index / spatial_region_chunks;
+        size_t source_offset = source_index % spatial_region_chunks;
+        size_t target_offset = index % spatial_region_chunks;
+        uint64_t source_bit = 1ULL << source_offset;
+        uint64_t target_bit = 1ULL << target_offset;
+        MaiSpatialPolicyRegion* slot =
+            policy_spatial_find_region_locked(record, source_region, 0);
+        if (source_region != target_region || !slot ||
+            (slot->learned_mask & source_bit) == 0 ||
+            (slot->learned_mask & target_bit) == 0 ||
+            slot->scores[source_offset] < spatial_admit_threshold ||
+            slot->scores[target_offset] < spatial_admit_threshold) {
+            admit = 0;
+        }
     }
     if (!admit) {
         stats_snapshot.policy_admission_rejected++;
@@ -4389,6 +4598,13 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
         } else {
             meta->confidence = record->policy_run_length > UINT16_MAX ?
                 UINT16_MAX : (uint16_t)record->policy_run_length;
+        }
+        if (migration_policy == MIGRATION_POLICY_SPATIAL) {
+            size_t target_region = index / spatial_region_chunks;
+            size_t target_offset = index % spatial_region_chunks;
+            MaiSpatialPolicyRegion* slot =
+                policy_spatial_find_region_locked(record, target_region, 0);
+            meta->confidence = slot ? slot->scores[target_offset] : 0;
         }
     }
     return 1;
@@ -4622,21 +4838,27 @@ static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
                 continue;
             }
 
-            int candidate_class =
-                (migration_policy == MIGRATION_POLICY_LFU) ?
-                policy_lfu_candidate_class(meta) :
-                ((migration_policy != MIGRATION_POLICY_LEGACY &&
-                  policy_chunk_is_prefetched_unused(meta)) ? 0 : 1);
-            size_t candidate_score =
-                migration_policy == MIGRATION_POLICY_LFU ?
-                policy_lfu_score_locked(meta) : 0;
+            size_t spatial_score = policy_spatial_score_locked(record, i);
+            int candidate_class = 1;
+            size_t candidate_score = 0;
+            if (migration_policy == MIGRATION_POLICY_LFU) {
+                candidate_class = policy_lfu_candidate_class(meta);
+                candidate_score = policy_lfu_score_locked(meta);
+            } else if (migration_policy == MIGRATION_POLICY_SPATIAL) {
+                candidate_class = spatial_score == 0 ? 0 : 1;
+                candidate_score = spatial_score;
+            } else if (migration_policy != MIGRATION_POLICY_LEGACY &&
+                       policy_chunk_is_prefetched_unused(meta)) {
+                candidate_class = 0;
+            }
             if (migration_policy == MIGRATION_POLICY_FIFO && meta &&
                 meta->first_resident_epoch != 0) {
                 epoch = meta->first_resident_epoch;
             }
             if (!best_record || candidate_class < best_class ||
                 (candidate_class == best_class &&
-                 migration_policy == MIGRATION_POLICY_LFU &&
+                 (migration_policy == MIGRATION_POLICY_LFU ||
+                  migration_policy == MIGRATION_POLICY_SPATIAL) &&
                  candidate_score < best_score) ||
                 (candidate_class == best_class &&
                  candidate_score == best_score && epoch < best_epoch)) {
@@ -6886,6 +7108,13 @@ static int configure_runtime(void) {
         getenv("MAI_UFFD_RESIDENT_LOW_LIMIT");
     const char* uffd_prefetch = getenv("MAI_UFFD_PREFETCH_CHUNKS");
     const char* migration_chunk = getenv("MAI_MIGRATION_CHUNK");
+    const char* spatial_region =
+        getenv("MAI_SPATIAL_REGION_CHUNKS");
+    const char* spatial_slots = getenv("MAI_SPATIAL_TABLE_SLOTS");
+    const char* spatial_learn =
+        getenv("MAI_SPATIAL_LEARN_THRESHOLD");
+    const char* spatial_admit =
+        getenv("MAI_SPATIAL_ADMIT_THRESHOLD");
     const char* migration_policy_env = getenv("MAI_MIGRATION_POLICY");
     if (!migration_policy_env || migration_policy_env[0] == '\0') {
         migration_policy_env = getenv("MAI_POLICY");
@@ -6957,6 +7186,10 @@ static int configure_runtime(void) {
     atomic_store_explicit(&background_heartbeat_stop, 0, memory_order_relaxed);
     migration_chunk_bytes = MAI_DEFAULT_MIGRATION_CHUNK_BYTES;
     uffd_prefetch_chunks = MAI_DEFAULT_UFFD_PREFETCH_CHUNKS;
+    spatial_region_chunks = MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS;
+    spatial_table_slots = MAI_POLICY_SPATIAL_DEFAULT_SLOTS;
+    spatial_learn_threshold = MAI_POLICY_SPATIAL_DEFAULT_LEARN_THRESHOLD;
+    spatial_admit_threshold = MAI_POLICY_SPATIAL_DEFAULT_ADMIT_THRESHOLD;
     file_dedicated_min_bytes = MAI_DEFAULT_FILE_DEDICATED_MIN_BYTES;
 
     memset(&stats_snapshot, 0, sizeof(stats_snapshot));
@@ -7105,6 +7338,26 @@ static int configure_runtime(void) {
         runtime_config_error = 1;
         return -1;
     }
+    if (spatial_region &&
+        parse_count_env(spatial_region, &spatial_region_chunks) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (spatial_slots &&
+        parse_count_env(spatial_slots, &spatial_table_slots) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (spatial_learn &&
+        parse_count_env(spatial_learn, &spatial_learn_threshold) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (spatial_admit &&
+        parse_count_env(spatial_admit, &spatial_admit_threshold) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
     if (migration_policy_env &&
         parse_migration_policy_env(migration_policy_env,
                                    &migration_policy) != 0) {
@@ -7241,6 +7494,30 @@ static int configure_runtime(void) {
     if (migration_chunk_bytes == 0) {
         runtime_config_error = 1;
         return -1;
+    }
+    if (spatial_region_chunks < 2) {
+        spatial_region_chunks = 2;
+    }
+    if (spatial_region_chunks > MAI_POLICY_SPATIAL_MAX_REGION_CHUNKS) {
+        spatial_region_chunks = MAI_POLICY_SPATIAL_MAX_REGION_CHUNKS;
+    }
+    if (spatial_table_slots == 0) {
+        spatial_table_slots = 1;
+    }
+    if (spatial_table_slots > MAI_POLICY_SPATIAL_MAX_SLOTS) {
+        spatial_table_slots = MAI_POLICY_SPATIAL_MAX_SLOTS;
+    }
+    if (spatial_learn_threshold == 0) {
+        spatial_learn_threshold = 1;
+    }
+    if (spatial_learn_threshold > UINT8_MAX) {
+        spatial_learn_threshold = UINT8_MAX;
+    }
+    if (spatial_admit_threshold == 0) {
+        spatial_admit_threshold = 1;
+    }
+    if (spatial_admit_threshold > UINT8_MAX) {
+        spatial_admit_threshold = UINT8_MAX;
     }
     if (max_rss_enabled && max_rss_auto) {
         max_rss_bytes = detect_auto_max_rss_bytes(sample_process_rss_bytes());

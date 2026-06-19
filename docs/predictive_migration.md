@@ -139,6 +139,8 @@ runtime strategy:
   victim selection baseline.
 - `markov`, `successor`, or `successor-table`: one-successor transition
   predictor for repeated irregular chunk order.
+- `spatial`, `spatial-mask`, or `region-mask`: per-allocation region-mask
+  predictor for stable sparse spatial access inside fixed chunk groups.
 
 All policies share append-only `MaiStats` counters for prefetch requests,
 admissions, completions, useful prefetches, late demand faults, unused-prefetch
@@ -173,7 +175,7 @@ observed lower bounds unless the row says
 | Best-offset and multi-lookahead offset | Score candidate offsets by later demand hits. Prefetch the highest-confidence offsets, not necessarily the next chunk. | Useful for blocked and stencil-like patterns after stream baselines. |
 | Markov and delta-correlation | Keep one bounded successor edge per chunk. Admit only repeated high-confidence successors, and require stronger confidence under resident pressure. | Implemented as `markov`/`successor` in first form; no fanout or chaining yet. |
 | Signature/history-table | Use rolling delta signatures to predict multi-step sequences. Confidence controls depth and admission. | Later; best paired with a global budget and quick decay. |
-| Spatial region masks | Divide allocations into fixed chunk regions and learn stable touched masks. On first fault in a region, prefetch the historically useful mask. | Good fit for MAI chunks; planned after stride. |
+| Spatial region masks | Divide allocations into fixed chunk regions and learn stable touched masks. A small tagged region table lets interleaved regions keep separate masks. Under pressure, same-region transitions may prefetch a learned mask, while inter-region transitions prefetch conservatively to limit pollution. | Implemented as `spatial`/`spatial-mask`; tune width, table slots, and confidence with `MAI_SPATIAL_REGION_CHUNKS`, `MAI_SPATIAL_TABLE_SLOTS`, `MAI_SPATIAL_LEARN_THRESHOLD`, and `MAI_SPATIAL_ADMIT_THRESHOLD`. |
 | TinyLFU and frequency sketches | Use a compact approximate frequency sketch for admission. Compare candidate score against victim score to prevent pollution. | Important for hot/cold classification under mixed scans. |
 | TPP/AutoNUMA-style tiering | Maintain high/low DRAM watermarks. Proactively demote cold chunks during quiet epochs, promote on demand, and keep headroom for new hot allocations. | Core design principle for MAI pressure handling. |
 | Nomad-style shadowing | Keep valid clean storage shadows after promotion until a write invalidates them. Clean demotion can then avoid rewriting the chunk. | High-value write-amplification reduction, not yet implemented. |
@@ -255,6 +257,35 @@ Current local smoke results show `markov` reducing demand faults versus
 `stride` on this workload without increasing migration volume, with the best
 throughput when write-protect observation is disabled. Observation mode is
 still useful for accuracy counters, but it changes the measured cost.
+`policy_spatial_region_mask` is the no-oracle sparse-region workload for
+`spatial`/`spatial-mask`. It touches a stable set of offsets inside each
+eight-unit region, but rotates and reverses in-region order across passes and
+regions so next-chunk, constant-stride, and one-successor predictors do not get
+the same signal. `policy_spatial_interleaved_mask` is the harder guardrail:
+regions are interleaved, and at region widths of four chunks or larger,
+alternating regions use different masks so a single allocation-wide mask would
+overfetch. These are policy-event probes;
+`logical_mib_per_sec` is synthetic logical progress because each unit touch
+samples one byte.
+
+Spatial-mask learning uses observed demand faults and optional write-protect
+faults, not every CPU load/store. A successful resident read hit may therefore
+be useful to the application without adding fresh spatial evidence. The tagged
+table also has finite capacity: if active regions exceed
+`MAI_SPATIAL_TABLE_SLOTS` (default 64, maximum 64), older masks churn and
+prefetch quality can fall sharply. Use the interleaved workload with a reduced
+table-slot setting to expose this cliff before claiming robustness on large
+allocations.
+
+On the local 64M allocation / 16M resident-limit shape with write-protect
+observation disabled, six-run means on `policy_spatial_region_mask` were:
+`spatial` 73 demand faults, 170 MiB migration reads, 182 MiB migration writes,
+and 2204 logical MiB/s; `stream` was 96 faults, 168/180 MiB, and 3144 logical
+MiB/s; `markov` was 95 faults, 174/186 MiB, and 2867 logical MiB/s. On
+`policy_spatial_interleaved_mask`, `spatial` and `markov` both reduced demand
+faults versus `stream` (67.0 and 67.3 versus 71.0), but `spatial` paid more
+prefetch traffic. This makes the interleaved workload a pollution/timeliness
+guardrail rather than a spatial victory lap.
 
 ## Benchmarks
 

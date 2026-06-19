@@ -1342,6 +1342,219 @@ static int run_policy_successor_cycle(unsigned char* buffer, size_t size,
     return 0;
 }
 
+static size_t spatial_region_units_env(void) {
+    return env_count("MAI_BENCH_POLICY_SPATIAL_REGION_UNITS", 8);
+}
+
+static size_t spatial_mask_units(size_t region_units) {
+    return region_units < 3 ? region_units : 3;
+}
+
+static size_t spatial_pattern_offset(size_t position, size_t pass,
+                                     size_t region, size_t region_units,
+                                     int mixed_masks) {
+    static const size_t offsets_a[] = {0, 3, 5};
+    static const size_t offsets_b[] = {1, 4, 7};
+    const size_t* offsets = offsets_a;
+    size_t count = sizeof(offsets_a) / sizeof(offsets_a[0]);
+    if (region_units >= 8 && mixed_masks && (region & 1u) != 0) {
+        offsets = offsets_b;
+    }
+    if (region_units < 8) {
+        count = spatial_mask_units(region_units);
+    }
+    size_t rotated = count == 0 ? 0 : (position + pass + region) % count;
+    if (((pass + region) & 1u) != 0) {
+        rotated = count - 1 - rotated;
+    }
+    if (region_units >= 8) {
+        return offsets[rotated];
+    }
+    if (mixed_masks && (region & 1u) != 0 && region_units > count) {
+        return (rotated + 1) % region_units;
+    }
+    return rotated;
+}
+
+static int run_policy_spatial_region_mask(unsigned char* buffer, size_t size,
+                                          uint64_t* checksum,
+                                          size_t* touches) {
+    const size_t region_units = spatial_region_units_env();
+    const size_t mask_units = spatial_mask_units(region_units);
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_SPATIAL_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t passes = env_count_compat("MAI_BENCH_POLICY_PASSES",
+                                     "MAI_BENCH_STREAM_PASSES", 3);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    size_t units = size / unit_bytes;
+    if (region_units < 2 || mask_units == 0 || units < region_units ||
+        units % region_units != 0) {
+        return -1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+    size_t regions = units / region_units;
+
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t region = 0; region < regions; region++) {
+            size_t region_base = region * region_units;
+            for (size_t position = 0; position < mask_units; position++) {
+                size_t unit = region_base +
+                    spatial_pattern_offset(position, pass, region,
+                                           region_units, 0);
+                size_t offset = unit * unit_bytes;
+                expected[unit]++;
+                buffer[offset] = expected[unit];
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+        for (size_t region = 0; region < regions; region++) {
+            size_t region_base = region * region_units;
+            for (size_t position = 0; position < mask_units; position++) {
+                size_t unit = region_base +
+                    spatial_pattern_offset(position, pass + 1, region,
+                                           region_units, 0);
+                size_t offset = unit * unit_bytes;
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "spatial_region_mask";
+    stream_pipeline_prediction_recorded = "spatial";
+    stream_pipeline_groups_recorded = regions;
+    stream_pipeline_group_visits_recorded = mask_units;
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_horizon_recorded = region_units;
+
+    free(expected);
+    return 0;
+}
+
+static int run_policy_spatial_interleaved_mask(unsigned char* buffer,
+                                               size_t size,
+                                               uint64_t* checksum,
+                                               size_t* touches) {
+    const size_t region_units = spatial_region_units_env();
+    const size_t mask_units = spatial_mask_units(region_units);
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_SPATIAL_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t passes = env_count_compat("MAI_BENCH_POLICY_PASSES",
+                                     "MAI_BENCH_STREAM_PASSES", 3);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    size_t units = size / unit_bytes;
+    if (region_units < 2 || mask_units == 0 || units < region_units ||
+        units % region_units != 0) {
+        return -1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+    size_t regions = units / region_units;
+
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t position = 0; position < mask_units; position++) {
+            for (size_t region = 0; region < regions; region++) {
+                size_t region_base = region * region_units;
+                size_t unit = region_base +
+                    spatial_pattern_offset(position, pass, region,
+                                           region_units, 1);
+                size_t offset = unit * unit_bytes;
+                expected[unit]++;
+                buffer[offset] = expected[unit];
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+        for (size_t position = 0; position < mask_units; position++) {
+            for (size_t region = 0; region < regions; region++) {
+                size_t region_base = region * region_units;
+                size_t unit = region_base +
+                    spatial_pattern_offset(position, pass + 1, region,
+                                           region_units, 1);
+                size_t offset = unit * unit_bytes;
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "spatial_interleaved_mask";
+    stream_pipeline_prediction_recorded = "spatial";
+    stream_pipeline_groups_recorded = regions;
+    stream_pipeline_group_visits_recorded = mask_units;
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_horizon_recorded = region_units;
+
+    free(expected);
+    return 0;
+}
+
 static int run_trace_chunks(unsigned char* buffer, size_t size,
                             uint64_t* checksum, size_t* touches) {
     if (load_trace_symbols() != 0) {
@@ -2956,7 +3169,8 @@ int main(int argc, char** argv) {
                 "stream_shared_file|stream_private_file|"
                 "stream_tiled_bandwidth|policy_stream_pipeline|"
                 "policy_multistream_stride|policy_hotset_scan|"
-                "policy_successor_cycle|"
+                "policy_successor_cycle|policy_spatial_region_mask|"
+                "policy_spatial_interleaved_mask|"
                 "stream_kernel_pipeline|"
                 "stream_kernel_pipeline_anon_mmap|"
                 "stream_kernel_pipeline_shared_file|"
@@ -3042,6 +3256,11 @@ int main(int argc, char** argv) {
         rc = run_policy_hotset_scan(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_successor_cycle") == 0) {
         rc = run_policy_successor_cycle(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_spatial_region_mask") == 0) {
+        rc = run_policy_spatial_region_mask(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_spatial_interleaved_mask") == 0) {
+        rc = run_policy_spatial_interleaved_mask(buffer, size, &checksum,
+                                                &touches);
     } else if (mode_uses_stream_kernel(argv[1])) {
         rc = run_stream_bandwidth(argv[1], buffer, size, &checksum, &touches);
     } else {
