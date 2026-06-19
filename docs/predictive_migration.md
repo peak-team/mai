@@ -246,10 +246,10 @@ reuses a small hot chunk set, scans colder chunks, and verifies whether policy
 counters show less prefetch pollution and migration traffic. It is the preferred
 first check for `2q` and `lfu`/`decayed-lfu`.
 Current local smoke results show `lfu` with write-protect observation reducing
-migration traffic versus `legacy` on this workload, but still trailing `2q` on
-this small shape. Without observation, this first exact per-chunk LFU roughly
-ties or trails the simpler policies. That result is expected and does not make
-`lfu` the default policy.
+migration traffic versus `legacy` on this workload. In the latest six-run
+policy matrix, observation-off `lfu` is competitive and wins the hotset scan
+event-rate row while tying `legacy` on lowest demand faults. Treat it as a
+workload-specific frequency-admission baseline, not a default policy.
 `policy_successor_cycle` is the no-oracle irregular-transition workload for
 `markov`/`successor`. It uses a deterministic successor cycle so simple
 next-chunk and constant-stride predictors do not receive the same signal.
@@ -288,6 +288,10 @@ prefetch traffic. This makes the interleaved workload a pollution/timeliness
 guardrail rather than a spatial victory lap.
 
 ## Benchmarks
+
+The current local six-run comparison is retained in
+[`docs/policy_benchmark_results.md`](policy_benchmark_results.md). Re-run it
+before making host-independent performance claims.
 
 Correctness tests stay deterministic:
 

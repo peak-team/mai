@@ -3,6 +3,8 @@
 Benchmarks are separate from correctness CI. They are intended to produce
 performance evidence for storage-backed MAI allocations under different access
 patterns, not to gate every commit with machine-dependent timing thresholds.
+The latest retained local policy comparison is in
+`docs/policy_benchmark_results.md`.
 
 Build benchmark utilities with:
 
@@ -202,10 +204,11 @@ then verifies the hot set. Control it with `MAI_BENCH_POLICY_HOTSET`,
 `MAI_BENCH_POLICY_SCAN_PASSES`. Use it to compare `2q` and `lfu` against
 legacy prefetch admission under the same resident limit.
 On the local 32M allocation / 8M resident-limit smoke shape, `lfu` with
-write-protect observation reduced migration traffic versus `legacy`, while
-`2q` remained as good or better on migration and sampled-unit throughput.
-Without observation, this first exact LFU roughly tied or trailed the simpler
-policies. Treat `lfu` as a frequency-admission baseline, not a default win.
+write-protect observation reduced migration traffic versus `legacy`. In the
+latest six-run policy matrix, observation-off `lfu` won the hotset scan
+event-rate row and tied `legacy` on lowest demand faults. Treat `lfu` as a
+frequency-admission baseline whose win is workload-specific, not a default
+policy.
 
 `policy_successor_cycle` is a no-oracle workload for repeated irregular
 transitions. It walks fixed-size units through an affine successor cycle, so
