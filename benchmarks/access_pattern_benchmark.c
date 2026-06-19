@@ -3418,6 +3418,19 @@ int main(int argc, char** argv) {
     size_t policy_async_prefetch_dropped = after_stats_available ?
         after.policy_async_prefetch_dropped -
         before.policy_async_prefetch_dropped : 0;
+    size_t policy_adaptive_windows = after_stats_available ?
+        after.policy_adaptive_windows - before.policy_adaptive_windows : 0;
+    size_t policy_adaptive_level = after_stats_available ?
+        after.policy_adaptive_level : 0;
+    size_t policy_adaptive_level_changes = after_stats_available ?
+        after.policy_adaptive_level_changes -
+        before.policy_adaptive_level_changes : 0;
+    size_t policy_adaptive_prefetch_capped = after_stats_available ?
+        after.policy_adaptive_prefetch_capped -
+        before.policy_adaptive_prefetch_capped : 0;
+    size_t policy_adaptive_admission_rejected = after_stats_available ?
+        after.policy_adaptive_admission_rejected -
+        before.policy_adaptive_admission_rejected : 0;
     const char* policy_prefetch_observation =
         after_stats_available && after.policy_prefetch_observation != 0 ?
         "write_protect" : "unobserved";
@@ -3485,6 +3498,11 @@ int main(int argc, char** argv) {
            "policy_async_prefetch_enqueued=%zu "
            "policy_async_prefetch_completed=%zu "
            "policy_async_prefetch_dropped=%zu "
+           "policy_adaptive_windows=%zu "
+           "policy_adaptive_level=%zu "
+           "policy_adaptive_level_changes=%zu "
+           "policy_adaptive_prefetch_capped=%zu "
+           "policy_adaptive_admission_rejected=%zu "
            "max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
@@ -3578,6 +3596,9 @@ int main(int argc, char** argv) {
            policy_async_prefetch_enqueued,
            policy_async_prefetch_completed,
            policy_async_prefetch_dropped,
+           policy_adaptive_windows, policy_adaptive_level,
+           policy_adaptive_level_changes, policy_adaptive_prefetch_capped,
+           policy_adaptive_admission_rejected,
            after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,

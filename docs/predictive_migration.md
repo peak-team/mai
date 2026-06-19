@@ -149,9 +149,13 @@ promotions. Async UFFD policy work also reports enqueued, completed, and
 dropped task counters. These counters are mechanism-derived and do not depend
 on benchmark scenario names.
 `policy_throttle_events` reports bounded-queue drops and resident-limit hard
-reclaim events. `policy_throttle_slept_ns` is reserved for a future
-bandwidth/stall-budget throttle; current policies use resident limits and
-migration chunk size but do not yet report active throttle sleeps.
+reclaim events. When `MAI_POLICY_ADAPTIVE_CONTROL=1` is enabled, adaptive
+behavior is also broken out into `policy_adaptive_windows`,
+`policy_adaptive_level`, `policy_adaptive_level_changes`,
+`policy_adaptive_prefetch_capped`, and
+`policy_adaptive_admission_rejected`. `policy_throttle_slept_ns` is reserved
+for a future bandwidth/stall-budget throttle; current policies reject or
+shrink speculative work instead of sleeping in the fault handler.
 
 `MAI_UFFD_ASYNC_PREFETCH=1` enables an experimental UFFD background policy
 worker. Demand faults are still resolved synchronously. The worker only moves
@@ -180,6 +184,16 @@ still workload-agnostic: the runtime only sees demand-fault recency, not
 benchmark group names or future access order. It defaults to zero because long
 active windows can preserve scan pollution and because raising the low
 watermark uses more DRAM headroom.
+
+`MAI_POLICY_ADAPTIVE_CONTROL=1` enables an opt-in feedback controller around
+prefetch admission and window size. It watches recent demand faults,
+unused-prefetch evictions, hot-evicted bytes, migration bytes, and
+demand-fault stall time. When speculation appears harmful, it first trims the
+prefetch window and then requires stronger predictor confidence before
+admission. It does not act on the `legacy` baseline because fixed next-block
+prefetch has no confidence model. Tune sensitivity with
+`MAI_POLICY_ADAPTIVE_WINDOW_FAULTS` and
+`MAI_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS`.
 
 Read-only usefulness of a UFFD-prefetched chunk is not directly observable
 without adding another faulting mechanism, because a successful prefetch avoids
@@ -210,6 +224,7 @@ observed lower bounds unless the row says
 | TPP/AutoNUMA-style tiering | Maintain high/low DRAM watermarks. Proactively demote cold chunks during quiet epochs, promote on demand, and keep headroom for new hot allocations. | Core design principle for MAI pressure handling. |
 | Record-aware demotion | Treat an allocation record as a coarse working-set unit. Under pressure, avoid demoting demand-confirmed chunks from records with recent faults, but still evict unused prefetched chunks first. | Implemented as opt-in `MAI_RECORD_PROTECT_EPOCHS`; useful as a tuning control, not a default. |
 | Active-record working-set control | Infer the active allocation-record set from demand faults. Coordinate admission, eviction, and the reclaim floor so active resident demand-confirmed chunks are not displaced by speculative prefetch or an overly tight low watermark. | Implemented as opt-in `MAI_ACTIVE_RECORD_EPOCHS` plus `MAI_ACTIVE_RECORD_SLACK_CHUNKS`; designed for phase-capture experiments such as the no-oracle 9-matrix pipeline. |
+| Adaptive admission/throttling | Treat prefetch, admission, eviction, and throttle as one loop. Recent pollution or stall pressure shrinks lookahead and raises confidence thresholds; useful or late-prefetch pressure relaxes them. | Implemented as opt-in `MAI_POLICY_ADAPTIVE_CONTROL`; currently useful for confidence-bearing policies such as `markov`, not for `legacy`. |
 | Nomad-style shadowing | Keep valid clean storage shadows after promotion until a write invalidates them. Clean demotion can then avoid rewriting the chunk. | High-value write-amplification reduction, not yet implemented. |
 | Application hints | Treat `mai_hint_range()`, `mai_prefetch()`, and `mai_prepare_write()` as confidence and intent signals, not commands that bypass budgets. | Supported primitives; not used by no-oracle claims. |
 | Queue-aware policies | Accept future ranges with deadlines from schedulers. Admission depends on whether migration can finish before the request executes. | Integration API candidate, separate from autonomous benchmarks. |

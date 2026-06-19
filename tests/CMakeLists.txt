@@ -688,6 +688,56 @@ set_tests_properties(mai_uffd_pager_active_record_prefetch_guard
     PROPERTIES SKIP_RETURN_CODE 77)
 
 add_test(
+    NAME mai_uffd_pager_adaptive_policy_throttle
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=64M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_RESIDENT_LIMIT=8M"
+        "MAI_UFFD_RESIDENT_LOW_LIMIT=4M"
+        "MAI_UFFD_PREFETCH_CHUNKS=4"
+        "MAI_MIGRATION_CHUNK=2M"
+        "MAI_MIGRATION_POLICY=markov"
+        "MAI_POLICY_ADAPTIVE_CONTROL=1"
+        "MAI_POLICY_ADAPTIVE_WINDOW_FAULTS=2"
+        "MAI_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS=1"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_adaptive_policy_throttle
+)
+set_tests_properties(mai_uffd_pager_adaptive_policy_throttle
+    PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
+    NAME mai_uffd_pager_adaptive_legacy_noop
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=64M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_RESIDENT_LIMIT=8M"
+        "MAI_UFFD_RESIDENT_LOW_LIMIT=4M"
+        "MAI_UFFD_PREFETCH_CHUNKS=4"
+        "MAI_MIGRATION_CHUNK=2M"
+        "MAI_MIGRATION_POLICY=legacy"
+        "MAI_POLICY_ADAPTIVE_CONTROL=1"
+        "MAI_POLICY_ADAPTIVE_WINDOW_FAULTS=2"
+        "MAI_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS=1"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_adaptive_legacy_noop
+)
+set_tests_properties(mai_uffd_pager_adaptive_legacy_noop
+    PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
     NAME mai_uffd_pager_spatial_prefetch
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"

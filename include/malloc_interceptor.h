@@ -117,6 +117,11 @@ typedef struct {
     size_t policy_async_prefetch_enqueued;
     size_t policy_async_prefetch_completed;
     size_t policy_async_prefetch_dropped;
+    size_t policy_adaptive_windows;
+    size_t policy_adaptive_level;
+    size_t policy_adaptive_level_changes;
+    size_t policy_adaptive_prefetch_capped;
+    size_t policy_adaptive_admission_rejected;
 } MaiStats;
 
 /**

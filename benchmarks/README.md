@@ -176,6 +176,10 @@ Runtime policy knobs are intentionally separate from benchmark knobs:
   allocation, default 64 and max 64
 - `MAI_SPATIAL_LEARN_THRESHOLD` and `MAI_SPATIAL_ADMIT_THRESHOLD`: confidence
   thresholds for mask learning and pressure admission
+- `MAI_POLICY_ADAPTIVE_CONTROL=1`: opt-in feedback control for prefetch
+  window size and admission confidence
+- `MAI_POLICY_ADAPTIVE_WINDOW_FAULTS` and
+  `MAI_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS`: adaptive feedback sensitivity
 - `MAI_POLICY_OBSERVE_PREFETCH_WRITES=1`: opt-in write-protect observation for
   useful-prefetch metrics on write-heavy workloads
 
@@ -262,9 +266,12 @@ Policy rows include mechanism-derived counters such as
 `policy_demand_fault_stall_ns`, `policy_demand_fault_stall_p50_ns`,
 `policy_demand_fault_stall_p90_ns`, `policy_demand_fault_stall_p99_ns`, and
 unused-prefetch eviction bytes. Policy probe rows also include
-`policy_sampled_units_per_sec`. Compare these against sufficient-memory rows
-from the same host, seed, binary, and workload before making performance
-claims. The observed prefetch metrics are lower bounds unless
+`policy_sampled_units_per_sec`. Adaptive-control rows additionally include
+`policy_adaptive_windows`, `policy_adaptive_level`,
+`policy_adaptive_level_changes`, `policy_adaptive_prefetch_capped`, and
+`policy_adaptive_admission_rejected`. Compare these against
+sufficient-memory rows from the same host, seed, binary, and workload before
+making performance claims. The observed prefetch metrics are lower bounds unless
 `policy_prefetch_observation=write_protect`; Linux mmap and swap baselines do
 not populate MAI migration-byte counters.
 For `policy_stream_pipeline`, the
@@ -316,6 +323,9 @@ MAI_FILE_DEDICATED_MIN=64M
 MAI_AUTO_LARGE_ALLOC_CAP_PERCENT=12
 MAI_MIGRATION_CHUNK=2M
 MAI_UFFD_PREFETCH_CHUNKS=4
+MAI_POLICY_ADAPTIVE_CONTROL=1
+MAI_POLICY_ADAPTIVE_WINDOW_FAULTS=16
+MAI_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS=16
 MAI_RECORD_PROTECT_EPOCHS=8
 MAI_BENCH_WINDOW=8M
 MAI_BENCH_HOTSET=32M

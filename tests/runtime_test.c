@@ -2293,6 +2293,195 @@ static int mode_uffd_pager_active_record_prefetch_guard(void) {
     return 0;
 }
 
+static int mode_uffd_pager_adaptive_policy_throttle(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t chunks = size / unit;
+    unsigned char expected[16] = {0};
+
+    if (chunks > sizeof(expected)) {
+        return fail("adaptive policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before adaptive policy test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for adaptive policy test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD adaptive policy allocation failed");
+    }
+
+    for (size_t pass = 0; pass < 3; pass++) {
+        for (size_t i = 0; i + 1 < chunks; i += 2) {
+            expected[i]++;
+            ptr[i * unit] = expected[i];
+            expected[i + 1]++;
+            ptr[(i + 1) * unit] = expected[i + 1];
+        }
+    }
+
+    for (size_t pass = 0; pass < 3; pass++) {
+        for (size_t i = 0; i < chunks; i += 2) {
+            expected[i]++;
+            ptr[i * unit] = expected[i];
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after adaptive policy touches");
+    }
+    size_t throttle_events =
+        after_touch.policy_throttle_events - before.policy_throttle_events;
+    size_t admission_rejected =
+        after_touch.policy_admission_rejected - before.policy_admission_rejected;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD adaptive policy did not exercise pager pressure");
+    }
+    if (throttle_events == 0) {
+        fprintf(stderr,
+                "adaptive policy stats: throttle=%zu rejected=%zu "
+                "unused_evictions=%zu hot_evicted=%zu\n",
+                throttle_events, admission_rejected,
+                after_touch.policy_prefetch_unused_evictions -
+                before.policy_prefetch_unused_evictions,
+                after_touch.policy_evicted_hot_bytes -
+                before.policy_evicted_hot_bytes);
+        free(ptr);
+        return fail("UFFD adaptive policy did not throttle harmful speculation");
+    }
+    if (after_touch.policy_adaptive_windows <= before.policy_adaptive_windows ||
+        after_touch.policy_adaptive_level_changes <=
+            before.policy_adaptive_level_changes ||
+        after_touch.policy_adaptive_admission_rejected <=
+            before.policy_adaptive_admission_rejected) {
+        fprintf(stderr,
+                "adaptive policy counters: windows=%zu level=%zu "
+                "changes=%zu adaptive_rejects=%zu\n",
+                after_touch.policy_adaptive_windows -
+                before.policy_adaptive_windows,
+                after_touch.policy_adaptive_level,
+                after_touch.policy_adaptive_level_changes -
+                before.policy_adaptive_level_changes,
+                after_touch.policy_adaptive_admission_rejected -
+                before.policy_adaptive_admission_rejected);
+        free(ptr);
+        return fail("UFFD adaptive policy did not report adaptive Markov gating");
+    }
+    for (size_t i = 0; i < chunks; i += 2) {
+        if (ptr[i * unit] != expected[i]) {
+            free(ptr);
+            return fail("UFFD adaptive policy lost data");
+        }
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after adaptive policy free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD adaptive policy allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_adaptive_legacy_noop(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t chunks = size / unit;
+    unsigned char expected[16] = {0};
+
+    if (chunks > sizeof(expected)) {
+        return fail("adaptive legacy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before adaptive legacy test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for adaptive legacy test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD adaptive legacy allocation failed");
+    }
+
+    for (size_t pass = 0; pass < 3; pass++) {
+        for (size_t i = 0; i < chunks; i += 2) {
+            expected[i]++;
+            ptr[i * unit] = expected[i];
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after adaptive legacy touches");
+    }
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD adaptive legacy did not exercise pager pressure");
+    }
+    if (after_touch.policy_adaptive_level != 0 ||
+        after_touch.policy_adaptive_level_changes !=
+            before.policy_adaptive_level_changes ||
+        after_touch.policy_adaptive_prefetch_capped !=
+            before.policy_adaptive_prefetch_capped ||
+        after_touch.policy_adaptive_admission_rejected !=
+            before.policy_adaptive_admission_rejected) {
+        fprintf(stderr,
+                "adaptive legacy counters: level=%zu changes=%zu capped=%zu "
+                "rejects=%zu\n",
+                after_touch.policy_adaptive_level,
+                after_touch.policy_adaptive_level_changes -
+                before.policy_adaptive_level_changes,
+                after_touch.policy_adaptive_prefetch_capped -
+                before.policy_adaptive_prefetch_capped,
+                after_touch.policy_adaptive_admission_rejected -
+                before.policy_adaptive_admission_rejected);
+        free(ptr);
+        return fail("UFFD adaptive control changed legacy baseline behavior");
+    }
+    for (size_t i = 0; i < chunks; i += 2) {
+        if (ptr[i * unit] != expected[i]) {
+            free(ptr);
+            return fail("UFFD adaptive legacy lost data");
+        }
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after adaptive legacy free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD adaptive legacy allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
 static int mode_uffd_pager_stride_policy(void) {
     MaiStats before;
     MaiStats after_touch;
@@ -3890,6 +4079,12 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_active_record_prefetch_guard") == 0) {
         return mode_uffd_pager_active_record_prefetch_guard();
+    }
+    if (strcmp(argv[1], "uffd_pager_adaptive_policy_throttle") == 0) {
+        return mode_uffd_pager_adaptive_policy_throttle();
+    }
+    if (strcmp(argv[1], "uffd_pager_adaptive_legacy_noop") == 0) {
+        return mode_uffd_pager_adaptive_legacy_noop();
     }
     if (strcmp(argv[1], "uffd_pager_stride_policy") == 0) {
         return mode_uffd_pager_stride_policy();

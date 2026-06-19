@@ -193,6 +193,30 @@ controller trades unused-prefetch evictions for more demand-confirmed hot
 evictions while reducing migration bytes and tail stall; that tradeoff needs
 broader seed and pressure sweeps before it can be promoted.
 
+### Adaptive Admission/Throttle Probe
+
+`MAI_POLICY_ADAPTIVE_CONTROL=1` adds a closed-loop admission and prefetch-window
+controller around confidence-bearing predictors. It is intentionally opt-in and
+does not act on the `legacy` baseline, because fixed next-block prefetch has no
+confidence signal to raise or lower. The current default uses a 16-fault
+feedback window and a 16-chunk migration-debt budget. These rows use
+`markov`, `MAI_ACTIVE_RECORD_EPOCHS=32`, `MAI_ACTIVE_RECORD_SLACK_CHUNKS=4`,
+a 64 MiB resident high watermark, a 48 MiB low watermark, 16 MiB matrices,
+random-no-repeat seeds `1,7,13,29,31,43`, 12 outer cycles, and four group
+iterations.
+
+| Adaptive | End-to-end MiB/s | Kernel MiB/s | Demand faults | Prefetches | Unused evictions | Read MiB | Write MiB | Hot-evicted MiB | Max-cycle stall ms | Max-cycle read MiB | Max-cycle write MiB | Adaptive windows | Adaptive rejects |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| off | 9818 | 12504 | 416.7 | 63.2 | 62.2 | 815.7 | 895.7 | 771.3 | 28.2 | 71.0 | 77.0 | 0.0 | 0.0 |
+| on | 10106 | 12865 | 418.3 | 35.7 | 35.7 | 764.0 | 844.0 | 772.7 | 25.1 | 68.7 | 76.7 | 25.5 | 62.0 |
+
+This is a modest, variance-sensitive result: end-to-end throughput improved by
+about 3% on this slice, while migration reads and writes each fell by about
+52 MiB and max-cycle stall fell by about 3 ms. Hot-evicted bytes were nearly
+flat. The row supports the narrow claim that migration-debt feedback can reduce
+admitted useless prefetches and phase-transition traffic for `markov`; it is
+not proof that MAI is close to the sufficient-memory baseline.
+
 ## Interpretation
 
 - Sufficient-memory MAI does not trigger migration in these runs; faster

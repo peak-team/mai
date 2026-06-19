@@ -64,6 +64,11 @@
 #define MAI_MAX_ACTIVE_RECORD_EPOCHS 4096
 #define MAI_DEFAULT_ACTIVE_RECORD_SLACK_CHUNKS 8
 #define MAI_MAX_ACTIVE_RECORD_SLACK_CHUNKS 1024
+#define MAI_DEFAULT_POLICY_ADAPTIVE_WINDOW_FAULTS 16
+#define MAI_MAX_POLICY_ADAPTIVE_WINDOW_FAULTS 4096
+#define MAI_DEFAULT_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS 16
+#define MAI_MAX_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS 1024
+#define MAI_POLICY_ADAPTIVE_MAX_THROTTLE_LEVEL 3
 #define MAI_POLICY_STALL_HIST_BUCKETS 64
 #define MAI_POLICY_STREAM_SLOTS 4
 #define MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS 8
@@ -472,6 +477,21 @@ static size_t record_protect_epochs = MAI_DEFAULT_RECORD_PROTECT_EPOCHS;
 static size_t active_record_epochs = MAI_DEFAULT_ACTIVE_RECORD_EPOCHS;
 static size_t active_record_slack_chunks =
     MAI_DEFAULT_ACTIVE_RECORD_SLACK_CHUNKS;
+static int policy_adaptive_control_enabled = 0;
+static size_t policy_adaptive_window_faults =
+    MAI_DEFAULT_POLICY_ADAPTIVE_WINDOW_FAULTS;
+static size_t policy_adaptive_migration_budget_chunks =
+    MAI_DEFAULT_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS;
+static size_t policy_adaptive_throttle_level = 0;
+static size_t policy_adaptive_start_demand_faults = 0;
+static size_t policy_adaptive_start_prefetch_completed = 0;
+static size_t policy_adaptive_start_prefetch_useful = 0;
+static size_t policy_adaptive_start_prefetch_late = 0;
+static size_t policy_adaptive_start_unused_evictions = 0;
+static size_t policy_adaptive_start_hot_evicted_bytes = 0;
+static size_t policy_adaptive_start_migration_read_bytes = 0;
+static size_t policy_adaptive_start_migration_write_bytes = 0;
+static size_t policy_adaptive_start_stall_ns = 0;
 static size_t spatial_region_chunks =
     MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS;
 static size_t spatial_table_slots = MAI_POLICY_SPATIAL_DEFAULT_SLOTS;
@@ -4438,6 +4458,213 @@ static size_t policy_prefetch_window_locked(AllocationRecord* record,
     return adaptive;
 }
 
+static size_t policy_adaptive_budget_bytes_locked(void) {
+    size_t chunk = migration_chunk_bytes == 0 ? page_size : migration_chunk_bytes;
+    size_t chunks = policy_adaptive_migration_budget_chunks == 0 ?
+        1 : policy_adaptive_migration_budget_chunks;
+    if (chunks > SIZE_MAX / chunk) {
+        return SIZE_MAX;
+    }
+    return chunks * chunk;
+}
+
+static size_t policy_adaptive_fault_window_locked(void) {
+    return policy_adaptive_window_faults == 0 ?
+        1 : policy_adaptive_window_faults;
+}
+
+static void policy_adaptive_reset_window_locked(void) {
+    policy_adaptive_start_demand_faults =
+        stats_snapshot.policy_demand_faults;
+    policy_adaptive_start_prefetch_completed =
+        stats_snapshot.policy_prefetch_completed;
+    policy_adaptive_start_prefetch_useful =
+        stats_snapshot.policy_prefetch_useful;
+    policy_adaptive_start_prefetch_late =
+        stats_snapshot.policy_prefetch_late;
+    policy_adaptive_start_unused_evictions =
+        stats_snapshot.policy_prefetch_unused_evictions;
+    policy_adaptive_start_hot_evicted_bytes =
+        stats_snapshot.policy_evicted_hot_bytes;
+    policy_adaptive_start_migration_read_bytes =
+        stats_snapshot.policy_migration_read_bytes;
+    policy_adaptive_start_migration_write_bytes =
+        stats_snapshot.policy_migration_write_bytes;
+    policy_adaptive_start_stall_ns =
+        stats_snapshot.policy_demand_fault_stall_ns;
+}
+
+static size_t policy_adaptive_max_throttle_level_locked(void) {
+    if (migration_policy == MIGRATION_POLICY_LEGACY) {
+        return 0;
+    }
+    return MAI_POLICY_ADAPTIVE_MAX_THROTTLE_LEVEL;
+}
+
+static void policy_adaptive_update_locked(void) {
+    if (!policy_adaptive_control_enabled) {
+        return;
+    }
+
+    size_t window = policy_adaptive_fault_window_locked();
+    size_t faults =
+        stats_snapshot.policy_demand_faults -
+        policy_adaptive_start_demand_faults;
+    if (faults < window) {
+        return;
+    }
+    stats_snapshot.policy_adaptive_windows++;
+
+    size_t completed =
+        stats_snapshot.policy_prefetch_completed -
+        policy_adaptive_start_prefetch_completed;
+    size_t useful =
+        stats_snapshot.policy_prefetch_useful -
+        policy_adaptive_start_prefetch_useful;
+    size_t late =
+        stats_snapshot.policy_prefetch_late -
+        policy_adaptive_start_prefetch_late;
+    size_t unused =
+        stats_snapshot.policy_prefetch_unused_evictions -
+        policy_adaptive_start_unused_evictions;
+    size_t hot_bytes =
+        stats_snapshot.policy_evicted_hot_bytes -
+        policy_adaptive_start_hot_evicted_bytes;
+    size_t read_bytes =
+        stats_snapshot.policy_migration_read_bytes -
+        policy_adaptive_start_migration_read_bytes;
+    size_t write_bytes =
+        stats_snapshot.policy_migration_write_bytes -
+        policy_adaptive_start_migration_write_bytes;
+    size_t stall_ns =
+        stats_snapshot.policy_demand_fault_stall_ns -
+        policy_adaptive_start_stall_ns;
+    size_t migration_bytes = read_bytes > SIZE_MAX - write_bytes ?
+        SIZE_MAX : read_bytes + write_bytes;
+    size_t budget_bytes = policy_adaptive_budget_bytes_locked();
+    size_t hot_budget = migration_chunk_bytes == 0 ? page_size :
+        migration_chunk_bytes;
+    size_t avg_stall_ns = faults == 0 ? 0 : stall_ns / faults;
+
+    int pollution = unused != 0;
+    int migration_over_budget =
+        budget_bytes != SIZE_MAX && migration_bytes > budget_bytes;
+    int stall_pressure = avg_stall_ns > 1000000ULL;
+    int hot_eviction_pressure = hot_bytes > hot_budget;
+    int harmful_speculation = pollution &&
+        (stall_pressure || migration_over_budget || hot_eviction_pressure);
+    int useful_speculation = useful > unused + 1 && late > useful / 2 &&
+        (budget_bytes == SIZE_MAX || migration_bytes <= budget_bytes) &&
+        hot_bytes == 0;
+
+    size_t max_level = policy_adaptive_max_throttle_level_locked();
+    if (policy_adaptive_throttle_level > max_level) {
+        policy_adaptive_throttle_level = max_level;
+    }
+    size_t previous_level = policy_adaptive_throttle_level;
+
+    if (hot_eviction_pressure && !pollution && completed == 0 &&
+        policy_adaptive_throttle_level > 0) {
+        policy_adaptive_throttle_level--;
+    } else if (harmful_speculation &&
+        policy_adaptive_throttle_level < max_level) {
+        policy_adaptive_throttle_level++;
+    } else if (pollution && policy_adaptive_throttle_level == 0 &&
+               max_level > 0) {
+        policy_adaptive_throttle_level = 1;
+    } else if (!harmful_speculation && useful_speculation &&
+               policy_adaptive_throttle_level > 0) {
+        policy_adaptive_throttle_level--;
+    } else if (completed == 0 && late > window &&
+               policy_adaptive_throttle_level > 0) {
+        policy_adaptive_throttle_level--;
+    }
+    if (policy_adaptive_throttle_level != previous_level) {
+        stats_snapshot.policy_throttle_events++;
+        stats_snapshot.policy_adaptive_level_changes++;
+        stats_snapshot.policy_adaptive_level =
+            policy_adaptive_throttle_level;
+    }
+
+    policy_adaptive_reset_window_locked();
+}
+
+static size_t policy_adaptive_prefetch_cap_locked(size_t requested) {
+    if (!policy_adaptive_control_enabled || requested <= 1) {
+        return requested;
+    }
+    policy_adaptive_update_locked();
+    size_t capped = requested;
+    if (policy_adaptive_throttle_level >= 3) {
+        capped = 1;
+    } else if (policy_adaptive_throttle_level == 2 && requested > 2) {
+        capped = 2;
+    } else if (policy_adaptive_throttle_level == 1 && requested > 3) {
+        capped = 3;
+    }
+    if (capped < requested) {
+        stats_snapshot.policy_adaptive_prefetch_capped++;
+    }
+    return capped;
+}
+
+static int policy_adaptive_prefetch_admissible_locked(AllocationRecord* record,
+                                                      size_t source_index,
+                                                      size_t index) {
+    if (!policy_adaptive_control_enabled ||
+        policy_adaptive_throttle_level == 0) {
+        return 1;
+    }
+    if (!record || index >= record->chunk_count) {
+        return 0;
+    }
+    if (migration_policy == MIGRATION_POLICY_MARKOV && record->chunk_policy_meta &&
+        source_index < record->chunk_count) {
+        MaiChunkPolicyMeta* source = &record->chunk_policy_meta[source_index];
+        return (source->flags & MAI_CHUNK_POLICY_SUCCESSOR_VALID) != 0 &&
+            source->successor_index == index &&
+            source->successor_confidence >=
+                (policy_adaptive_throttle_level >= 2 ? 5 : 4);
+    }
+    if (migration_policy == MIGRATION_POLICY_STRIDE) {
+        for (size_t i = 0; i < MAI_POLICY_STREAM_SLOTS; i++) {
+            MaiStreamPolicySlot* slot = &record->policy_stream_slots[i];
+            size_t predicted = 0;
+            if (slot->active && slot->last_index == source_index &&
+                slot->confidence >=
+                    (policy_adaptive_throttle_level >= 2 ? 4 : 3) &&
+                policy_index_add(source_index, slot->delta,
+                                 record->chunk_count, &predicted) &&
+                predicted == index) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (migration_policy == MIGRATION_POLICY_STREAM) {
+        return record->policy_run_length >=
+            (policy_adaptive_throttle_level >= 2 ? 4 : 3);
+    }
+    if (migration_policy == MIGRATION_POLICY_SPATIAL) {
+        size_t source_region = source_index / spatial_region_chunks;
+        size_t target_region = index / spatial_region_chunks;
+        if (source_region != target_region) {
+            return 0;
+        }
+        size_t target_offset = index % spatial_region_chunks;
+        MaiSpatialPolicyRegion* slot =
+            policy_spatial_find_region_locked(record, target_region, 0);
+        return slot &&
+            slot->scores[target_offset] >=
+                spatial_admit_threshold + policy_adaptive_throttle_level;
+    }
+    if (migration_policy == MIGRATION_POLICY_LFU && record->chunk_policy_meta) {
+        MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
+        return policy_lfu_score_locked(meta) >= policy_adaptive_throttle_level;
+    }
+    return policy_adaptive_throttle_level < 2;
+}
+
 static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
                                             size_t* out_index,
                                             const MaiProtectedChunkSet* protected_set);
@@ -4567,7 +4794,12 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
     stats_snapshot.policy_admission_requests++;
 
     int admit = 1;
-    if (active_record_epochs != 0 &&
+    policy_adaptive_update_locked();
+    if (!policy_adaptive_prefetch_admissible_locked(record, source_index, index)) {
+        admit = 0;
+        stats_snapshot.policy_throttle_events++;
+        stats_snapshot.policy_adaptive_admission_rejected++;
+    } else if (active_record_epochs != 0 &&
         uffd_resident_limit_bytes != 0 &&
         uffd_resident_bytes + length > uffd_resident_limit_bytes &&
         !policy_active_prefetch_has_safe_victim_locked(record, source_index,
@@ -5331,6 +5563,7 @@ static size_t policy_build_access_prefetch_plan_locked(AllocationRecord* record,
             prefetch_window = cap_window;
         }
     }
+    prefetch_window = policy_adaptive_prefetch_cap_locked(prefetch_window);
     return policy_build_prefetch_indices_locked(record, index, prefetch_window,
                                                 prefetch_indices,
                                                 prefetch_cap);
@@ -6692,6 +6925,7 @@ static void populate_stats_snapshot_locked(MaiStats* out) {
     out->policy_demand_fault_stall_p99_ns =
         policy_stall_percentile_locked(99);
     out->policy_demand_fault_stall_max_ns = policy_fault_stall_max_ns;
+    out->policy_adaptive_level = policy_adaptive_throttle_level;
 }
 
 int mai_get_stats_sized(MaiStats* out, size_t stats_size) {
@@ -7408,7 +7642,11 @@ static void print_stats(void) {
             "policy_demand_fault_stall_max_ns=%zu "
             "policy_async_prefetch_enqueued=%zu "
             "policy_async_prefetch_completed=%zu "
-            "policy_async_prefetch_dropped=%zu\n",
+            "policy_async_prefetch_dropped=%zu "
+            "policy_adaptive_windows=%zu policy_adaptive_level=%zu "
+            "policy_adaptive_level_changes=%zu "
+            "policy_adaptive_prefetch_capped=%zu "
+            "policy_adaptive_admission_rejected=%zu\n",
             stats.enabled, stats.configured, stats.config_error, stats.threshold,
             stats.arena_size, stats.target_rss, stats.max_rss,
             stats.current_rss_bytes, stats.high_water_rss_bytes,
@@ -7454,7 +7692,12 @@ static void print_stats(void) {
             stats.policy_demand_fault_stall_max_ns,
             stats.policy_async_prefetch_enqueued,
             stats.policy_async_prefetch_completed,
-            stats.policy_async_prefetch_dropped);
+            stats.policy_async_prefetch_dropped,
+            stats.policy_adaptive_windows,
+            stats.policy_adaptive_level,
+            stats.policy_adaptive_level_changes,
+            stats.policy_adaptive_prefetch_capped,
+            stats.policy_adaptive_admission_rejected);
 }
 
 static void print_profile_report(void) {
@@ -7610,6 +7853,12 @@ static int configure_runtime(void) {
         getenv("MAI_ACTIVE_RECORD_EPOCHS");
     const char* active_record_slack =
         getenv("MAI_ACTIVE_RECORD_SLACK_CHUNKS");
+    const char* adaptive_control =
+        getenv("MAI_POLICY_ADAPTIVE_CONTROL");
+    const char* adaptive_window =
+        getenv("MAI_POLICY_ADAPTIVE_WINDOW_FAULTS");
+    const char* adaptive_migration_budget =
+        getenv("MAI_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS");
     const char* migration_chunk = getenv("MAI_MIGRATION_CHUNK");
     const char* spatial_region =
         getenv("MAI_SPATIAL_REGION_CHUNKS");
@@ -7672,6 +7921,21 @@ static int configure_runtime(void) {
     record_protect_epochs = MAI_DEFAULT_RECORD_PROTECT_EPOCHS;
     active_record_epochs = MAI_DEFAULT_ACTIVE_RECORD_EPOCHS;
     active_record_slack_chunks = MAI_DEFAULT_ACTIVE_RECORD_SLACK_CHUNKS;
+    policy_adaptive_control_enabled = 0;
+    policy_adaptive_window_faults =
+        MAI_DEFAULT_POLICY_ADAPTIVE_WINDOW_FAULTS;
+    policy_adaptive_migration_budget_chunks =
+        MAI_DEFAULT_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS;
+    policy_adaptive_throttle_level = 0;
+    policy_adaptive_start_demand_faults = 0;
+    policy_adaptive_start_prefetch_completed = 0;
+    policy_adaptive_start_prefetch_useful = 0;
+    policy_adaptive_start_prefetch_late = 0;
+    policy_adaptive_start_unused_evictions = 0;
+    policy_adaptive_start_hot_evicted_bytes = 0;
+    policy_adaptive_start_migration_read_bytes = 0;
+    policy_adaptive_start_migration_write_bytes = 0;
+    policy_adaptive_start_stall_ns = 0;
 
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     if (page_size == 0) {
@@ -7870,6 +8134,19 @@ static int configure_runtime(void) {
         runtime_config_error = 1;
         return -1;
     }
+    policy_adaptive_control_enabled = parse_bool_env(adaptive_control);
+    if (adaptive_window &&
+        parse_count_env(adaptive_window,
+                        &policy_adaptive_window_faults) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (adaptive_migration_budget &&
+        parse_count_env(adaptive_migration_budget,
+                        &policy_adaptive_migration_budget_chunks) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
     if (migration_chunk && parse_size_env(migration_chunk, &migration_chunk_bytes) != 0) {
         runtime_config_error = 1;
         return -1;
@@ -8006,6 +8283,22 @@ static int configure_runtime(void) {
     }
     if (active_record_slack_chunks > MAI_MAX_ACTIVE_RECORD_SLACK_CHUNKS) {
         active_record_slack_chunks = MAI_MAX_ACTIVE_RECORD_SLACK_CHUNKS;
+    }
+    if (policy_adaptive_window_faults == 0) {
+        policy_adaptive_window_faults = 1;
+    }
+    if (policy_adaptive_window_faults >
+        MAI_MAX_POLICY_ADAPTIVE_WINDOW_FAULTS) {
+        policy_adaptive_window_faults =
+            MAI_MAX_POLICY_ADAPTIVE_WINDOW_FAULTS;
+    }
+    if (policy_adaptive_migration_budget_chunks == 0) {
+        policy_adaptive_migration_budget_chunks = 1;
+    }
+    if (policy_adaptive_migration_budget_chunks >
+        MAI_MAX_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS) {
+        policy_adaptive_migration_budget_chunks =
+            MAI_MAX_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS;
     }
     if (uffd_pager_mode != UFFD_PAGER_OFF && !uffd_resident_limit_explicit) {
         size_t cap = 0;
