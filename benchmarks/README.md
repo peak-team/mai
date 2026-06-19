@@ -33,6 +33,10 @@ recency/frequency, and signature-context guardrails. Default policies are
 `legacy`, `markov`, `car`, `wtinylfu`, `hybrid`, `markov_adaptive`, and
 `hybrid_adaptive`; default seeds are `1,7,13,29,31,43`. The default sizes are
 developer guardrail sizes, not sufficient for memory-bandwidth claims.
+Pressure high/low resident limits default to workload-aware values:
+`policy_stream_pipeline` uses `4 * matrix_size` and `3 * matrix_size`, while
+single-allocation guardrails use one quarter and three sixteenths of the
+allocation size.
 
 For every workload/seed/repetition, the runner records native sufficient,
 MAI pass-through, MAI managed sufficient, and policy-pressure rows. Pressure
@@ -41,6 +45,12 @@ not call assisted range APIs or feed benchmark future-order variables into the
 runtime. Write-protect useful-prefetch observation defaults to off because it
 changes fault behavior; use `--observe-prefetch-writes 1` only when validating
 observed accuracy/coverage counters.
+
+Pressure rows also accept runtime mechanism controls such as
+`--async-prefetch`, `--async-slack-chunks`, `--record-protect-epochs`,
+`--active-record-epochs`, and `--active-record-slack-chunks`. Use these to
+compare policy changes against existing async and record-aware migration
+mechanisms under the same sufficient-memory ratio baseline.
 
 For bandwidth claims, rerun the same matrix with working sets well beyond CPU
 cache, for example:
@@ -51,13 +61,12 @@ python3 benchmarks/policy_retained_matrix.py \
   build/benchmarks/mai_access_pattern_benchmark \
   --output-dir policy-matrix-results-large \
   --pipeline-matrix-size 128M \
-  --allocation-size 512M \
-  --resident-limit 384M \
-  --resident-low-limit 320M
+  --allocation-size 512M
 ```
 
 For `policy_stream_pipeline`, choose a resident limit where three active
-matrices fit but all nine do not.
+matrices fit but all nine do not. The default `auto` resident limits already
+follow this rule.
 
 Run sufficient-memory overhead benchmarks with:
 

@@ -102,6 +102,42 @@ def parse_value(value: str) -> Any:
         return value
 
 
+def parse_size_bytes(value: str) -> int:
+    text = value.strip().lower()
+    if not text:
+        raise ValueError("empty size")
+    multipliers = {
+        "kib": 1024,
+        "kb": 1024,
+        "k": 1024,
+        "mib": 1024**2,
+        "mb": 1024**2,
+        "m": 1024**2,
+        "gib": 1024**3,
+        "gb": 1024**3,
+        "g": 1024**3,
+        "tib": 1024**4,
+        "tb": 1024**4,
+        "t": 1024**4,
+        "b": 1,
+    }
+    for suffix, multiplier in sorted(
+        multipliers.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        if text.endswith(suffix):
+            number = text[: -len(suffix)]
+            if not number:
+                raise ValueError(f"invalid size: {value}")
+            return int(number) * multiplier
+    return int(text)
+
+
+def size_arg(value: str, auto_bytes: int) -> str:
+    if value.strip().lower() == "auto":
+        return str(auto_bytes)
+    return value
+
+
 def parse_key_value_line(line: str) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     for token in shlex.split(line):
@@ -160,6 +196,15 @@ def workload_size(workload: str, allocation_size: str, pipeline_size: str) -> st
     return allocation_size
 
 
+def workload_auto_resident_bytes(workload: str, size: str) -> tuple[int, int]:
+    size_bytes = parse_size_bytes(size)
+    if workload in {"policy_stream_pipeline", "stream_kernel_pipeline"}:
+        return size_bytes * 4, size_bytes * 3
+    high = max(size_bytes // 4, 4096)
+    low = max((high * 3) // 4, 4096)
+    return high, low
+
+
 def expected_managed_allocations(workload: str) -> float | None:
     if workload in {"policy_stream_pipeline", "stream_kernel_pipeline"}:
         return 9.0
@@ -208,6 +253,16 @@ def run_case(
     env_updates = dict(env_updates)
     if env_updates.get("MAI_ENABLE") == "1":
         env_updates.setdefault("MAI_PATH", str(scratch))
+    if scenario == "policy_pressure":
+        auto_high, auto_low = workload_auto_resident_bytes(workload, size)
+        resolved_high = size_arg(args.resident_limit, auto_high)
+        resolved_low = size_arg(args.resident_low_limit, auto_low)
+        resolved_max_rss = args.mai_max_rss
+        if resolved_max_rss.strip().lower() == "auto":
+            resolved_max_rss = resolved_high
+        env_updates["MAI_UFFD_RESIDENT_LIMIT"] = resolved_high
+        env_updates["MAI_UFFD_RESIDENT_LOW_LIMIT"] = resolved_low
+        env_updates["MAI_MAX_RSS"] = resolved_max_rss
     env = benchmark_env(
         os.environ,
         {
@@ -272,7 +327,10 @@ def run_case(
         "uffd_prefetch_chunks": env.get("MAI_UFFD_PREFETCH_CHUNKS", ""),
         "adaptive_control": env.get("MAI_POLICY_ADAPTIVE_CONTROL", "0"),
         "async_prefetch": env.get("MAI_UFFD_ASYNC_PREFETCH", "0"),
+        "async_slack_chunks": env.get("MAI_UFFD_ASYNC_SLACK_CHUNKS", ""),
+        "record_protect_epochs": env.get("MAI_RECORD_PROTECT_EPOCHS", ""),
         "active_record_epochs": env.get("MAI_ACTIVE_RECORD_EPOCHS", ""),
+        "active_record_slack_chunks": env.get("MAI_ACTIVE_RECORD_SLACK_CHUNKS", ""),
         "clean_shadow": env.get("MAI_UFFD_CLEAN_SHADOW", "0"),
         "raw_stdout": raw_stdout,
         "raw_stderr": raw_stderr,
@@ -494,11 +552,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--pipeline-group-iterations", type=int, default=int(os.environ.get("MAI_BENCH_STREAM_PIPELINE_GROUP_ITERATIONS", "4")))
     parser.add_argument("--mai-threshold", default=os.environ.get("MAI_THRESHOLD", "4K"))
     parser.add_argument("--mai-arena-size", default=os.environ.get("MAI_ARENA_SIZE", "256M"))
-    parser.add_argument("--mai-max-rss", default=os.environ.get("MAI_MAX_RSS", "32M"))
-    parser.add_argument("--resident-limit", default=os.environ.get("MAI_UFFD_RESIDENT_LIMIT", "16M"))
-    parser.add_argument("--resident-low-limit", default=os.environ.get("MAI_UFFD_RESIDENT_LOW_LIMIT", "12M"))
+    parser.add_argument("--mai-max-rss", default=os.environ.get("MAI_MAX_RSS", "auto"))
+    parser.add_argument("--resident-limit", default=os.environ.get("MAI_UFFD_RESIDENT_LIMIT", "auto"))
+    parser.add_argument("--resident-low-limit", default=os.environ.get("MAI_UFFD_RESIDENT_LOW_LIMIT", "auto"))
     parser.add_argument("--prefetch-chunks", default=os.environ.get("MAI_UFFD_PREFETCH_CHUNKS", "4"))
+    parser.add_argument("--async-prefetch", default=os.environ.get("MAI_UFFD_ASYNC_PREFETCH", "0"))
+    parser.add_argument("--async-slack-chunks", default=os.environ.get("MAI_UFFD_ASYNC_SLACK_CHUNKS", "2"))
     parser.add_argument("--migration-chunk", default=os.environ.get("MAI_MIGRATION_CHUNK", "2M"))
+    parser.add_argument("--record-protect-epochs", default=os.environ.get("MAI_RECORD_PROTECT_EPOCHS", "0"))
+    parser.add_argument("--active-record-epochs", default=os.environ.get("MAI_ACTIVE_RECORD_EPOCHS", "0"))
+    parser.add_argument("--active-record-slack-chunks", default=os.environ.get("MAI_ACTIVE_RECORD_SLACK_CHUNKS", "8"))
     parser.add_argument("--successor-chain-depth", default=os.environ.get("MAI_POLICY_SUCCESSOR_CHAIN_DEPTH", "2"))
     parser.add_argument("--observe-prefetch-writes", default=os.environ.get("MAI_POLICY_OBSERVE_PREFETCH_WRITES", "0"))
     parser.add_argument("--row-timeout-sec", type=float, default=float(os.environ.get("MAI_BENCH_ROW_TIMEOUT_SEC", "0")))
@@ -619,8 +682,13 @@ def main(argv: list[str]) -> int:
                                 "MAI_UFFD_RESIDENT_LIMIT": args.resident_limit,
                                 "MAI_UFFD_RESIDENT_LOW_LIMIT": args.resident_low_limit,
                                 "MAI_UFFD_PREFETCH_CHUNKS": args.prefetch_chunks,
+                                "MAI_UFFD_ASYNC_PREFETCH": args.async_prefetch,
+                                "MAI_UFFD_ASYNC_SLACK_CHUNKS": args.async_slack_chunks,
                                 "MAI_MIGRATION_CHUNK": args.migration_chunk,
                                 "MAI_MIGRATION_POLICY": migration_policy,
+                                "MAI_RECORD_PROTECT_EPOCHS": args.record_protect_epochs,
+                                "MAI_ACTIVE_RECORD_EPOCHS": args.active_record_epochs,
+                                "MAI_ACTIVE_RECORD_SLACK_CHUNKS": args.active_record_slack_chunks,
                                 "MAI_POLICY_SUCCESSOR_CHAIN_DEPTH": args.successor_chain_depth,
                                 "MAI_POLICY_OBSERVE_PREFETCH_WRITES": args.observe_prefetch_writes,
                                 "LD_PRELOAD": str(args.libmai),
