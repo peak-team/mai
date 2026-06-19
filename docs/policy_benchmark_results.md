@@ -237,6 +237,13 @@ about half on this read-mostly reuse pattern. Write-heavy reuse still needs a
 separate benchmark because its first post-restore write pays a UFFD
 write-protect fault.
 
+A three-seed spot check on the write-heavy 9-matrix STREAM pipeline with
+`markov`, active-record control, adaptive admission, 64 MiB high / 48 MiB low
+watermarks, and 12 random-no-repeat cycles reduced migration writes but did not
+improve throughput. Mean end-to-end throughput was about 9356 MiB/s with
+clean-shadow off and 9038 MiB/s with it on. That supports keeping clean-shadow
+off by default for STREAM-like write-heavy workloads.
+
 ## Interpretation
 
 - Sufficient-memory MAI does not trigger migration in these runs; faster
