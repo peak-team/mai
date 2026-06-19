@@ -22,10 +22,12 @@ python3 benchmarks/policy_retained_matrix.py \
   --output-dir policy-matrix-results
 ```
 
-The runner writes `rows.ndjson`, `summary.csv`, and `summary.md`. Each row
-records the git SHA, dirty state, host kernel, build type, workload, scenario,
-policy, seed, repetition, runtime knobs, raw benchmark output, parsed metrics,
-and validation reasons. The default matrix includes the primary
+The runner appends each completed row to `partial_rows.ndjson`, then writes
+final `rows.ndjson`, `summary.csv`, and `summary.md` after ratios are computed.
+Use `--row-timeout-sec N` to mark a slow row invalid and continue the matrix.
+Each row records the git SHA, dirty state, host kernel, build type, workload,
+scenario, policy, seed, repetition, runtime knobs, raw benchmark output, parsed
+metrics, and validation reasons. The default matrix includes the primary
 `policy_stream_pipeline` no-oracle workload plus long-tail admission,
 recency/frequency, and signature-context guardrails. Default policies are
 `legacy`, `markov`, `car`, `wtinylfu`, `hybrid`, `markov_adaptive`, and

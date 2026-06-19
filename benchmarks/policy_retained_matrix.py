@@ -75,6 +75,14 @@ SUMMARY_METRICS = [
 ]
 
 
+def output_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value
+
+
 def split_csv(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
@@ -213,16 +221,27 @@ def run_case(
         },
     )
     command = [str(args.benchmark), workload, size]
-    completed = subprocess.run(
-        command,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    timed_out = False
+    row_timeout = args.row_timeout_sec if args.row_timeout_sec > 0.0 else None
+    try:
+        completed = subprocess.run(
+            command,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=row_timeout,
+        )
+        exit_code = completed.returncode
+        raw_stdout = output_text(completed.stdout).strip()
+        raw_stderr = output_text(completed.stderr).strip()
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        exit_code = 124
+        raw_stdout = output_text(exc.stdout).strip()
+        raw_stderr = output_text(exc.stderr).strip()
     metrics: dict[str, Any] = {}
-    raw_stdout = completed.stdout.strip()
     for line in raw_stdout.splitlines():
         parsed = parse_key_value_line(line)
         if parsed.get("mode") == workload:
@@ -243,7 +262,9 @@ def run_case(
         "size": size,
         "command": command,
         "scratch_path": str(scratch),
-        "exit_code": completed.returncode,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "row_timeout_sec": args.row_timeout_sec,
         "observation_mode": env.get("MAI_POLICY_OBSERVE_PREFETCH_WRITES", "0"),
         "uffd_resident_limit": env.get("MAI_UFFD_RESIDENT_LIMIT", ""),
         "uffd_resident_low_limit": env.get("MAI_UFFD_RESIDENT_LOW_LIMIT", ""),
@@ -254,7 +275,7 @@ def run_case(
         "active_record_epochs": env.get("MAI_ACTIVE_RECORD_EPOCHS", ""),
         "clean_shadow": env.get("MAI_UFFD_CLEAN_SHADOW", "0"),
         "raw_stdout": raw_stdout,
-        "raw_stderr": completed.stderr.strip(),
+        "raw_stderr": raw_stderr,
         "metrics": metrics,
         "invalid_reasons": [],
     }
@@ -284,6 +305,8 @@ def validate_row(row: dict[str, Any]) -> None:
     metrics = row["metrics"]
     if row["exit_code"] != 0:
         reasons.append("nonzero_exit")
+    if row.get("timed_out"):
+        reasons.append("timeout")
     if not metrics:
         reasons.append("missing_metrics")
     managed_delta = metric_number(row, "managed_delta")
@@ -352,6 +375,16 @@ def write_ndjson(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def append_ndjson(path: Path, row: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def record_row(rows: list[dict[str, Any]], partial_path: Path, row: dict[str, Any]) -> None:
+    rows.append(row)
+    append_ndjson(partial_path, row)
 
 
 def attach_baseline_ratios(rows: list[dict[str, Any]]) -> None:
@@ -468,6 +501,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--migration-chunk", default=os.environ.get("MAI_MIGRATION_CHUNK", "2M"))
     parser.add_argument("--successor-chain-depth", default=os.environ.get("MAI_POLICY_SUCCESSOR_CHAIN_DEPTH", "2"))
     parser.add_argument("--observe-prefetch-writes", default=os.environ.get("MAI_POLICY_OBSERVE_PREFETCH_WRITES", "0"))
+    parser.add_argument("--row-timeout-sec", type=float, default=float(os.environ.get("MAI_BENCH_ROW_TIMEOUT_SEC", "0")))
     parser.add_argument("--run-baselines", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fail-on-error", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--build-type", default=os.environ.get("MAI_BENCH_BUILD_TYPE", ""))
@@ -494,11 +528,15 @@ def main(argv: list[str]) -> int:
     seeds = [int(seed) for seed in split_csv(args.seeds)]
 
     rows: list[dict[str, Any]] = []
+    partial_path = args.output_dir / "partial_rows.ndjson"
+    partial_path.write_text("", encoding="utf-8")
     for repetition in range(1, args.repetitions + 1):
         for seed in seeds:
             for workload in workloads:
                 if args.run_baselines:
-                    rows.append(
+                    record_row(
+                        rows,
+                        partial_path,
                         run_case(
                             args=args,
                             metadata=metadata,
@@ -509,9 +547,11 @@ def main(argv: list[str]) -> int:
                             seed=seed,
                             repetition=repetition,
                             env_updates={"MAI_ACCESS_EXPECT_MANAGED": "0"},
-                        )
+                        ),
                     )
-                    rows.append(
+                    record_row(
+                        rows,
+                        partial_path,
                         run_case(
                             args=args,
                             metadata=metadata,
@@ -530,9 +570,11 @@ def main(argv: list[str]) -> int:
                                 "MAI_ACCESS_EXPECT_MANAGED": "0",
                                 "LD_PRELOAD": str(args.libmai),
                             },
-                        )
+                        ),
                     )
-                    rows.append(
+                    record_row(
+                        rows,
+                        partial_path,
                         run_case(
                             args=args,
                             metadata=metadata,
@@ -551,11 +593,13 @@ def main(argv: list[str]) -> int:
                                 "MAI_RECLAIM_POLICY": "none",
                                 "LD_PRELOAD": str(args.libmai),
                             },
-                        )
+                        ),
                     )
                 for policy_name in policies:
                     migration_policy, extra_env = policy_config(policy_name)
-                    rows.append(
+                    record_row(
+                        rows,
+                        partial_path,
                         run_case(
                             args=args,
                             metadata=metadata,
@@ -582,7 +626,7 @@ def main(argv: list[str]) -> int:
                                 "LD_PRELOAD": str(args.libmai),
                                 **extra_env,
                             },
-                        )
+                        ),
                     )
 
     attach_baseline_ratios(rows)
