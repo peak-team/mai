@@ -188,6 +188,12 @@ that `MAI_BACKEND=auto` would otherwise demote under pressure; `required`
 turns an unavailable pager into a configuration error. `MAI_UFFD_PREFETCH_CHUNKS`
 is the total number of adjacent chunks to populate per missing fault, including
 the faulting chunk. Set it to `1` to disable spatial prefetch.
+`MAI_UFFD_CLEAN_SHADOW=1` is an opt-in UFFD mode that preserves valid storage
+shadows after a chunk is restored and uses write-protect faults to invalidate
+the shadow on the first write. Clean demotion can then skip the storage write;
+tracking only activates when the kernel can restore the chunk write-protected
+atomically. Write-heavy reuse pays the extra write-protect fault and should
+benchmark this mode explicitly before enabling it.
 
 `MAI_ALLOCATOR_HOOKS` controls whether MAI also patches libc allocator entry
 points with Frida/Gum:

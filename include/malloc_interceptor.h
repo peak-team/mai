@@ -122,6 +122,11 @@ typedef struct {
     size_t policy_adaptive_level_changes;
     size_t policy_adaptive_prefetch_capped;
     size_t policy_adaptive_admission_rejected;
+    size_t policy_clean_shadow_tracked_chunks;
+    size_t policy_clean_shadow_protect_failures;
+    size_t policy_clean_shadow_write_skipped_bytes;
+    size_t policy_clean_shadow_write_skipped_chunks;
+    size_t policy_clean_shadow_write_faults;
 } MaiStats;
 
 /**

@@ -217,6 +217,26 @@ flat. The row supports the narrow claim that migration-debt feedback can reduce
 admitted useless prefetches and phase-transition traffic for `markov`; it is
 not proof that MAI is close to the sufficient-memory baseline.
 
+### Clean-Shadow Smoke Check
+
+`MAI_UFFD_CLEAN_SHADOW=1` keeps valid storage shadows for restored chunks and
+uses UFFD write-protect to invalidate the shadow on first write. This local
+smoke check used six runs of `policy_successor_cycle 16M`,
+`MAI_UFFD_RESIDENT_LIMIT=2M`, `MAI_UFFD_RESIDENT_LOW_LIMIT=2M`,
+`MAI_UFFD_PREFETCH_CHUNKS=1`, and `MAI_MIGRATION_CHUNK=2M`. It is a mechanism
+check, not a broad performance claim.
+
+| Clean shadow | End-to-end MiB/s | Read MiB | Write MiB | Write amplification | Tracked chunks | Skipped write MiB | Write faults | Protect failures |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| off | 4109 | 80 | 94 | 0.979 | 0 | 0 | 0 | 0 |
+| on | 4879 | 80 | 48 | 0.500 | 24 | 46 | 0 | 0 |
+
+The result confirms the intended accounting: clean-shadow did not reduce read
+traffic, but it skipped 23 clean demotion writes and cut write amplification by
+about half on this read-mostly reuse pattern. Write-heavy reuse still needs a
+separate benchmark because its first post-restore write pays a UFFD
+write-protect fault.
+
 ## Interpretation
 
 - Sufficient-memory MAI does not trigger migration in these runs; faster
@@ -261,11 +281,12 @@ not proof that MAI is close to the sufficient-memory baseline.
   sufficient-memory STREAM remains large, so the next work should target
   reduced write/read amplification and phase-transition stalls rather than
   adding another standalone predictor.
-- A clean-shadow write-amplification experiment was attempted but rejected:
-  retaining storage shadows and using UFFD write-protect to avoid clean
-  write-back corrupted the successor-policy correctness workload. Any future
-  shadow-copy design needs explicit dirty-state tests before performance
-  benchmarking.
+- Clean-shadow write-amplification is now an opt-in UFFD feature
+  (`MAI_UFFD_CLEAN_SHADOW=1`) with targeted correctness tests for clean
+  demotion skips and dirty write-protect invalidation. It should still be
+  benchmarked separately before being used in performance claims: read-mostly
+  reuse can save demotion writes, while write-heavy reuse pays extra
+  write-protect faults.
 - Write-protect observation is useful for lower-bound usefulness counters, but
   it changes fault behavior and should not be mixed with default performance
   rows.

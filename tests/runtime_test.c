@@ -55,6 +55,30 @@ static int skip(const char* message) {
     return 77;
 }
 
+static volatile unsigned char runtime_byte_sink;
+
+static __attribute__((noinline)) void runtime_compiler_barrier(void) {
+    __asm__ __volatile__("" ::: "memory");
+}
+
+static __attribute__((noinline)) unsigned char
+runtime_load_byte(volatile unsigned char* ptr, size_t offset) {
+    runtime_compiler_barrier();
+    unsigned char value = ptr[offset];
+    runtime_byte_sink = value;
+    runtime_compiler_barrier();
+    return value;
+}
+
+static __attribute__((noinline)) void
+runtime_store_byte(volatile unsigned char* ptr, size_t offset,
+                   unsigned char value) {
+    runtime_compiler_barrier();
+    ptr[offset] = value;
+    runtime_byte_sink = value;
+    runtime_compiler_barrier();
+}
+
 static int has_prefix(const char* value, const char* prefix) {
     return strncmp(value, prefix, strlen(prefix)) == 0;
 }
@@ -70,6 +94,26 @@ static int load_stats(MaiStats* stats) {
         return -1;
     }
     return get_stats(stats);
+}
+
+static int wait_for_uffd_evictions(size_t target, MaiStats* out) {
+    MaiStats stats;
+    for (size_t wait = 0; wait < 200; wait++) {
+        if (load_stats(&stats) != 0) {
+            return -1;
+        }
+        if (stats.uffd_evictions >= target) {
+            if (out) {
+                *out = stats;
+            }
+            return 0;
+        }
+        usleep(1000);
+    }
+    if (out) {
+        *out = stats;
+    }
+    return 1;
 }
 
 static int visible_arena_files(void) {
@@ -2482,6 +2526,294 @@ static int mode_uffd_pager_adaptive_legacy_noop(void) {
     return 0;
 }
 
+static int mode_uffd_pager_clean_shadow_skip(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 8 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before clean shadow skip test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for clean shadow skip test");
+    }
+
+    volatile unsigned char* ptr = (volatile unsigned char*)malloc(size);
+    if (!ptr) {
+        return fail("UFFD clean shadow allocation failed");
+    }
+
+    size_t base_evictions = before.uffd_evictions;
+    runtime_store_byte(ptr, 0, 0x11);
+    runtime_store_byte(ptr, unit, 0x22);
+    if (wait_for_uffd_evictions(base_evictions + 1, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow skip did not demote initial chunk");
+    }
+    unsigned char restored = runtime_load_byte(ptr, 0);
+    if (wait_for_uffd_evictions(base_evictions + 2, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow skip did not demote post-restore chunk");
+    }
+    runtime_store_byte(ptr, 2 * unit, 0x33);
+    if (wait_for_uffd_evictions(base_evictions + 3, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow skip did not demote restored chunk");
+    }
+    if (restored != 0x11 || runtime_load_byte(ptr, 0) != 0x11) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow lost restored data");
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free((void*)ptr);
+        return fail("mai_get_stats failed after clean shadow skip touches");
+    }
+    size_t skipped =
+        after_touch.policy_clean_shadow_write_skipped_bytes -
+        before.policy_clean_shadow_write_skipped_bytes;
+    size_t skipped_chunks =
+        after_touch.policy_clean_shadow_write_skipped_chunks -
+        before.policy_clean_shadow_write_skipped_chunks;
+    size_t write_faults =
+        after_touch.policy_clean_shadow_write_faults -
+        before.policy_clean_shadow_write_faults;
+    size_t tracked =
+        after_touch.policy_clean_shadow_tracked_chunks -
+        before.policy_clean_shadow_tracked_chunks;
+    size_t protect_failures =
+        after_touch.policy_clean_shadow_protect_failures -
+        before.policy_clean_shadow_protect_failures;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow skip did not exercise pager pressure");
+    }
+    if (skipped < unit || skipped_chunks == 0 || write_faults != 0) {
+        fprintf(stderr,
+                "clean shadow skip stats: skipped=%zu chunks=%zu "
+                "write_faults=%zu tracked=%zu protect_failures=%zu "
+                "evictions=%zu demand_faults=%zu read_bytes=%zu "
+                "write_bytes=%zu useful_prefetch=%zu late_prefetch=%zu\n",
+                skipped, skipped_chunks, write_faults, tracked,
+                protect_failures,
+                after_touch.uffd_evictions - before.uffd_evictions,
+                after_touch.policy_demand_faults - before.policy_demand_faults,
+                after_touch.policy_migration_read_bytes -
+                    before.policy_migration_read_bytes,
+                after_touch.policy_migration_write_bytes -
+                    before.policy_migration_write_bytes,
+                after_touch.policy_prefetch_useful -
+                    before.policy_prefetch_useful,
+                after_touch.policy_prefetch_late -
+                    before.policy_prefetch_late);
+        free((void*)ptr);
+        return fail("UFFD clean shadow did not skip a clean demotion write");
+    }
+
+    free((void*)ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after clean shadow skip free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD clean shadow skip allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_clean_shadow_dirty(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 8 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before clean shadow dirty test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for clean shadow dirty test");
+    }
+
+    volatile unsigned char* ptr = (volatile unsigned char*)malloc(size);
+    if (!ptr) {
+        return fail("UFFD clean shadow dirty allocation failed");
+    }
+
+    size_t base_evictions = before.uffd_evictions;
+    runtime_store_byte(ptr, 0, 0x41);
+    runtime_store_byte(ptr, unit, 0x52);
+    if (wait_for_uffd_evictions(base_evictions + 1, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty did not demote initial chunk");
+    }
+    if (runtime_load_byte(ptr, 0) != 0x41) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty failed to restore clean chunk");
+    }
+    if (wait_for_uffd_evictions(base_evictions + 2, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty did not demote post-restore chunk");
+    }
+    runtime_store_byte(ptr, 0, 0x63);
+    if (runtime_load_byte(ptr, 0) != 0x63) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty lost updated resident data");
+    }
+    runtime_store_byte(ptr, 2 * unit, 0x74);
+    if (wait_for_uffd_evictions(base_evictions + 3, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty did not demote dirty chunk");
+    }
+    if (runtime_load_byte(ptr, 0) != 0x63) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty lost updated data");
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free((void*)ptr);
+        return fail("mai_get_stats failed after clean shadow dirty touches");
+    }
+    size_t skipped =
+        after_touch.policy_clean_shadow_write_skipped_bytes -
+        before.policy_clean_shadow_write_skipped_bytes;
+    size_t write_faults =
+        after_touch.policy_clean_shadow_write_faults -
+        before.policy_clean_shadow_write_faults;
+    size_t tracked =
+        after_touch.policy_clean_shadow_tracked_chunks -
+        before.policy_clean_shadow_tracked_chunks;
+    size_t protect_failures =
+        after_touch.policy_clean_shadow_protect_failures -
+        before.policy_clean_shadow_protect_failures;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty did not exercise pager pressure");
+    }
+    if (skipped != 0 || write_faults == 0) {
+        fprintf(stderr,
+                "clean shadow dirty stats: skipped=%zu write_faults=%zu "
+                "tracked=%zu protect_failures=%zu evictions=%zu "
+                "demand_faults=%zu read_bytes=%zu write_bytes=%zu "
+                "useful_prefetch=%zu late_prefetch=%zu\n",
+                skipped, write_faults, tracked, protect_failures,
+                after_touch.uffd_evictions - before.uffd_evictions,
+                after_touch.policy_demand_faults - before.policy_demand_faults,
+                after_touch.policy_migration_read_bytes -
+                    before.policy_migration_read_bytes,
+                after_touch.policy_migration_write_bytes -
+                    before.policy_migration_write_bytes,
+                after_touch.policy_prefetch_useful -
+                    before.policy_prefetch_useful,
+                after_touch.policy_prefetch_late -
+                    before.policy_prefetch_late);
+        free((void*)ptr);
+        return fail("UFFD clean shadow did not invalidate on write");
+    }
+
+    free((void*)ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after clean shadow dirty free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD clean shadow dirty allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_clean_shadow_fallback(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 8 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before clean shadow fallback test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for clean shadow fallback test");
+    }
+
+    volatile unsigned char* ptr = (volatile unsigned char*)malloc(size);
+    if (!ptr) {
+        return fail("UFFD clean shadow fallback allocation failed");
+    }
+
+    size_t base_evictions = before.uffd_evictions;
+    runtime_store_byte(ptr, 0, 0x21);
+    runtime_store_byte(ptr, unit, 0x32);
+    if (wait_for_uffd_evictions(base_evictions + 1, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback did not demote initial chunk");
+    }
+    if (runtime_load_byte(ptr, 0) != 0x21) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback failed to restore data");
+    }
+    if (wait_for_uffd_evictions(base_evictions + 2, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback did not demote after restore");
+    }
+    runtime_store_byte(ptr, 2 * unit, 0x43);
+    if (wait_for_uffd_evictions(base_evictions + 3, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback did not demote restored chunk");
+    }
+    if (runtime_load_byte(ptr, 0) != 0x21) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback lost restored data");
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free((void*)ptr);
+        return fail("mai_get_stats failed after clean shadow fallback touches");
+    }
+    size_t skipped =
+        after_touch.policy_clean_shadow_write_skipped_bytes -
+        before.policy_clean_shadow_write_skipped_bytes;
+    size_t tracked =
+        after_touch.policy_clean_shadow_tracked_chunks -
+        before.policy_clean_shadow_tracked_chunks;
+    size_t protect_failures =
+        after_touch.policy_clean_shadow_protect_failures -
+        before.policy_clean_shadow_protect_failures;
+    if (skipped != 0 || tracked != 0 || protect_failures == 0) {
+        fprintf(stderr,
+                "clean shadow fallback stats: skipped=%zu tracked=%zu "
+                "protect_failures=%zu\n",
+                skipped, tracked, protect_failures);
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback tracked an unsafe clean shadow");
+    }
+
+    free((void*)ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after clean shadow fallback free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD clean shadow fallback allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
 static int mode_uffd_pager_stride_policy(void) {
     MaiStats before;
     MaiStats after_touch;
@@ -4085,6 +4417,15 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_adaptive_legacy_noop") == 0) {
         return mode_uffd_pager_adaptive_legacy_noop();
+    }
+    if (strcmp(argv[1], "uffd_pager_clean_shadow_skip") == 0) {
+        return mode_uffd_pager_clean_shadow_skip();
+    }
+    if (strcmp(argv[1], "uffd_pager_clean_shadow_dirty") == 0) {
+        return mode_uffd_pager_clean_shadow_dirty();
+    }
+    if (strcmp(argv[1], "uffd_pager_clean_shadow_fallback") == 0) {
+        return mode_uffd_pager_clean_shadow_fallback();
     }
     if (strcmp(argv[1], "uffd_pager_stride_policy") == 0) {
         return mode_uffd_pager_stride_policy();

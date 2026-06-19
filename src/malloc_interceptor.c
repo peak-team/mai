@@ -303,6 +303,7 @@ struct AllocationRecord {
     size_t chunk_count;
     unsigned char* chunk_states;
     unsigned char* chunk_has_storage;
+    unsigned char* chunk_shadow_clean;
     size_t* chunk_touch_epochs;
     MaiChunkPolicyMeta* chunk_policy_meta;
     size_t resident_bytes;
@@ -444,6 +445,8 @@ static BackendMode backend_mode = BACKEND_MODE_AUTO;
 static UffdPagerMode uffd_pager_mode = UFFD_PAGER_OFF;
 static MigrationPolicy migration_policy = MIGRATION_POLICY_LEGACY;
 static int policy_observe_prefetch_writes = 0;
+static int uffd_clean_shadow_enabled = 0;
+static int uffd_clean_shadow_force_no_copy_wp = 0;
 static int uffd_pager_available = 0;
 static int uffd_fd = -1;
 static pthread_t uffd_thread;
@@ -3438,6 +3441,7 @@ static AllocationRecord* carve_block_locked(ArenaBlock* block, size_t user_size,
     record->chunk_count = 0;
     record->chunk_states = NULL;
     record->chunk_has_storage = NULL;
+    record->chunk_shadow_clean = NULL;
     record->chunk_touch_epochs = NULL;
     record->chunk_policy_meta = NULL;
     record->resident_bytes = 0;
@@ -3633,11 +3637,14 @@ static AllocationRecord* managed_uffd_alloc_locked(size_t size, size_t alignment
     }
     record->chunk_states = meta_alloc(record->chunk_count);
     record->chunk_has_storage = meta_alloc(record->chunk_count);
+    record->chunk_shadow_clean = meta_alloc(record->chunk_count);
     record->chunk_touch_epochs = meta_alloc(record->chunk_count * sizeof(size_t));
     if (!record->chunk_states || !record->chunk_has_storage ||
+        !record->chunk_shadow_clean ||
         !record->chunk_touch_epochs) {
         meta_free(record->chunk_states);
         meta_free(record->chunk_has_storage);
+        meta_free(record->chunk_shadow_clean);
         meta_free(record->chunk_touch_epochs);
         meta_free(record);
         munmap(base, mapped_length);
@@ -3646,6 +3653,7 @@ static AllocationRecord* managed_uffd_alloc_locked(size_t size, size_t alignment
     }
     memset(record->chunk_states, CHUNK_FILE_COLD, record->chunk_count);
     memset(record->chunk_has_storage, 0, record->chunk_count);
+    memset(record->chunk_shadow_clean, 0, record->chunk_count);
     memset(record->chunk_touch_epochs, 0, record->chunk_count * sizeof(size_t));
     (void)init_record_policy_meta_locked(record);
 
@@ -3654,6 +3662,7 @@ static AllocationRecord* managed_uffd_alloc_locked(size_t size, size_t alignment
     if (page_length == 0) {
         meta_free(record->chunk_states);
         meta_free(record->chunk_has_storage);
+        meta_free(record->chunk_shadow_clean);
         meta_free(record->chunk_touch_epochs);
         free_record_policy_meta_locked(record);
         meta_free(record);
@@ -3665,6 +3674,7 @@ static AllocationRecord* managed_uffd_alloc_locked(size_t size, size_t alignment
     if (record->storage_fd < 0) {
         meta_free(record->chunk_states);
         meta_free(record->chunk_has_storage);
+        meta_free(record->chunk_shadow_clean);
         meta_free(record->chunk_touch_epochs);
         free_record_policy_meta_locked(record);
         meta_free(record);
@@ -3853,6 +3863,8 @@ static void managed_free_record_locked(AllocationRecord* record) {
         record->chunk_states = NULL;
         meta_free(record->chunk_has_storage);
         record->chunk_has_storage = NULL;
+        meta_free(record->chunk_shadow_clean);
+        record->chunk_shadow_clean = NULL;
         meta_free(record->chunk_touch_epochs);
         record->chunk_touch_epochs = NULL;
         if (record->base_ptr && record->mapped_length != 0) {
@@ -3989,6 +4001,18 @@ static int uffd_writeprotect_range(uintptr_t start, size_t length, int protect) 
     wp.range.len = (unsigned long)length;
     wp.mode = protect ? UFFDIO_WRITEPROTECT_MODE_WP : 0;
     return ioctl(uffd_fd, UFFDIO_WRITEPROTECT, &wp);
+}
+
+static int uffd_wake_range(uintptr_t start, size_t length) {
+    if (uffd_fd < 0 || length == 0) {
+        return -1;
+    }
+
+    struct uffdio_range range;
+    memset(&range, 0, sizeof(range));
+    range.start = (unsigned long)start;
+    range.len = (unsigned long)length;
+    return ioctl(uffd_fd, UFFDIO_WAKE, &range);
 }
 
 static void insert_uffd_record_locked(AllocationRecord* record) {
@@ -4974,7 +4998,6 @@ static void policy_note_resident_demand_locked(AllocationRecord* record,
 static void policy_note_evict_locked(AllocationRecord* record, size_t index,
                                      size_t length) {
     stats_snapshot.policy_demotions++;
-    stats_snapshot.policy_migration_write_bytes += length;
     if (!record || index >= record->chunk_count ||
         !record->chunk_policy_meta) {
         return;
@@ -5006,6 +5029,15 @@ static void policy_note_evict_locked(AllocationRecord* record, size_t index,
         meta->successor_index = successor_index;
         meta->successor_confidence = successor_confidence;
     }
+}
+
+static void policy_note_evict_write_locked(size_t length) {
+    stats_snapshot.policy_migration_write_bytes += length;
+}
+
+static void policy_note_clean_shadow_skip_locked(size_t length) {
+    stats_snapshot.policy_clean_shadow_write_skipped_bytes += length;
+    stats_snapshot.policy_clean_shadow_write_skipped_chunks++;
 }
 
 static void policy_note_evict_runtime_locked(AllocationRecord* record,
@@ -5278,7 +5310,10 @@ static int evict_uffd_chunk_locked(AllocationRecord* record, size_t index,
     if (ensure_record_storage_locked(record) != 0) {
         return -1;
     }
-
+    int clean_shadow =
+        uffd_clean_shadow_enabled &&
+        record->chunk_has_storage && record->chunk_has_storage[index] &&
+        record->chunk_shadow_clean && record->chunk_shadow_clean[index];
     if (uffd_writeprotect_range(start, length, 1) != 0) {
         return -1;
     }
@@ -5290,7 +5325,8 @@ static int evict_uffd_chunk_locked(AllocationRecord* record, size_t index,
         return -1;
     }
     off_t offset = (off_t)(start - (uintptr_t)page_start_ptr);
-    int rc = write_all_at(record->storage_fd, (void*)start, length, offset);
+    int rc = clean_shadow ? 0 :
+        write_all_at(record->storage_fd, (void*)start, length, offset);
     if (rc == 0 && madvise((void*)start, length, MADV_DONTNEED) != 0) {
         rc = -1;
     }
@@ -5299,10 +5335,18 @@ static int evict_uffd_chunk_locked(AllocationRecord* record, size_t index,
         return -1;
     }
 
+    if (clean_shadow) {
+        policy_note_clean_shadow_skip_locked(length);
+    } else {
+        policy_note_evict_write_locked(length);
+    }
     policy_note_evict_locked(record, index, length);
     record->chunk_states[index] = CHUNK_FILE_COLD;
     if (record->chunk_has_storage) {
         record->chunk_has_storage[index] = 1;
+    }
+    if (record->chunk_shadow_clean) {
+        record->chunk_shadow_clean[index] = 0;
     }
     if (record->resident_bytes >= length) {
         record->resident_bytes -= length;
@@ -5372,6 +5416,7 @@ static void release_uffd_scratch_locked(void) {
 
 static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
                                       int count_fault_event,
+                                      int track_clean_shadow,
                                       size_t* populated_bytes) {
     if (!record || record->backend != BACKEND_UFFD_PAGER ||
         !record->chunk_states || index >= record->chunk_count) {
@@ -5397,6 +5442,9 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
 
     int has_storage = record->chunk_states[index] == CHUNK_FILE_COLD &&
         record->chunk_has_storage && record->chunk_has_storage[index];
+    int defer_wake_for_clean_shadow =
+        uffd_clean_shadow_enabled && has_storage && track_clean_shadow;
+    int clean_shadow_wp_armed_by_copy = 0;
     if (has_storage) {
         void* temp = NULL;
         if (ensure_uffd_scratch_locked(length, &temp) != 0) {
@@ -5419,8 +5467,28 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
         copy.dst = (unsigned long)chunk_start;
         copy.src = (unsigned long)temp;
         copy.len = (unsigned long)length;
-        if (ioctl(uffd_fd, UFFDIO_COPY, &copy) != 0) {
-            return -1;
+        if (defer_wake_for_clean_shadow) {
+            copy.mode = UFFDIO_COPY_MODE_DONTWAKE | UFFDIO_COPY_MODE_WP;
+        }
+        int copy_rc = uffd_clean_shadow_force_no_copy_wp &&
+            defer_wake_for_clean_shadow ? -1 : ioctl(uffd_fd, UFFDIO_COPY, &copy);
+        int copy_errno = uffd_clean_shadow_force_no_copy_wp &&
+            defer_wake_for_clean_shadow ? EINVAL : errno;
+        if (copy_rc != 0) {
+            if (!defer_wake_for_clean_shadow || copy_errno != EINVAL) {
+                return -1;
+            }
+            stats_snapshot.policy_clean_shadow_protect_failures++;
+            defer_wake_for_clean_shadow = 0;
+            memset(&copy, 0, sizeof(copy));
+            copy.dst = (unsigned long)chunk_start;
+            copy.src = (unsigned long)temp;
+            copy.len = (unsigned long)length;
+            if (ioctl(uffd_fd, UFFDIO_COPY, &copy) != 0) {
+                return -1;
+            }
+        } else if (defer_wake_for_clean_shadow) {
+            clean_shadow_wp_armed_by_copy = 1;
         }
     } else {
         struct uffdio_zeropage zero;
@@ -5441,10 +5509,27 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
         }
         policy_note_populate_locked(record, index, count_fault_event,
                                     has_storage, length);
+        int clean_shadow_tracked = 0;
+        if (defer_wake_for_clean_shadow) {
+            if (clean_shadow_wp_armed_by_copy) {
+                clean_shadow_tracked = 1;
+                stats_snapshot.policy_clean_shadow_tracked_chunks++;
+            } else {
+                stats_snapshot.policy_clean_shadow_protect_failures++;
+            }
+        }
+        if (record->chunk_shadow_clean) {
+            record->chunk_shadow_clean[index] =
+                (unsigned char)clean_shadow_tracked;
+        }
         if (policy_observe_prefetch_writes &&
             (!count_fault_event || migration_policy == MIGRATION_POLICY_LFU)) {
             (void)uffd_writeprotect_range(chunk_start, length, 1);
         }
+    }
+    if (defer_wake_for_clean_shadow &&
+        uffd_wake_range(chunk_start, length) != 0) {
+        return -1;
     }
     record->chunk_touch_epochs[index] = ++uffd_touch_epoch;
     if (count_fault_event) {
@@ -5600,7 +5685,8 @@ static int policy_apply_prefetch_plan_locked(AllocationRecord* record,
                                           prefetch_length, &protected_set)) {
             continue;
         }
-        if (populate_uffd_chunk_locked(record, prefetch_index, 0, NULL) != 0) {
+        if (populate_uffd_chunk_locked(record, prefetch_index, 0, 1,
+                                       NULL) != 0) {
             break;
         }
         policy_protect_chunk_index(&protected_set, record, prefetch_index);
@@ -5758,6 +5844,25 @@ static int resolve_uffd_fault_locked(uintptr_t fault_address,
         return -1;
     }
     if (flags & UFFD_PAGEFAULT_FLAG_WP) {
+        if (record->chunk_shadow_clean &&
+            record->chunk_shadow_clean[index]) {
+            record->chunk_shadow_clean[index] = 0;
+            stats_snapshot.policy_clean_shadow_write_faults++;
+        }
+        if (record->chunk_states[index] != CHUNK_ANON_HOT) {
+            policy_note_demand_fault_locked(record, index);
+            if (populate_uffd_chunk_locked(record, index, 1, 0,
+                                           NULL) != 0) {
+                return -1;
+            }
+            if (policy_enqueue_async_after_access_locked(record, index,
+                                                         runtime_lock_held)) {
+                return policy_hard_reclaim_after_async_enqueue_locked(
+                    record, index, runtime_lock_held);
+            }
+            return policy_prefetch_and_reclaim_after_access_locked(
+                record, index, runtime_lock_held);
+        }
         if (uffd_writeprotect_range(chunk_start, length, 0) != 0) {
             return -1;
         }
@@ -5773,7 +5878,9 @@ static int resolve_uffd_fault_locked(uintptr_t fault_address,
             record, index, runtime_lock_held);
     }
     policy_note_demand_fault_locked(record, index);
-    if (populate_uffd_chunk_locked(record, index, 1, NULL) != 0) {
+    int write_fault = (flags & UFFD_PAGEFAULT_FLAG_WRITE) != 0;
+    if (populate_uffd_chunk_locked(record, index, 1, !write_fault,
+                                   NULL) != 0) {
         return -1;
     }
     if (policy_enqueue_async_after_access_locked(record, index,
@@ -6119,6 +6226,7 @@ static int migrate_anon_range_to_file_locked(AllocationRecord* record,
         if (write_all_at(record->storage_fd, (void*)start, length, offset) != 0) {
             return -1;
         }
+        policy_note_evict_write_locked(length);
 
         void* mapped = mmap((void*)start, length, PROT_READ | PROT_WRITE,
                             MAP_SHARED | MAP_FIXED, record->storage_fd, offset);
@@ -7646,7 +7754,12 @@ static void print_stats(void) {
             "policy_adaptive_windows=%zu policy_adaptive_level=%zu "
             "policy_adaptive_level_changes=%zu "
             "policy_adaptive_prefetch_capped=%zu "
-            "policy_adaptive_admission_rejected=%zu\n",
+            "policy_adaptive_admission_rejected=%zu "
+            "policy_clean_shadow_tracked_chunks=%zu "
+            "policy_clean_shadow_protect_failures=%zu "
+            "policy_clean_shadow_write_skipped_bytes=%zu "
+            "policy_clean_shadow_write_skipped_chunks=%zu "
+            "policy_clean_shadow_write_faults=%zu\n",
             stats.enabled, stats.configured, stats.config_error, stats.threshold,
             stats.arena_size, stats.target_rss, stats.max_rss,
             stats.current_rss_bytes, stats.high_water_rss_bytes,
@@ -7697,7 +7810,12 @@ static void print_stats(void) {
             stats.policy_adaptive_level,
             stats.policy_adaptive_level_changes,
             stats.policy_adaptive_prefetch_capped,
-            stats.policy_adaptive_admission_rejected);
+            stats.policy_adaptive_admission_rejected,
+            stats.policy_clean_shadow_tracked_chunks,
+            stats.policy_clean_shadow_protect_failures,
+            stats.policy_clean_shadow_write_skipped_bytes,
+            stats.policy_clean_shadow_write_skipped_chunks,
+            stats.policy_clean_shadow_write_faults);
 }
 
 static void print_profile_report(void) {
@@ -7847,6 +7965,10 @@ static int configure_runtime(void) {
         getenv("MAI_UFFD_ASYNC_PREFETCH");
     const char* uffd_async_slack =
         getenv("MAI_UFFD_ASYNC_SLACK_CHUNKS");
+    const char* uffd_clean_shadow =
+        getenv("MAI_UFFD_CLEAN_SHADOW");
+    const char* uffd_clean_shadow_force_no_copy_wp_env =
+        getenv("MAI_UFFD_CLEAN_SHADOW_FORCE_NO_COPY_WP");
     const char* record_protect =
         getenv("MAI_RECORD_PROTECT_EPOCHS");
     const char* active_record =
@@ -7903,6 +8025,8 @@ static int configure_runtime(void) {
     uffd_pager_mode = UFFD_PAGER_OFF;
     migration_policy = MIGRATION_POLICY_LEGACY;
     policy_observe_prefetch_writes = 0;
+    uffd_clean_shadow_enabled = 0;
+    uffd_clean_shadow_force_no_copy_wp = 0;
     uffd_async_prefetch_enabled = 0;
     uffd_async_slack_chunks = MAI_DEFAULT_UFFD_ASYNC_SLACK_CHUNKS;
     atomic_store_explicit(&uffd_async_thread_started, 0,
@@ -8118,6 +8242,9 @@ static int configure_runtime(void) {
         runtime_config_error = 1;
         return -1;
     }
+    uffd_clean_shadow_enabled = parse_bool_env(uffd_clean_shadow);
+    uffd_clean_shadow_force_no_copy_wp =
+        parse_bool_env(uffd_clean_shadow_force_no_copy_wp_env);
     if (record_protect &&
         parse_count_env(record_protect, &record_protect_epochs) != 0) {
         runtime_config_error = 1;

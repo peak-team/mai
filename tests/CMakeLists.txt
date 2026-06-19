@@ -738,6 +738,73 @@ set_tests_properties(mai_uffd_pager_adaptive_legacy_noop
     PROPERTIES SKIP_RETURN_CODE 77)
 
 add_test(
+    NAME mai_uffd_pager_clean_shadow_skip
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=64M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_RESIDENT_LIMIT=2M"
+        "MAI_UFFD_RESIDENT_LOW_LIMIT=2M"
+        "MAI_UFFD_PREFETCH_CHUNKS=1"
+        "MAI_MIGRATION_CHUNK=2M"
+        "MAI_UFFD_CLEAN_SHADOW=1"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_clean_shadow_skip
+)
+set_tests_properties(mai_uffd_pager_clean_shadow_skip
+    PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
+    NAME mai_uffd_pager_clean_shadow_dirty
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=64M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_RESIDENT_LIMIT=2M"
+        "MAI_UFFD_RESIDENT_LOW_LIMIT=2M"
+        "MAI_UFFD_PREFETCH_CHUNKS=1"
+        "MAI_MIGRATION_CHUNK=2M"
+        "MAI_UFFD_CLEAN_SHADOW=1"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_clean_shadow_dirty
+)
+set_tests_properties(mai_uffd_pager_clean_shadow_dirty
+    PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
+    NAME mai_uffd_pager_clean_shadow_fallback
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=64M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_RESIDENT_LIMIT=2M"
+        "MAI_UFFD_RESIDENT_LOW_LIMIT=2M"
+        "MAI_UFFD_PREFETCH_CHUNKS=1"
+        "MAI_MIGRATION_CHUNK=2M"
+        "MAI_UFFD_CLEAN_SHADOW=1"
+        "MAI_UFFD_CLEAN_SHADOW_FORCE_NO_COPY_WP=1"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_clean_shadow_fallback
+)
+set_tests_properties(mai_uffd_pager_clean_shadow_fallback
+    PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
     NAME mai_uffd_pager_spatial_prefetch
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"

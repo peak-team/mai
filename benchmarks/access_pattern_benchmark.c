@@ -3431,6 +3431,21 @@ int main(int argc, char** argv) {
     size_t policy_adaptive_admission_rejected = after_stats_available ?
         after.policy_adaptive_admission_rejected -
         before.policy_adaptive_admission_rejected : 0;
+    size_t policy_clean_shadow_tracked_chunks = after_stats_available ?
+        after.policy_clean_shadow_tracked_chunks -
+        before.policy_clean_shadow_tracked_chunks : 0;
+    size_t policy_clean_shadow_protect_failures = after_stats_available ?
+        after.policy_clean_shadow_protect_failures -
+        before.policy_clean_shadow_protect_failures : 0;
+    size_t policy_clean_shadow_write_skipped_bytes = after_stats_available ?
+        after.policy_clean_shadow_write_skipped_bytes -
+        before.policy_clean_shadow_write_skipped_bytes : 0;
+    size_t policy_clean_shadow_write_skipped_chunks = after_stats_available ?
+        after.policy_clean_shadow_write_skipped_chunks -
+        before.policy_clean_shadow_write_skipped_chunks : 0;
+    size_t policy_clean_shadow_write_faults = after_stats_available ?
+        after.policy_clean_shadow_write_faults -
+        before.policy_clean_shadow_write_faults : 0;
     const char* policy_prefetch_observation =
         after_stats_available && after.policy_prefetch_observation != 0 ?
         "write_protect" : "unobserved";
@@ -3503,6 +3518,11 @@ int main(int argc, char** argv) {
            "policy_adaptive_level_changes=%zu "
            "policy_adaptive_prefetch_capped=%zu "
            "policy_adaptive_admission_rejected=%zu "
+           "policy_clean_shadow_tracked_chunks=%zu "
+           "policy_clean_shadow_protect_failures=%zu "
+           "policy_clean_shadow_write_skipped_bytes=%zu "
+           "policy_clean_shadow_write_skipped_chunks=%zu "
+           "policy_clean_shadow_write_faults=%zu "
            "max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
@@ -3599,6 +3619,11 @@ int main(int argc, char** argv) {
            policy_adaptive_windows, policy_adaptive_level,
            policy_adaptive_level_changes, policy_adaptive_prefetch_capped,
            policy_adaptive_admission_rejected,
+           policy_clean_shadow_tracked_chunks,
+           policy_clean_shadow_protect_failures,
+           policy_clean_shadow_write_skipped_bytes,
+           policy_clean_shadow_write_skipped_chunks,
+           policy_clean_shadow_write_faults,
            after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,

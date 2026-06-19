@@ -182,6 +182,11 @@ Runtime policy knobs are intentionally separate from benchmark knobs:
   `MAI_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS`: adaptive feedback sensitivity
 - `MAI_POLICY_OBSERVE_PREFETCH_WRITES=1`: opt-in write-protect observation for
   useful-prefetch metrics on write-heavy workloads
+- `MAI_UFFD_CLEAN_SHADOW=1`: opt-in UFFD clean-shadow tracking that can skip
+  demotion writes for restored chunks that were not written before demotion.
+  Tracking requires atomic restore-with-write-protect; benchmark output
+  reports tracked chunks, protect failures, skipped clean writes, and
+  write-protect invalidation faults.
 
 Policy pressure scenarios can use `mai_policy_pipeline` with
 `MAI_MIGRATION_POLICY`, or a policy-specific scenario such as

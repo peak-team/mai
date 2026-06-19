@@ -153,9 +153,14 @@ reclaim events. When `MAI_POLICY_ADAPTIVE_CONTROL=1` is enabled, adaptive
 behavior is also broken out into `policy_adaptive_windows`,
 `policy_adaptive_level`, `policy_adaptive_level_changes`,
 `policy_adaptive_prefetch_capped`, and
-`policy_adaptive_admission_rejected`. `policy_throttle_slept_ns` is reserved
-for a future bandwidth/stall-budget throttle; current policies reject or
-shrink speculative work instead of sleeping in the fault handler.
+`policy_adaptive_admission_rejected`. Opt-in clean-shadow tracking reports
+`policy_clean_shadow_tracked_chunks`,
+`policy_clean_shadow_protect_failures`,
+`policy_clean_shadow_write_skipped_bytes`,
+`policy_clean_shadow_write_skipped_chunks`, and
+`policy_clean_shadow_write_faults`. `policy_throttle_slept_ns` is reserved for
+a future bandwidth/stall-budget throttle; current policies reject or shrink
+speculative work instead of sleeping in the fault handler.
 
 `MAI_UFFD_ASYNC_PREFETCH=1` enables an experimental UFFD background policy
 worker. Demand faults are still resolved synchronously. The worker only moves
@@ -205,6 +210,17 @@ observation overhead. Benchmark fields named `*_observed` are therefore
 observed lower bounds unless the row says
 `policy_prefetch_observation=write_protect`.
 
+`MAI_UFFD_CLEAN_SHADOW=1` enables opt-in clean storage-shadow tracking for the
+UFFD pager. When a cold chunk is restored from storage, MAI maps it
+write-protected before waking the faulting thread. If the kernel cannot do the
+restore and write-protect atomically, MAI records a protect failure and does
+not mark that chunk clean. If a tracked chunk is demoted again without a
+write-protect fault, MAI skips the storage write because the existing shadow is
+still valid. The first write clears the clean bit and the next demotion writes
+the dirty chunk normally. This can reduce write amplification for read-mostly
+reuse, but it adds write-protect faults to write-heavy reuse and is not a
+default performance mode.
+
 ## Algorithm Designs
 
 | Family | Integrated policy design | MAI priority |
@@ -225,7 +241,7 @@ observed lower bounds unless the row says
 | Record-aware demotion | Treat an allocation record as a coarse working-set unit. Under pressure, avoid demoting demand-confirmed chunks from records with recent faults, but still evict unused prefetched chunks first. | Implemented as opt-in `MAI_RECORD_PROTECT_EPOCHS`; useful as a tuning control, not a default. |
 | Active-record working-set control | Infer the active allocation-record set from demand faults. Coordinate admission, eviction, and the reclaim floor so active resident demand-confirmed chunks are not displaced by speculative prefetch or an overly tight low watermark. | Implemented as opt-in `MAI_ACTIVE_RECORD_EPOCHS` plus `MAI_ACTIVE_RECORD_SLACK_CHUNKS`; designed for phase-capture experiments such as the no-oracle 9-matrix pipeline. |
 | Adaptive admission/throttling | Treat prefetch, admission, eviction, and throttle as one loop. Recent pollution or stall pressure shrinks lookahead and raises confidence thresholds; useful or late-prefetch pressure relaxes them. | Implemented as opt-in `MAI_POLICY_ADAPTIVE_CONTROL`; currently useful for confidence-bearing policies such as `markov`, not for `legacy`. |
-| Nomad-style shadowing | Keep valid clean storage shadows after promotion until a write invalidates them. Clean demotion can then avoid rewriting the chunk. | High-value write-amplification reduction, not yet implemented. |
+| Nomad-style shadowing | Keep valid clean storage shadows after promotion until a write invalidates them. Clean demotion can then avoid rewriting the chunk; dirty demotion still writes back. | Implemented as opt-in `MAI_UFFD_CLEAN_SHADOW`; useful for read-mostly reuse and explicitly not a default write-heavy mode. |
 | Application hints | Treat `mai_hint_range()`, `mai_prefetch()`, and `mai_prepare_write()` as confidence and intent signals, not commands that bypass budgets. | Supported primitives; not used by no-oracle claims. |
 | Queue-aware policies | Accept future ranges with deadlines from schedulers. Admission depends on whether migration can finish before the request executes. | Integration API candidate, separate from autonomous benchmarks. |
 | ML or bandit selector | Prefer a contextual bandit over neural prediction at first: choose among stream, stride, spatial, and admission thresholds from online metrics. | Later meta-policy after several concrete policies exist. |
