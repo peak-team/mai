@@ -2924,7 +2924,8 @@ static int mode_uffd_pager_stride_policy(void) {
 }
 
 static int mode_uffd_pager_hotset_scan_policy(const char* policy_name,
-                                              int expect_car_activity) {
+                                              int expect_car_activity,
+                                              int expect_tinylfu_activity) {
     MaiStats before;
     MaiStats after_touch;
     MaiStats after_free;
@@ -3030,6 +3031,21 @@ static int mode_uffd_pager_hotset_scan_policy(const char* policy_name,
             return fail("UFFD CAR hotset test did not exercise CAR state");
         }
     }
+    if (expect_tinylfu_activity) {
+        size_t updates =
+            after_touch.policy_tinylfu_sketch_updates -
+            before.policy_tinylfu_sketch_updates;
+        size_t rejected =
+            after_touch.policy_tinylfu_admission_rejected -
+            before.policy_tinylfu_admission_rejected;
+        if (updates == 0 || rejected == 0) {
+            fprintf(stderr,
+                    "TinyLFU hotset stats: updates=%zu rejected=%zu\n",
+                    updates, rejected);
+            free(ptr);
+            return fail("UFFD TinyLFU hotset test did not exercise sketch admission");
+        }
+    }
 
     free(ptr);
     if (load_stats(&after_free) != 0) {
@@ -3043,15 +3059,19 @@ static int mode_uffd_pager_hotset_scan_policy(const char* policy_name,
 }
 
 static int mode_uffd_pager_lfu_hotset_scan(void) {
-    return mode_uffd_pager_hotset_scan_policy("LFU", 0);
+    return mode_uffd_pager_hotset_scan_policy("LFU", 0, 0);
 }
 
 static int mode_uffd_pager_lruk_hotset_scan(void) {
-    return mode_uffd_pager_hotset_scan_policy("LRU-K", 0);
+    return mode_uffd_pager_hotset_scan_policy("LRU-K", 0, 0);
 }
 
 static int mode_uffd_pager_car_hotset_scan(void) {
-    return mode_uffd_pager_hotset_scan_policy("CAR", 1);
+    return mode_uffd_pager_hotset_scan_policy("CAR", 1, 0);
+}
+
+static int mode_uffd_pager_tinylfu_hotset_scan(void) {
+    return mode_uffd_pager_hotset_scan_policy("TinyLFU", 0, 1);
 }
 
 static int mode_uffd_pager_successor_policy(void) {
@@ -4470,6 +4490,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_car_hotset_scan") == 0) {
         return mode_uffd_pager_car_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_tinylfu_hotset_scan") == 0) {
+        return mode_uffd_pager_tinylfu_hotset_scan();
     }
     if (strcmp(argv[1], "uffd_pager_successor_policy") == 0) {
         return mode_uffd_pager_successor_policy();

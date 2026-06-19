@@ -308,6 +308,51 @@ trails `legacy` on demand faults and migration volume. Ghost feedback and
 target movement are observed, but the policy still needs better prefetch
 admission or migration traffic control before it can be promoted.
 
+### TinyLFU Long-Tail Admission Probe
+
+`MAI_MIGRATION_POLICY=tinylfu` is an experimental sketch-backed admission
+classifier. It uses a fixed global Count-Min-style sketch keyed by allocation
+sequence and chunk index, trains only on demand-observed touches, and gates
+speculative prefetch admission under pressure. Demand faults still populate;
+TinyLFU is not a new prefetch predictor.
+
+These six-run means use 64 MiB workloads, 2 MiB chunks, an 8 MiB resident high
+watermark, a 6 MiB low watermark, and `MAI_MAX_RSS=16M`. The
+`policy_long_tail_admission` row uses a full cold-tail permutation per pass;
+earlier modulo-LCG runs accidentally revisited only part of the cold tail and
+are intentionally superseded.
+
+| Workload | Policy | Events/s | Demand faults | Read MiB | Write MiB | Admission rejects | Unused evictions | Hot-evicted MiB | TinyLFU updates | TinyLFU rejects |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `policy_hotset_scan` | `legacy` | 2373 | 50 | 136 | 194 | 0 | 48 | 98 | 0 | 0 |
+| `policy_hotset_scan` | `lfu` | 2284 | 67 | 138 | 194 | 31 | 34 | 126 | 0 | 0 |
+| `policy_hotset_scan` | `car` | 2507 | 55 | 144 | 202 | 2 | 48 | 106 | 0 | 0 |
+| `policy_hotset_scan` | `lruk` | 2473 | 98 | 136 | 192 | 93 | 2 | 188 | 0 | 0 |
+| `policy_hotset_scan` | `tinylfu` | 2313 | 98 | 136 | 192 | 93 | 2 | 188 | 98 | 93 |
+| `policy_phase_shift_hotset` | `legacy` | 3277 | 46 | 120 | 178 | 0 | 44 | 90 | 0 | 0 |
+| `policy_phase_shift_hotset` | `lfu` | 2737 | 50 | 124 | 182 | 3 | 44 | 94 | 0 | 0 |
+| `policy_phase_shift_hotset` | `car` | 2786 | 52 | 130 | 188 | 2 | 44 | 100 | 0 | 0 |
+| `policy_phase_shift_hotset` | `lruk` | 2670 | 90 | 120 | 176 | 85 | 2 | 172 | 0 | 0 |
+| `policy_phase_shift_hotset` | `tinylfu` | 2828 | 90 | 120 | 176 | 85 | 2 | 172 | 90 | 85 |
+| `policy_recency_frequency_pivot` | `legacy` | 2382 | 98 | 328 | 386 | 0 | 96 | 194 | 0 | 0 |
+| `policy_recency_frequency_pivot` | `lfu` | 2375 | 201 | 370 | 426 | 175 | 16 | 394 | 0 | 0 |
+| `policy_recency_frequency_pivot` | `car` | 2020 | 118 | 347 | 405 | 21 | 86 | 232 | 0 | 0 |
+| `policy_recency_frequency_pivot` | `lruk` | 1884 | 156 | 379 | 437 | 77 | 65 | 308 | 0 | 0 |
+| `policy_recency_frequency_pivot` | `tinylfu` | 1895 | 218 | 419 | 477 | 185 | 23 | 432 | 218 | 185 |
+| `policy_long_tail_admission` | `legacy` | 1668 | 124 | 310 | 368 | 0 | 61 | 246 | 0 | 0 |
+| `policy_long_tail_admission` | `lfu` | 1992 | 153 | 277 | 335 | 67 | 18 | 299 | 0 | 0 |
+| `policy_long_tail_admission` | `car` | 1849 | 132 | 308 | 366 | 5 | 53 | 260 | 0 | 0 |
+| `policy_long_tail_admission` | `lruk` | 1803 | 152 | 295 | 351 | 59 | 28 | 296 | 0 | 0 |
+| `policy_long_tail_admission` | `tinylfu` | 1910 | 161 | 294 | 350 | 75 | 18 | 314 | 161 | 75 |
+
+The corrected result is intentionally modest. TinyLFU is a poor fit for the
+small phase-shift and recency/frequency pivot probes because it rejects useful
+speculation until demand history exists. On the corrected long-tail admission
+workload, it matches exact `lfu` on unused-prefetch evictions and reduces
+migration bytes versus `legacy`, but it does not beat exact `lfu` on throughput,
+demand faults, or hot-evicted bytes. Keep it experimental: this slice validates
+sketch-backed admission plumbing, not a production default.
+
 ## Interpretation
 
 - Sufficient-memory MAI does not trigger migration in these runs; faster
@@ -325,6 +370,10 @@ admission or migration traffic control before it can be promoted.
   local hotset and pivot event-rate rows and avoids the worst `2q`/`lruk`
   pivot hot evictions, but it still does not beat `legacy` on demand faults or
   migration volume.
+- `tinylfu` is the first sketch-backed admission slice. It is not competitive
+  on the small phase-shift probes. On the corrected long-tail workload, it
+  reduces cold-tail prefetch pollution versus `legacy` but does not beat exact
+  `lfu`; use it as infrastructure for future W-TinyLFU-style policies.
 - On the local six-run 9-matrix pressure shape, `legacy` has the highest mean
   end-to-end rate among the low-watermark 48 MiB rows. It reaches only 22.9%
   of the matching MAI-managed sufficient-memory end-to-end baseline, while its

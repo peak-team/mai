@@ -145,6 +145,8 @@ runtime strategy:
   predictor for repeated irregular chunk order.
 - `spatial`, `spatial-mask`, or `region-mask`: per-allocation region-mask
   predictor for stable sparse spatial access inside fixed chunk groups.
+- `tinylfu`, `tiny-lfu`, or `sketch-lfu`: compact Count-Min-style admission
+  classifier trained only by demand-observed chunk touches.
 
 All policies share append-only `MaiStats` counters for prefetch requests,
 admissions, completions, useful prefetches, late demand faults, unused-prefetch
@@ -165,6 +167,8 @@ behavior is also broken out into `policy_adaptive_windows`,
 `policy_clean_shadow_write_faults`. CAR-lite also reports current
 recent/frequent resident and ghost chunk counts, recent/frequent ghost hits,
 target movement, and second-chance scans through `policy_car_*` counters.
+TinyLFU reports sketch updates, sketch decays, sketch admission rejects, and
+the current minimum admission score through `policy_tinylfu_*` counters.
 `policy_throttle_slept_ns` is reserved for
 a future bandwidth/stall-budget throttle; current policies reject or shrink
 speculative work instead of sleeping in the fault handler.
@@ -233,7 +237,7 @@ default performance mode.
 | Family | Integrated policy design | MAI priority |
 | --- | --- | --- |
 | LRU, CLOCK, FIFO, Random | Demand faults admit chunks. Prefetch enters probation. Eviction uses oldest touch, second-chance reference bit, admission order, or random victim. Throttling is fixed by resident limits and migration chunk size. | Implemented as baselines. |
-| LFU and decayed LFU | Track exact per-chunk frequency with lazy decay and ghost scores after eviction. Admit a prefetch under pressure only if its score beats the current victim or ties an unused/probation victim. Evict unused prefetches first, then low-frequency chunks. Optional write-protect observation can add one resident reuse signal but also adds handler overhead. | Implemented as `lfu`/`decayed-lfu`; approximate TinyLFU sketches remain future work. |
+| LFU and decayed LFU | Track exact per-chunk frequency with lazy decay and ghost scores after eviction. Admit a prefetch under pressure only if its score beats the current victim or ties an unused/probation victim. Evict unused prefetches first, then low-frequency chunks. Optional write-protect observation can add one resident reuse signal but also adds handler overhead. | Implemented as `lfu`/`decayed-lfu`; use it as the exact-frequency baseline for the separate `tinylfu` sketch policy. |
 | 2Q | New or prefetched chunks enter a probation queue. A second demand touch promotes them to the protected set. Eviction demotes probation before protected chunks. | Implemented as a conservative admission baseline; queue refinement remains future work. |
 | ARC, CAR, CART | Maintain recent and frequent resident sets plus ghost histories. Ghost hits tune the split between recency and frequency. Prefetched chunks never enter the frequent set until a demand touch confirms them. | Implemented first as `car`/`car-lite`, a compact CAR/CLOCK-Pro approximation using per-chunk state and ARC-style target movement; exact ARC/CART metadata remains future work. |
 | LRU-K / reuse distance | Keep a compact two-reference history per chunk. Admit speculative prefetch under pressure only when it can displace unused or immature chunks, and evict by the older Kth-reference epoch among mature chunks. | Implemented as `lruk`/`lru-k`, an LRU-2 approximation with ghost history across demotion. |
@@ -244,7 +248,7 @@ default performance mode.
 | Markov and delta-correlation | Keep one bounded successor edge per chunk. Admit only repeated high-confidence successors, and require stronger confidence under resident pressure. | Implemented as `markov`/`successor` in first form; no fanout or chaining yet. |
 | Signature/history-table | Use rolling delta signatures to predict multi-step sequences. Confidence controls depth and admission. | Later; best paired with a global budget and quick decay. |
 | Spatial region masks | Divide allocations into fixed chunk regions and learn stable touched masks. A small tagged region table lets interleaved regions keep separate masks. Under pressure, same-region transitions may prefetch a learned mask, while inter-region transitions prefetch conservatively to limit pollution. | Implemented as `spatial`/`spatial-mask`; tune width, table slots, and confidence with `MAI_SPATIAL_REGION_CHUNKS`, `MAI_SPATIAL_TABLE_SLOTS`, `MAI_SPATIAL_LEARN_THRESHOLD`, and `MAI_SPATIAL_ADMIT_THRESHOLD`. |
-| TinyLFU and frequency sketches | Use a compact approximate frequency sketch for admission. Compare candidate score against victim score to prevent pollution. | Important for hot/cold classification under mixed scans. |
+| TinyLFU and frequency sketches | Use a compact approximate frequency sketch for admission. Train only on demand-confirmed touches, compare candidate score against victim score under pressure, and decay the sketch by halving counters after a fixed update window. TinyLFU gates candidates generated by other predictors; it is not itself a prefetcher. | Implemented as `tinylfu`/`tiny-lfu`, an experimental long-tail admission classifier with fixed global sketch state and no per-chunk allocation. |
 | TPP/AutoNUMA-style tiering | Maintain high/low DRAM watermarks. Proactively demote cold chunks during quiet epochs, promote on demand, and keep headroom for new hot allocations. | Core design principle for MAI pressure handling. |
 | Record-aware demotion | Treat an allocation record as a coarse working-set unit. Under pressure, avoid demoting demand-confirmed chunks from records with recent faults, but still evict unused prefetched chunks first. | Implemented as opt-in `MAI_RECORD_PROTECT_EPOCHS`; useful as a tuning control, not a default. |
 | Active-record working-set control | Infer the active allocation-record set from demand faults. Coordinate admission, eviction, and the reclaim floor so active resident demand-confirmed chunks are not displaced by speculative prefetch or an overly tight low watermark. | Implemented as opt-in `MAI_ACTIVE_RECORD_EPOCHS` plus `MAI_ACTIVE_RECORD_SLACK_CHUNKS`; designed for phase-capture experiments such as the no-oracle 9-matrix pipeline. |
@@ -330,6 +334,10 @@ can linger.
 frequent hotset, rotates through short recent hotsets separated by scans, then
 returns to the old frequent hotset. It checks whether CAR adapts the
 recent/frequent balance from ghost feedback without receiving workload hints.
+`policy_long_tail_admission` is the TinyLFU guardrail: it mixes a stable hotset,
+a medium-frequency set, and a full-permutation one-pass cold tail before
+changing hotsets. It tests whether a demand-trained sketch can reject cold-tail
+prefetches without preserving stale heat forever.
 `policy_successor_cycle` is the no-oracle irregular-transition workload for
 `markov`/`successor`. It uses a deterministic successor cycle so simple
 next-chunk and constant-stride predictors do not receive the same signal.

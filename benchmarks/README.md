@@ -167,7 +167,7 @@ Runtime policy knobs are intentionally separate from benchmark knobs:
 - `MAI_MIGRATION_POLICY` or `MAI_POLICY`: `legacy`, `lru`, `clock`, `fifo`,
   `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, or
   `lruk`/`lru-k`, `car`/`car-lite`, `markov`/`successor`, or
-  `spatial`/`spatial-mask`
+  `spatial`/`spatial-mask`, or `tinylfu`/`tiny-lfu`
 - `MAI_UFFD_PREFETCH_CHUNKS`: maximum UFFD prefetch lookahead
 - `MAI_UFFD_RESIDENT_LIMIT` and `MAI_UFFD_RESIDENT_LOW_LIMIT`: resident
   high/low watermarks for UFFD-managed chunks
@@ -195,7 +195,7 @@ Policy pressure scenarios can use `mai_policy_pipeline` with
 `mai_policy_2q_pipeline`. The runtime accepts `legacy`, `lru`, `clock`,
 `fifo`, `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, and
 `lruk`/`lru-k`, `car`/`car-lite`, `markov`/`successor`, and
-`spatial`/`spatial-mask`.
+`spatial`/`spatial-mask`, and `tinylfu`/`tiny-lfu`.
 
 `policy_multistream_stride` is a focused no-oracle workload for stride
 predictors. It walks fixed-size units inside one allocation as independent
@@ -244,6 +244,22 @@ with `MAI_BENCH_POLICY_PIVOT_HOTSET`,
 between recency and frequency instead of only throttling prefetches. Benchmark
 output reports CAR resident state counts, ghost hits, target movement, and
 second-chance scans.
+
+`policy_long_tail_admission` is a no-oracle admission workload for TinyLFU-like
+hot/cold classifiers. It warms a stable hotset, repeatedly mixes a
+medium-frequency set with a full-permutation cold tail, then changes to a
+second hotset. Control it with `MAI_BENCH_POLICY_LONGTAIL_HOTSET`,
+`MAI_BENCH_POLICY_LONGTAIL_MEDIUM`,
+`MAI_BENCH_POLICY_LONGTAIL_UNIT`,
+`MAI_BENCH_POLICY_LONGTAIL_WARM_ROUNDS`,
+`MAI_BENCH_POLICY_LONGTAIL_MEDIUM_ROUNDS`,
+`MAI_BENCH_POLICY_LONGTAIL_COLD_PASSES`,
+`MAI_BENCH_POLICY_LONGTAIL_PHASE_ROUNDS`, and
+`MAI_BENCH_POLICY_LONGTAIL_SEED`. Use it to compare `tinylfu` with exact `lfu`
+and `car`: the expected signal is lower cold-tail pollution and migration
+traffic, not universal improvement on every phase-shift probe. Output includes
+`stream_pipeline_unique_cold_visits`, which should equal the cold-tail unit
+count times the number of cold-tail passes.
 
 `policy_successor_cycle` is a no-oracle workload for repeated irregular
 transitions. It walks fixed-size units through an affine successor cycle, so

@@ -137,6 +137,10 @@ typedef struct {
     size_t policy_car_target_increases;
     size_t policy_car_target_decreases;
     size_t policy_car_second_chances;
+    size_t policy_tinylfu_sketch_updates;
+    size_t policy_tinylfu_sketch_decays;
+    size_t policy_tinylfu_admission_rejected;
+    size_t policy_tinylfu_min_score;
 } MaiStats;
 
 /**

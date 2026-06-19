@@ -106,6 +106,7 @@ static const char* stream_pipeline_order_recorded = "sequential";
 static const char* stream_pipeline_prediction_recorded = "entry";
 static size_t stream_pipeline_reclaim_lag_recorded = 0;
 static size_t stream_pipeline_reclaim_horizon_recorded = 0;
+static size_t stream_pipeline_unique_cold_visits_recorded = 0;
 static size_t stream_pipeline_max_cycle_policy_demand_faults = 0;
 static size_t stream_pipeline_max_cycle_policy_read_bytes = 0;
 static size_t stream_pipeline_max_cycle_policy_write_bytes = 0;
@@ -199,6 +200,40 @@ static int mul_size(size_t a, size_t b, size_t* out) {
     }
     *out = a * b;
     return 0;
+}
+
+static size_t gcd_size(size_t a, size_t b) {
+    while (b != 0) {
+        size_t rem = a % b;
+        a = b;
+        b = rem;
+    }
+    return a;
+}
+
+static size_t coprime_stride(size_t units, size_t salt) {
+    if (units <= 1) {
+        return 1;
+    }
+
+    size_t stride = salt % units;
+    if (stride == 0) {
+        stride = 1;
+    }
+    if ((stride & 1U) == 0) {
+        stride++;
+    }
+    if (stride >= units) {
+        stride = 1;
+    }
+
+    while (gcd_size(stride, units) != 1) {
+        stride += 2;
+        if (stride >= units) {
+            stride = 1;
+        }
+    }
+    return stride;
 }
 
 static int parse_size_value(const char* value, size_t* out) {
@@ -1532,6 +1567,240 @@ static int run_policy_recency_frequency_pivot(unsigned char* buffer,
     stream_pipeline_reclaim_lag_recorded = warm_rounds;
     stream_pipeline_reclaim_horizon_recorded = return_rounds;
 
+    free(expected);
+    return 0;
+}
+
+static int run_policy_long_tail_admission(unsigned char* buffer, size_t size,
+                                          uint64_t* checksum,
+                                          size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_LONGTAIL_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t hotset_bytes =
+        env_size("MAI_BENCH_POLICY_LONGTAIL_HOTSET", 8ULL * 1024ULL * 1024ULL);
+    size_t medium_bytes =
+        env_size("MAI_BENCH_POLICY_LONGTAIL_MEDIUM", 8ULL * 1024ULL * 1024ULL);
+    size_t warm_rounds =
+        env_count("MAI_BENCH_POLICY_LONGTAIL_WARM_ROUNDS", 8);
+    size_t medium_rounds =
+        env_count("MAI_BENCH_POLICY_LONGTAIL_MEDIUM_ROUNDS", 2);
+    size_t cold_passes =
+        env_count("MAI_BENCH_POLICY_LONGTAIL_COLD_PASSES", 3);
+    size_t phase_rounds =
+        env_count("MAI_BENCH_POLICY_LONGTAIL_PHASE_ROUNDS", 3);
+    size_t seed = env_count("MAI_BENCH_POLICY_LONGTAIL_SEED", 17);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    hotset_bytes -= hotset_bytes % unit_bytes;
+    medium_bytes -= medium_bytes % unit_bytes;
+    size_t hot_units = hotset_bytes / unit_bytes;
+    size_t medium_units = medium_bytes / unit_bytes;
+    if (hot_units == 0) {
+        hot_units = 1;
+    }
+    if (medium_units == 0) {
+        medium_units = 1;
+    }
+    size_t units = size / unit_bytes;
+    if (units < hot_units * 2 + medium_units + 1) {
+        return -1;
+    }
+    if (warm_rounds == 0) {
+        warm_rounds = 1;
+    }
+    if (medium_rounds == 0) {
+        medium_rounds = 1;
+    }
+    if (cold_passes == 0) {
+        cold_passes = 1;
+    }
+    if (phase_rounds == 0) {
+        phase_rounds = 1;
+    }
+
+    size_t hot_a = 0;
+    size_t hot_b = hot_units;
+    size_t medium_start = hot_units * 2;
+    size_t cold_start = medium_start + medium_units;
+    size_t cold_units = units - cold_start;
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+    unsigned char* visited = calloc(cold_units, sizeof(*visited));
+    if (!visited) {
+        free(expected);
+        return -1;
+    }
+    size_t unique_cold_visits = 0;
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (size_t round = 0; round < warm_rounds; round++) {
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = hot_a + unit;
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    for (size_t pass = 0; pass < cold_passes; pass++) {
+        for (size_t round = 0; round < medium_rounds; round++) {
+            for (size_t unit = 0; unit < medium_units; unit++) {
+                size_t index = medium_start + unit;
+                size_t offset = index * unit_bytes;
+                expected[index]++;
+                buffer[offset] = expected[index];
+                if (buffer[offset] != expected[index]) {
+                    free(visited);
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+        size_t salt = seed + pass * 2654435761ULL;
+        size_t start_unit = salt % cold_units;
+        size_t stride = coprime_stride(cold_units, salt ^ 1103515245ULL);
+        memset(visited, 0, cold_units * sizeof(*visited));
+        size_t pass_unique = 0;
+        for (size_t step = 0; step < cold_units; step++) {
+            size_t cold_unit = (start_unit + step * stride) % cold_units;
+            if (visited[cold_unit]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            visited[cold_unit] = 1;
+            pass_unique++;
+            size_t index = cold_start + cold_unit;
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        if (pass_unique != cold_units) {
+            free(visited);
+            free(expected);
+            return -1;
+        }
+        unique_cold_visits += pass_unique;
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = hot_a + unit;
+            size_t offset = index * unit_bytes;
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    for (size_t round = 0; round < phase_rounds; round++) {
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = hot_b + unit;
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        size_t salt = seed + round * 1013904223ULL;
+        size_t start_unit = salt % cold_units;
+        size_t stride = coprime_stride(cold_units, salt ^ 1664525ULL);
+        memset(visited, 0, cold_units * sizeof(*visited));
+        size_t pass_unique = 0;
+        for (size_t step = 0; step < cold_units; step++) {
+            size_t cold_unit = (start_unit + step * stride) % cold_units;
+            if (visited[cold_unit]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            visited[cold_unit] = 1;
+            pass_unique++;
+            size_t index = cold_start + cold_unit;
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        if (pass_unique != cold_units) {
+            free(visited);
+            free(expected);
+            return -1;
+        }
+        unique_cold_visits += pass_unique;
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = hot_b + unit;
+            size_t offset = index * unit_bytes;
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(visited);
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "long_tail_admission";
+    stream_pipeline_prediction_recorded = "tinylfu_admission";
+    stream_pipeline_groups_recorded = 3;
+    stream_pipeline_group_visits_recorded = cold_units;
+    stream_pipeline_group_iterations_recorded = cold_passes + phase_rounds;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_lag_recorded = warm_rounds;
+    stream_pipeline_reclaim_horizon_recorded = phase_rounds;
+    stream_pipeline_unique_cold_visits_recorded = unique_cold_visits;
+    stream_pipeline_seed_recorded = seed;
+
+    free(visited);
     free(expected);
     return 0;
 }
@@ -3525,6 +3794,7 @@ int main(int argc, char** argv) {
                 "policy_multistream_stride|policy_hotset_scan|"
                 "policy_phase_shift_hotset|"
                 "policy_recency_frequency_pivot|"
+                "policy_long_tail_admission|"
                 "policy_successor_cycle|policy_spatial_region_mask|"
                 "policy_spatial_interleaved_mask|"
                 "stream_kernel_pipeline|"
@@ -3615,6 +3885,9 @@ int main(int argc, char** argv) {
     } else if (strcmp(argv[1], "policy_recency_frequency_pivot") == 0) {
         rc = run_policy_recency_frequency_pivot(buffer, size, &checksum,
                                                 &touches);
+    } else if (strcmp(argv[1], "policy_long_tail_admission") == 0) {
+        rc = run_policy_long_tail_admission(buffer, size, &checksum,
+                                            &touches);
     } else if (strcmp(argv[1], "policy_successor_cycle") == 0) {
         rc = run_policy_successor_cycle(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_spatial_region_mask") == 0) {
@@ -3775,6 +4048,17 @@ int main(int argc, char** argv) {
     size_t policy_car_second_chances = after_stats_available ?
         after.policy_car_second_chances -
         before.policy_car_second_chances : 0;
+    size_t policy_tinylfu_sketch_updates = after_stats_available ?
+        after.policy_tinylfu_sketch_updates -
+        before.policy_tinylfu_sketch_updates : 0;
+    size_t policy_tinylfu_sketch_decays = after_stats_available ?
+        after.policy_tinylfu_sketch_decays -
+        before.policy_tinylfu_sketch_decays : 0;
+    size_t policy_tinylfu_admission_rejected = after_stats_available ?
+        after.policy_tinylfu_admission_rejected -
+        before.policy_tinylfu_admission_rejected : 0;
+    size_t policy_tinylfu_min_score = after_stats_available ?
+        after.policy_tinylfu_min_score : 0;
     const char* policy_prefetch_observation =
         after_stats_available && after.policy_prefetch_observation != 0 ?
         "write_protect" : "unobserved";
@@ -3862,6 +4146,10 @@ int main(int argc, char** argv) {
            "policy_car_target_increases=%zu "
            "policy_car_target_decreases=%zu "
            "policy_car_second_chances=%zu "
+           "policy_tinylfu_sketch_updates=%zu "
+           "policy_tinylfu_sketch_decays=%zu "
+           "policy_tinylfu_admission_rejected=%zu "
+           "policy_tinylfu_min_score=%zu "
            "max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
@@ -3917,6 +4205,7 @@ int main(int argc, char** argv) {
            "stream_pipeline_prediction=%s "
            "stream_pipeline_reclaim_lag=%zu "
            "stream_pipeline_reclaim_horizon=%zu "
+           "stream_pipeline_unique_cold_visits=%zu "
            "stream_pipeline_max_cycle_policy_demand_faults=%zu "
            "stream_pipeline_max_cycle_policy_read_bytes=%zu "
            "stream_pipeline_max_cycle_policy_write_bytes=%zu "
@@ -3972,6 +4261,10 @@ int main(int argc, char** argv) {
            policy_car_target_increases,
            policy_car_target_decreases,
            policy_car_second_chances,
+           policy_tinylfu_sketch_updates,
+           policy_tinylfu_sketch_decays,
+           policy_tinylfu_admission_rejected,
+           policy_tinylfu_min_score,
            after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,
@@ -4014,6 +4307,7 @@ int main(int argc, char** argv) {
            stream_pipeline_prediction_recorded,
            stream_pipeline_reclaim_lag_recorded,
            stream_pipeline_reclaim_horizon_recorded,
+           stream_pipeline_unique_cold_visits_recorded,
            stream_pipeline_max_cycle_policy_demand_faults,
            stream_pipeline_max_cycle_policy_read_bytes,
            stream_pipeline_max_cycle_policy_write_bytes,
