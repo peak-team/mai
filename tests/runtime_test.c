@@ -3074,6 +3074,110 @@ static int mode_uffd_pager_tinylfu_hotset_scan(void) {
     return mode_uffd_pager_hotset_scan_policy("TinyLFU", 0, 1);
 }
 
+static int mode_uffd_pager_bestoffset_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t offset_chunks = 16;
+    const size_t passes = 4;
+    const size_t pair_count = offset_chunks;
+    const size_t order[16] = {
+        5, 0, 11, 2, 14, 7, 1, 13,
+        4, 10, 3, 15, 6, 12, 8, 9
+    };
+    unsigned char expected[32] = {0};
+
+    if (units > sizeof(expected) || pair_count == 0 ||
+        pair_count != sizeof(order) / sizeof(order[0])) {
+        return fail("UFFD best-offset expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD best-offset test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for best-offset test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD best-offset allocation failed");
+    }
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t step = 0; step < pair_count; step++) {
+            size_t anchor = order[(step + pass) % pair_count];
+            expected[anchor]++;
+            ptr[anchor * unit] = expected[anchor];
+            if (ptr[anchor * unit] != expected[anchor]) {
+                free(ptr);
+                return fail("UFFD best-offset lost anchor data");
+            }
+            size_t target = anchor + offset_chunks;
+            expected[target]++;
+            ptr[target * unit] = expected[target];
+            if (ptr[target * unit] != expected[target]) {
+                free(ptr);
+                return fail("UFFD best-offset lost target data");
+            }
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD best-offset touches");
+    }
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD best-offset test did not exercise pager pressure");
+    }
+    size_t samples =
+        after_touch.policy_bestoffset_train_samples -
+        before.policy_bestoffset_train_samples;
+    size_t hits =
+        after_touch.policy_bestoffset_train_hits -
+        before.policy_bestoffset_train_hits;
+    size_t slots =
+        after_touch.policy_bestoffset_slots_created -
+        before.policy_bestoffset_slots_created;
+    size_t candidates =
+        after_touch.policy_bestoffset_candidates -
+        before.policy_bestoffset_candidates;
+    if (samples == 0 || hits == 0 || slots == 0 || candidates == 0 ||
+        after_touch.policy_bestoffset_top_score == 0 ||
+        after_touch.policy_bestoffset_top_offset_sign != 1 ||
+        after_touch.policy_bestoffset_top_offset_magnitude != offset_chunks) {
+        fprintf(stderr,
+                "best-offset stats: samples=%zu hits=%zu slots=%zu "
+                "candidates=%zu "
+                "top_score=%zu top_sign=%zu top_mag=%zu\n",
+                samples, hits, slots, candidates,
+                after_touch.policy_bestoffset_top_score,
+                after_touch.policy_bestoffset_top_offset_sign,
+                after_touch.policy_bestoffset_top_offset_magnitude);
+        free(ptr);
+        return fail("UFFD best-offset test did not exercise offset predictor");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD best-offset free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD best-offset allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
 static int mode_uffd_pager_successor_policy(void) {
     MaiStats before;
     MaiStats after_touch;
@@ -4493,6 +4597,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_tinylfu_hotset_scan") == 0) {
         return mode_uffd_pager_tinylfu_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_bestoffset_policy") == 0) {
+        return mode_uffd_pager_bestoffset_policy();
     }
     if (strcmp(argv[1], "uffd_pager_successor_policy") == 0) {
         return mode_uffd_pager_successor_policy();

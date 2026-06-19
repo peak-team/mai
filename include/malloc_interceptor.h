@@ -141,6 +141,16 @@ typedef struct {
     size_t policy_tinylfu_sketch_decays;
     size_t policy_tinylfu_admission_rejected;
     size_t policy_tinylfu_min_score;
+    size_t policy_bestoffset_train_samples;
+    size_t policy_bestoffset_train_hits;
+    size_t policy_bestoffset_slots_created;
+    size_t policy_bestoffset_score_decays;
+    size_t policy_bestoffset_candidates;
+    size_t policy_bestoffset_pressure_rejected;
+    size_t policy_bestoffset_unused_penalties;
+    size_t policy_bestoffset_top_offset_magnitude;
+    size_t policy_bestoffset_top_offset_sign;
+    size_t policy_bestoffset_top_score;
 } MaiStats;
 
 /**

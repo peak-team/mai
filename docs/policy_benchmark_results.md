@@ -353,6 +353,45 @@ migration bytes versus `legacy`, but it does not beat exact `lfu` on throughput,
 demand faults, or hot-evicted bytes. Keep it experimental: this slice validates
 sketch-backed admission plumbing, not a production default.
 
+### Best-Offset Lag Probe
+
+`MAI_MIGRATION_POLICY=best-offset` is an experimental top-1 offset prefetcher.
+It trains only from demand-observed chunk order, emits at most the highest-score
+forward offset, and penalizes unused offset-prefetch evictions. The
+`policy_best_offset_lag` workload shuffles disjoint anchor chunks and touches
+`anchor + offset` after a configurable lookahead; the benchmark does not reveal
+the next target to MAI or expose target chunks as ordinary anchors.
+
+These six-run means use `policy_best_offset_lag 128M`, 2 MiB chunks,
+`MAI_BENCH_POLICY_OFFSET_CHUNKS=16`, lookahead 4, a 32 MiB resident high
+watermark, a 24 MiB low watermark, `MAI_MAX_RSS=64M`, and the default
+best-offset floor. With `MAI_UFFD_PREFETCH_CHUNKS=4`, that floor ignores
+offsets below four chunks.
+
+| Policy | Events/s | Demand events | Prefetch completed | Useful | Accuracy | Coverage | Late events | Unused evictions | Read MiB | Write MiB | Hot-evicted MiB | Offset slots | Best-offset candidates | Top offset | Top score |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| `legacy` | 290 | 56 | 139 | 0 | 0.000 | 0.000 | 56 | 128 | 320 | 358 | 102 | 0 | 0 | `0` | 0 |
+| `stream` | 728 | 84 | 0 | 0 | 0.000 | 0.000 | 84 | 0 | 104 | 140 | 140 | 0 | 0 | `0` | 0 |
+| `stride` | 643 | 85 | 20 | 0 | 0.000 | 0.000 | 85 | 20 | 138 | 184 | 144 | 0 | 0 | `0` | 0 |
+| `markov` | 657 | 84 | 0 | 0 | 0.000 | 0.000 | 84 | 0 | 104 | 140 | 140 | 0 | 0 | `0` | 0 |
+| `spatial` | 429 | 70 | 41 | 0 | 0.000 | 0.000 | 70 | 34 | 158 | 192 | 124 | 0 | 0 | `0` | 0 |
+| `car` | 304 | 66 | 134 | 0 | 0.000 | 0.000 | 66 | 130 | 329 | 370 | 109 | 0 | 0 | `0` | 0 |
+| `tinylfu` | 308 | 70 | 102 | 0 | 0.000 | 0.000 | 70 | 101 | 278 | 320 | 118 | 0 | 0 | `0` | 0 |
+| `best-offset` | 569 | 76 | 36 | 0 | 0.000 | 0.000 | 76 | 33 | 144 | 192 | 126 | 486 | 58 | `+8` | 52 |
+
+The result is useful but not promotable. Best-offset is expected to learn the
+intended `+16` chunk offset on this guardrail, but the corrected disjoint-source
+runs learned nearby incidental offsets instead and produced no useful
+prefetches. It cuts migration traffic relative to legacy-style speculative
+prefetching, but it does not beat conservative `stream` or `markov` rows on
+event rate, demand events, or migration volume. Keep it as a guardrail for
+future offset/window designs rather than a recommended policy.
+
+A separate spot check with `MAI_POLICY_BEST_OFFSET_MIN_CHUNKS=16` still
+produced zero useful prefetches and learned `+17`, so the remaining issue is
+not only the default floor; the top-1 scorer needs better temporal alignment
+or multi-lookahead scoring before this policy can be promoted.
+
 ## Interpretation
 
 - Sufficient-memory MAI does not trigger migration in these runs; faster
@@ -374,6 +413,9 @@ sketch-backed admission plumbing, not a production default.
   on the small phase-shift probes. On the corrected long-tail workload, it
   reduces cold-tail prefetch pollution versus `legacy` but does not beat exact
   `lfu`; use it as infrastructure for future W-TinyLFU-style policies.
+- `best-offset` is an experimental offset-learning guardrail. It should not be
+  treated as successful unless the disjoint-source benchmark shows both the
+  expected top offset and competitive stall/migration metrics.
 - On the local six-run 9-matrix pressure shape, `legacy` has the highest mean
   end-to-end rate among the low-watermark 48 MiB rows. It reaches only 22.9%
   of the matching MAI-managed sufficient-memory end-to-end baseline, while its

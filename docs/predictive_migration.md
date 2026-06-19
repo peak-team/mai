@@ -147,6 +147,13 @@ runtime strategy:
   predictor for stable sparse spatial access inside fixed chunk groups.
 - `tinylfu`, `tiny-lfu`, or `sketch-lfu`: compact Count-Min-style admission
   classifier trained only by demand-observed chunk touches.
+- `best-offset`, `bestoffset`, `offset`, or `offset-prefetch`: demand-trained
+  top-offset prefetcher for recurring non-adjacent chunk offsets.
+
+For `best-offset`, `MAI_POLICY_BEST_OFFSET_MIN_CHUNKS=N` can exclude nearby
+offsets from training and candidate emission. The default `0` uses the current
+`MAI_UFFD_PREFETCH_CHUNKS` window as the floor, keeping adjacent chunks in the
+stream/stride policy domain.
 
 All policies share append-only `MaiStats` counters for prefetch requests,
 admissions, completions, useful prefetches, late demand faults, unused-prefetch
@@ -169,6 +176,10 @@ recent/frequent resident and ghost chunk counts, recent/frequent ghost hits,
 target movement, and second-chance scans through `policy_car_*` counters.
 TinyLFU reports sketch updates, sketch decays, sketch admission rejects, and
 the current minimum admission score through `policy_tinylfu_*` counters.
+Best-offset reports training samples, validated training hits, created offset
+slots, score decays, emitted candidates, rejected candidates,
+unused-prefetch penalties, and the top learned forward offset through
+`policy_bestoffset_*` counters.
 `policy_throttle_slept_ns` is reserved for
 a future bandwidth/stall-budget throttle; current policies reject or shrink
 speculative work instead of sleeping in the fault handler.
@@ -244,7 +255,7 @@ default performance mode.
 | LIRS | Protect chunks with low inter-reference recency and demote high inter-reference recency chunks even if they were touched recently by a scan. | Simulator/reference first; exact LIRS stack metadata is still too heavy for the initial C runtime. |
 | Sequential readahead | Detect monotonic chunk faults and adapt the forward window with additive increase and multiplicative decrease from accuracy feedback. Admit only while headroom and budget permit. | Implemented as `stream` in first form. |
 | Stride and multi-stream | Track several `{last, delta, confidence, window}` streams per allocation. Admit only after repeated deltas. Evict chunks far behind active streams. | Implemented as `stride` in first form. |
-| Best-offset and multi-lookahead offset | Score candidate offsets by later demand hits. Prefetch the highest-confidence offsets, not necessarily the next chunk. | Useful for blocked and stencil-like patterns after stream baselines. |
+| Best-offset and multi-lookahead offset | Score candidate offsets by later demand hits. Prefetch the highest-confidence forward offset, not necessarily the next chunk. Penalize unused offset-prefetch evictions and apply pressure admission before displacing resident chunks. | Implemented as `best-offset`/`offset-prefetch`, an experimental top-1 offset predictor. Corrected local results show it can reduce worst-case speculative traffic versus legacy-style prefetch, but dense footprints can make it learn nearby incidental offsets instead of the intended lagged offset; it does not beat conservative stream/markov rows on throughput or migration volume. |
 | Markov and delta-correlation | Keep one bounded successor edge per chunk. Admit only repeated high-confidence successors, and require stronger confidence under resident pressure. | Implemented as `markov`/`successor` in first form; no fanout or chaining yet. |
 | Signature/history-table | Use rolling delta signatures to predict multi-step sequences. Confidence controls depth and admission. | Later; best paired with a global budget and quick decay. |
 | Spatial region masks | Divide allocations into fixed chunk regions and learn stable touched masks. A small tagged region table lets interleaved regions keep separate masks. Under pressure, same-region transitions may prefetch a learned mask, while inter-region transitions prefetch conservatively to limit pollution. | Implemented as `spatial`/`spatial-mask`; tune width, table slots, and confidence with `MAI_SPATIAL_REGION_CHUNKS`, `MAI_SPATIAL_TABLE_SLOTS`, `MAI_SPATIAL_LEARN_THRESHOLD`, and `MAI_SPATIAL_ADMIT_THRESHOLD`. |
@@ -338,6 +349,11 @@ recent/frequent balance from ghost feedback without receiving workload hints.
 a medium-frequency set, and a full-permutation one-pass cold tail before
 changing hotsets. It tests whether a demand-trained sketch can reject cold-tail
 prefetches without preserving stale heat forever.
+`policy_best_offset_lag` is the best-offset guardrail: it shuffles disjoint
+anchor chunks, then touches `anchor + offset` only after several later anchors.
+The workload exposes a recurring historical offset without telling MAI the next
+target, prevents target chunks from also appearing as anchors, and avoids
+constant-stride ordering in the benchmark itself.
 `policy_successor_cycle` is the no-oracle irregular-transition workload for
 `markov`/`successor`. It uses a deterministic successor cycle so simple
 next-chunk and constant-stride predictors do not receive the same signal.

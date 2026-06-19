@@ -130,6 +130,23 @@ if(BUILD_TESTING)
     )
 
     add_test(
+        NAME mai_policy_best_offset_lag_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_POLICY_OFFSET_UNIT=2M"
+            "MAI_BENCH_POLICY_OFFSET_CHUNKS=4"
+            "MAI_BENCH_POLICY_OFFSET_LOOKAHEAD=3"
+            "MAI_BENCH_POLICY_OFFSET_PASSES=2"
+            "MAI_BENCH_POLICY_OFFSET_SEED=5"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            policy_best_offset_lag
+            32M
+    )
+    set_tests_properties(mai_policy_best_offset_lag_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=policy_best_offset_lag .*logical_mib=32\\.000 .*stream_pipeline_group_visits=4 .*stream_pipeline_groups=4 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=best_offset_lag .*stream_pipeline_seed=5 .*stream_pipeline_prediction=best_offset .*stream_pipeline_reclaim_lag=3 .*stream_pipeline_reclaim_horizon=4"
+    )
+
+    add_test(
         NAME mai_policy_successor_cycle_smoke
         COMMAND ${CMAKE_COMMAND} -E env
             "MAI_ACCESS_EXPECT_MANAGED=0"

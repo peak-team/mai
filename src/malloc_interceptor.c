@@ -81,6 +81,11 @@
 #define MAI_POLICY_TINYLFU_WIDTH 2048
 #define MAI_POLICY_TINYLFU_DECAY_INTERVAL 4096
 #define MAI_POLICY_TINYLFU_MAX_SCORE 255
+#define MAI_POLICY_BEST_OFFSET_SLOTS 8
+#define MAI_POLICY_BEST_OFFSET_RECENT 32
+#define MAI_POLICY_BEST_OFFSET_DECAY_INTERVAL 256
+#define MAI_POLICY_BEST_OFFSET_MAX_SCORE 255
+#define MAI_POLICY_BEST_OFFSET_MIN_SCORE 6
 #define MAI_HUGEPAGE_SIZE (2ULL * 1024ULL * 1024ULL)
 #define MAI_ACCESS_TRACE_RETIRED_GRACE_NS (10ULL * 1000ULL * 1000ULL)
 
@@ -144,7 +149,8 @@ typedef enum {
     MIGRATION_POLICY_SPATIAL,
     MIGRATION_POLICY_LRUK,
     MIGRATION_POLICY_CAR,
-    MIGRATION_POLICY_TINYLFU
+    MIGRATION_POLICY_TINYLFU,
+    MIGRATION_POLICY_BEST_OFFSET
 } MigrationPolicy;
 
 enum {
@@ -265,6 +271,21 @@ typedef struct {
 } MaiStreamPolicySlot;
 
 typedef struct {
+    ptrdiff_t offset;
+    uint16_t score;
+    uint16_t hits;
+    uint16_t tests;
+    size_t last_epoch;
+    int active;
+} MaiBestOffsetSlot;
+
+typedef struct {
+    size_t index;
+    size_t epoch;
+    int active;
+} MaiBestOffsetRecent;
+
+typedef struct {
     size_t region;
     size_t last_epoch;
     size_t touches_in_cycle;
@@ -339,6 +360,13 @@ struct AllocationRecord {
     size_t policy_prefetch_window;
     size_t policy_record_last_demand_epoch;
     MaiStreamPolicySlot policy_stream_slots[MAI_POLICY_STREAM_SLOTS];
+    MaiBestOffsetSlot
+        policy_best_offset_slots[MAI_POLICY_BEST_OFFSET_SLOTS];
+    MaiBestOffsetRecent
+        policy_best_offset_recent[MAI_POLICY_BEST_OFFSET_RECENT];
+    size_t policy_best_offset_recent_next;
+    size_t policy_best_offset_recent_count;
+    size_t policy_best_offset_train_since_decay;
     MaiSpatialPolicyRegion
         policy_spatial_regions[MAI_POLICY_SPATIAL_MAX_SLOTS];
     int uffd_registered;
@@ -498,6 +526,7 @@ static void* uffd_scratch_buffer = NULL;
 static size_t uffd_scratch_length = 0;
 static size_t migration_chunk_bytes = MAI_DEFAULT_MIGRATION_CHUNK_BYTES;
 static size_t uffd_prefetch_chunks = MAI_DEFAULT_UFFD_PREFETCH_CHUNKS;
+static size_t policy_best_offset_min_chunks = 0;
 static size_t record_protect_epochs = MAI_DEFAULT_RECORD_PROTECT_EPOCHS;
 static size_t active_record_epochs = MAI_DEFAULT_ACTIVE_RECORD_EPOCHS;
 static size_t active_record_slack_chunks =
@@ -1089,6 +1118,13 @@ static int parse_migration_policy_env(const char* value,
         strcmp(value, "tiny-lfu") == 0 ||
         strcmp(value, "sketch-lfu") == 0) {
         *out = MIGRATION_POLICY_TINYLFU;
+        return 0;
+    }
+    if (strcmp(value, "best-offset") == 0 ||
+        strcmp(value, "bestoffset") == 0 ||
+        strcmp(value, "offset") == 0 ||
+        strcmp(value, "offset-prefetch") == 0) {
+        *out = MIGRATION_POLICY_BEST_OFFSET;
         return 0;
     }
     return -1;
@@ -4591,6 +4627,274 @@ static size_t policy_tinylfu_min_score_locked(void) {
 }
 
 static int policy_index_add(size_t index, ptrdiff_t delta, size_t limit,
+                            size_t* out);
+
+static int policy_bestoffset_delta(size_t from, size_t to, ptrdiff_t* out) {
+    if (!out) {
+        return 0;
+    }
+    if (to >= from) {
+        size_t delta = to - from;
+        if (delta > (size_t)PTRDIFF_MAX) {
+            return 0;
+        }
+        *out = (ptrdiff_t)delta;
+        return delta != 0;
+    }
+    size_t delta = from - to;
+    if (delta > (size_t)PTRDIFF_MAX) {
+        return 0;
+    }
+    *out = -(ptrdiff_t)delta;
+    return delta != 0;
+}
+
+static int policy_bestoffset_recent_contains_locked(AllocationRecord* record,
+                                                    size_t index) {
+    if (!record) {
+        return 0;
+    }
+    for (size_t i = 0; i < MAI_POLICY_BEST_OFFSET_RECENT; i++) {
+        MaiBestOffsetRecent* recent = &record->policy_best_offset_recent[i];
+        if (recent->active && recent->index == index) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static MaiBestOffsetSlot*
+policy_bestoffset_find_slot_locked(AllocationRecord* record, ptrdiff_t offset) {
+    if (!record || offset == 0) {
+        return NULL;
+    }
+    for (size_t i = 0; i < MAI_POLICY_BEST_OFFSET_SLOTS; i++) {
+        MaiBestOffsetSlot* slot = &record->policy_best_offset_slots[i];
+        if (slot->active && slot->offset == offset) {
+            return slot;
+        }
+    }
+    return NULL;
+}
+
+static MaiBestOffsetSlot*
+policy_bestoffset_alloc_slot_locked(AllocationRecord* record, ptrdiff_t offset) {
+    if (!record || offset == 0) {
+        return NULL;
+    }
+    MaiBestOffsetSlot* victim = NULL;
+    for (size_t i = 0; i < MAI_POLICY_BEST_OFFSET_SLOTS; i++) {
+        MaiBestOffsetSlot* slot = &record->policy_best_offset_slots[i];
+        if (!slot->active) {
+            victim = slot;
+            break;
+        }
+        if (!victim || slot->score < victim->score ||
+            (slot->score == victim->score &&
+             slot->last_epoch < victim->last_epoch)) {
+            victim = slot;
+        }
+    }
+    if (!victim) {
+        return NULL;
+    }
+    memset(victim, 0, sizeof(*victim));
+    victim->active = 1;
+    victim->offset = offset;
+    victim->last_epoch = uffd_touch_epoch + 1;
+    return victim;
+}
+
+static size_t policy_bestoffset_min_score_locked(void) {
+    return MAI_POLICY_BEST_OFFSET_MIN_SCORE + policy_adaptive_throttle_level;
+}
+
+static size_t policy_bestoffset_min_offset_locked(void) {
+    if (policy_best_offset_min_chunks != 0) {
+        return policy_best_offset_min_chunks;
+    }
+    return uffd_prefetch_chunks == 0 ? 1 : uffd_prefetch_chunks;
+}
+
+static size_t policy_bestoffset_score_delta_locked(AllocationRecord* record,
+                                                   ptrdiff_t offset) {
+    MaiBestOffsetSlot* slot =
+        policy_bestoffset_find_slot_locked(record, offset);
+    return slot && slot->active ? slot->score : 0;
+}
+
+static void policy_bestoffset_decay_locked(AllocationRecord* record) {
+    if (!record) {
+        return;
+    }
+    for (size_t i = 0; i < MAI_POLICY_BEST_OFFSET_SLOTS; i++) {
+        MaiBestOffsetSlot* slot = &record->policy_best_offset_slots[i];
+        if (!slot->active) {
+            continue;
+        }
+        slot->score >>= 1;
+        slot->hits >>= 1;
+        slot->tests >>= 1;
+        if (slot->score == 0 && slot->hits == 0) {
+            memset(slot, 0, sizeof(*slot));
+        }
+    }
+    record->policy_best_offset_train_since_decay = 0;
+    stats_snapshot.policy_bestoffset_score_decays++;
+}
+
+static void policy_bestoffset_note_recent_locked(AllocationRecord* record,
+                                                 size_t index) {
+    if (!record) {
+        return;
+    }
+    size_t slot = record->policy_best_offset_recent_next %
+        MAI_POLICY_BEST_OFFSET_RECENT;
+    record->policy_best_offset_recent[slot].index = index;
+    record->policy_best_offset_recent[slot].epoch = uffd_touch_epoch + 1;
+    record->policy_best_offset_recent[slot].active = 1;
+    record->policy_best_offset_recent_next =
+        (slot + 1) % MAI_POLICY_BEST_OFFSET_RECENT;
+    if (record->policy_best_offset_recent_count <
+        MAI_POLICY_BEST_OFFSET_RECENT) {
+        record->policy_best_offset_recent_count++;
+    }
+}
+
+static void policy_bestoffset_note_demand_locked(AllocationRecord* record,
+                                                 size_t index) {
+    if (migration_policy != MIGRATION_POLICY_BEST_OFFSET || !record ||
+        index >= record->chunk_count) {
+        return;
+    }
+
+    stats_snapshot.policy_bestoffset_train_samples++;
+    size_t epoch = uffd_touch_epoch + 1;
+    size_t min_offset = policy_bestoffset_min_offset_locked();
+    for (size_t i = 0; i < MAI_POLICY_BEST_OFFSET_SLOTS; i++) {
+        MaiBestOffsetSlot* slot = &record->policy_best_offset_slots[i];
+        if (!slot->active || slot->offset == 0 ||
+            (size_t)labs(slot->offset) < min_offset) {
+            continue;
+        }
+        size_t source = 0;
+        int hit = policy_index_add(index, -slot->offset,
+                                   record->chunk_count, &source) &&
+            policy_bestoffset_recent_contains_locked(record, source);
+        if (slot->tests < UINT16_MAX) {
+            slot->tests++;
+        }
+        if (hit) {
+            if (slot->hits < UINT16_MAX) {
+                slot->hits++;
+            }
+            if (slot->score <= MAI_POLICY_BEST_OFFSET_MAX_SCORE - 2) {
+                slot->score += 2;
+            } else {
+                slot->score = MAI_POLICY_BEST_OFFSET_MAX_SCORE;
+            }
+            slot->last_epoch = epoch;
+            stats_snapshot.policy_bestoffset_train_hits++;
+        } else if (slot->score != 0) {
+            slot->score--;
+        }
+    }
+
+    for (size_t i = 0; i < MAI_POLICY_BEST_OFFSET_RECENT; i++) {
+        MaiBestOffsetRecent* recent = &record->policy_best_offset_recent[i];
+        if (!recent->active) {
+            continue;
+        }
+        ptrdiff_t offset = 0;
+        if (!policy_bestoffset_delta(recent->index, index, &offset)) {
+            continue;
+        }
+        if (offset <= 0 || (size_t)offset < min_offset) {
+            continue;
+        }
+        MaiBestOffsetSlot* existing =
+            policy_bestoffset_find_slot_locked(record, offset);
+        if (existing) {
+            continue;
+        }
+        MaiBestOffsetSlot* slot =
+            policy_bestoffset_alloc_slot_locked(record, offset);
+        if (!slot) {
+            continue;
+        }
+        slot->score = 2;
+        slot->hits = 0;
+        slot->tests = 1;
+        slot->last_epoch = epoch;
+        stats_snapshot.policy_bestoffset_slots_created++;
+    }
+
+    policy_bestoffset_note_recent_locked(record, index);
+    record->policy_best_offset_train_since_decay++;
+    if (record->policy_best_offset_train_since_decay >=
+        MAI_POLICY_BEST_OFFSET_DECAY_INTERVAL) {
+        policy_bestoffset_decay_locked(record);
+    }
+}
+
+static void policy_bestoffset_penalize_locked(AllocationRecord* record,
+                                              ptrdiff_t offset) {
+    if (migration_policy != MIGRATION_POLICY_BEST_OFFSET || !record ||
+        offset == 0) {
+        return;
+    }
+    MaiBestOffsetSlot* slot =
+        policy_bestoffset_find_slot_locked(record, offset);
+    if (!slot) {
+        return;
+    }
+    slot->score = slot->score > 2 ? (uint16_t)(slot->score - 2) : 0;
+    stats_snapshot.policy_bestoffset_unused_penalties++;
+}
+
+static int policy_bestoffset_candidate_class(MaiChunkPolicyMeta* meta) {
+    if (policy_chunk_is_prefetched_unused(meta) ||
+        (meta && (meta->flags & MAI_CHUNK_POLICY_PROBATION) != 0 &&
+         (meta->flags & MAI_CHUNK_POLICY_PREFETCH_USED) == 0)) {
+        return 0;
+    }
+    if (policy_chunk_is_demand_confirmed(meta)) {
+        return 2;
+    }
+    return 1;
+}
+
+static void policy_bestoffset_snapshot_locked(MaiStats* out) {
+    if (!out || migration_policy != MIGRATION_POLICY_BEST_OFFSET) {
+        return;
+    }
+    size_t best_score = 0;
+    ptrdiff_t best_offset = 0;
+    size_t min_offset = policy_bestoffset_min_offset_locked();
+    for (AllocationRecord* record = uffd_head; record; record = record->uffd_next) {
+        for (size_t i = 0; i < MAI_POLICY_BEST_OFFSET_SLOTS; i++) {
+            MaiBestOffsetSlot* slot = &record->policy_best_offset_slots[i];
+            if (!slot->active || slot->offset <= 0 ||
+                (size_t)slot->offset < min_offset ||
+                slot->score <= best_score) {
+                continue;
+            }
+            best_score = slot->score;
+            best_offset = slot->offset;
+        }
+    }
+    out->policy_bestoffset_top_score = best_score;
+    if (best_offset < 0) {
+        out->policy_bestoffset_top_offset_sign = 2;
+        out->policy_bestoffset_top_offset_magnitude =
+            (size_t)(-best_offset);
+    } else if (best_offset > 0) {
+        out->policy_bestoffset_top_offset_sign = 1;
+        out->policy_bestoffset_top_offset_magnitude = (size_t)best_offset;
+    }
+}
+
+static int policy_index_add(size_t index, ptrdiff_t delta, size_t limit,
                             size_t* out) {
     if (delta >= 0) {
         size_t step = (size_t)delta;
@@ -4849,6 +5153,7 @@ static void policy_note_demand_fault_locked(AllocationRecord* record,
     policy_lfu_note_touch_locked(meta);
     policy_car_note_demand_locked(meta);
     policy_tinylfu_note_touch_locked(record, index, meta);
+    policy_bestoffset_note_demand_locked(record, index);
     size_t epoch = uffd_touch_epoch + 1;
     policy_lruk_note_touch_locked(meta, epoch);
     meta->last_access_epoch = epoch;
@@ -5060,6 +5365,15 @@ static int policy_adaptive_prefetch_admissible_locked(AllocationRecord* record,
         }
         return 0;
     }
+    if (migration_policy == MIGRATION_POLICY_BEST_OFFSET) {
+        ptrdiff_t offset = 0;
+        if (!policy_bestoffset_delta(source_index, index, &offset)) {
+            return 0;
+        }
+        return policy_bestoffset_score_delta_locked(record, offset) >=
+            policy_bestoffset_min_score_locked() +
+            (policy_adaptive_throttle_level >= 2 ? 2 : 0);
+    }
     if (migration_policy == MIGRATION_POLICY_STREAM) {
         return record->policy_run_length >=
             (policy_adaptive_throttle_level >= 2 ? 4 : 3);
@@ -5159,6 +5473,71 @@ static size_t policy_build_prefetch_indices_locked(AllocationRecord* record,
         return count;
     }
 
+    if (migration_policy == MIGRATION_POLICY_BEST_OFFSET) {
+        if (limit > 1) {
+            limit = 1;
+        }
+        size_t emitted = 0;
+        size_t selected_count = 0;
+        ptrdiff_t selected[MAI_MAX_UFFD_PREFETCH_CHUNKS];
+        size_t min_score = policy_bestoffset_min_score_locked();
+        size_t min_offset = policy_bestoffset_min_offset_locked();
+        if (uffd_resident_limit_bytes != 0 &&
+            uffd_resident_bytes >= uffd_resident_low_limit_bytes &&
+            min_score < MAI_POLICY_BEST_OFFSET_MIN_SCORE + 1) {
+            min_score = MAI_POLICY_BEST_OFFSET_MIN_SCORE + 1;
+        }
+        while (emitted < limit &&
+               selected_count < MAI_MAX_UFFD_PREFETCH_CHUNKS) {
+            MaiBestOffsetSlot* best = NULL;
+            for (size_t i = 0; i < MAI_POLICY_BEST_OFFSET_SLOTS; i++) {
+                MaiBestOffsetSlot* slot = &record->policy_best_offset_slots[i];
+                if (!slot->active || slot->offset <= 0 ||
+                    (size_t)slot->offset < min_offset ||
+                    slot->score < min_score) {
+                    continue;
+                }
+                int already_selected = 0;
+                for (size_t j = 0; j < selected_count; j++) {
+                    if (selected[j] == slot->offset) {
+                        already_selected = 1;
+                        break;
+                    }
+                }
+                if (already_selected) {
+                    continue;
+                }
+                if (!best || slot->score > best->score ||
+                    (slot->score == best->score &&
+                     slot->last_epoch > best->last_epoch)) {
+                    best = slot;
+                }
+            }
+            if (!best) {
+                break;
+            }
+            selected[selected_count++] = best->offset;
+            size_t predicted = 0;
+            if (!policy_index_add(index, best->offset, record->chunk_count,
+                                  &predicted) ||
+                predicted == index) {
+                continue;
+            }
+            int duplicate = 0;
+            for (size_t j = 0; j < emitted; j++) {
+                if (out[j] == predicted) {
+                    duplicate = 1;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                out[emitted++] = predicted;
+                stats_snapshot.policy_bestoffset_candidates++;
+            }
+        }
+        return emitted;
+    }
+
     if (migration_policy == MIGRATION_POLICY_MARKOV) {
         if (!record->chunk_policy_meta) {
             return 0;
@@ -5245,6 +5624,8 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
         stats_snapshot.policy_adaptive_admission_rejected++;
         if (migration_policy == MIGRATION_POLICY_TINYLFU) {
             stats_snapshot.policy_tinylfu_admission_rejected++;
+        } else if (migration_policy == MIGRATION_POLICY_BEST_OFFSET) {
+            stats_snapshot.policy_bestoffset_pressure_rejected++;
         }
     } else if (active_record_epochs != 0 &&
         uffd_resident_limit_bytes != 0 &&
@@ -5312,6 +5693,38 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
         }
         if (!admit) {
             stats_snapshot.policy_tinylfu_admission_rejected++;
+        }
+    } else if (migration_policy == MIGRATION_POLICY_BEST_OFFSET &&
+               uffd_resident_limit_bytes != 0 &&
+               uffd_resident_bytes + length > uffd_resident_limit_bytes) {
+        ptrdiff_t offset = 0;
+        size_t candidate_score = 0;
+        size_t min_score = policy_bestoffset_min_score_locked();
+        size_t min_offset = policy_bestoffset_min_offset_locked();
+        if (policy_bestoffset_delta(source_index, index, &offset)) {
+            candidate_score =
+                policy_bestoffset_score_delta_locked(record, offset);
+        }
+        if (offset <= 0 || (size_t)offset < min_offset ||
+            candidate_score < min_score) {
+            admit = 0;
+        }
+        AllocationRecord* victim_record = NULL;
+        size_t victim_index = 0;
+        if (admit &&
+            policy_peek_uffd_victim_locked(&victim_record, &victim_index,
+                                           protected_set) &&
+            victim_record && victim_record->chunk_policy_meta) {
+            MaiChunkPolicyMeta* victim =
+                &victim_record->chunk_policy_meta[victim_index];
+            int victim_class = policy_bestoffset_candidate_class(victim);
+            admit = victim_class == 0 ||
+                (victim_class == 1 && candidate_score >= min_score + 4);
+        } else if (admit) {
+            admit = candidate_score >= min_score + 2;
+        }
+        if (!admit) {
+            stats_snapshot.policy_bestoffset_pressure_rejected++;
         }
     } else if (migration_policy == MIGRATION_POLICY_LRUK &&
                uffd_resident_limit_bytes != 0 &&
@@ -5419,6 +5832,15 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
             record->chunk_policy_meta && source_index < record->chunk_count) {
             MaiChunkPolicyMeta* source = &record->chunk_policy_meta[source_index];
             meta->confidence = source->successor_confidence;
+        } else if (migration_policy == MIGRATION_POLICY_BEST_OFFSET) {
+            ptrdiff_t offset = 0;
+            if (policy_bestoffset_delta(source_index, index, &offset)) {
+                size_t score =
+                    policy_bestoffset_score_delta_locked(record, offset);
+                meta->last_delta = offset;
+                meta->confidence = score > UINT16_MAX ?
+                    UINT16_MAX : (uint16_t)score;
+            }
         } else {
             meta->confidence = record->policy_run_length > UINT16_MAX ?
                 UINT16_MAX : (uint16_t)record->policy_run_length;
@@ -5519,6 +5941,7 @@ static void policy_note_resident_demand_locked(AllocationRecord* record,
     policy_lfu_note_touch_locked(meta);
     policy_car_note_resident_demand_locked(meta);
     policy_tinylfu_note_touch_locked(record, index, meta);
+    policy_bestoffset_note_demand_locked(record, index);
     size_t epoch = uffd_touch_epoch + 1;
     policy_lruk_note_touch_locked(meta, epoch);
     meta->last_access_epoch = epoch;
@@ -5536,6 +5959,10 @@ static void policy_note_evict_locked(AllocationRecord* record, size_t index,
     if (policy_chunk_is_prefetched_unused(meta)) {
         stats_snapshot.policy_prefetch_unused_evictions++;
         stats_snapshot.policy_prefetch_unused_evicted_bytes += length;
+        if (migration_policy == MIGRATION_POLICY_BEST_OFFSET &&
+            meta->last_delta != 0) {
+            policy_bestoffset_penalize_locked(record, meta->last_delta);
+        }
     } else if ((meta->flags & MAI_CHUNK_POLICY_DEMANDED) != 0 ||
                meta->frequency > 1) {
         stats_snapshot.policy_evicted_hot_bytes += length;
@@ -5829,6 +6256,9 @@ static int policy_choose_uffd_victim_mode_locked(
                     candidate_class = policy_tinylfu_candidate_class(meta);
                     candidate_score =
                         policy_tinylfu_score_locked(record, i, meta);
+                } else if (migration_policy == MIGRATION_POLICY_BEST_OFFSET) {
+                    candidate_class = policy_bestoffset_candidate_class(meta);
+                    candidate_score = meta ? meta->confidence : 0;
                 } else if (migration_policy == MIGRATION_POLICY_LRUK) {
                     candidate_class = policy_lruk_candidate_class(meta);
                     candidate_score = policy_lruk_score_locked(meta);
@@ -5861,6 +6291,7 @@ static int policy_choose_uffd_victim_mode_locked(
                     (candidate_class == best_class &&
                      (migration_policy == MIGRATION_POLICY_LFU ||
                       migration_policy == MIGRATION_POLICY_TINYLFU ||
+                      migration_policy == MIGRATION_POLICY_BEST_OFFSET ||
                       migration_policy == MIGRATION_POLICY_LRUK ||
                       migration_policy == MIGRATION_POLICY_CAR ||
                       migration_policy == MIGRATION_POLICY_SPATIAL) &&
@@ -7680,6 +8111,7 @@ static void populate_stats_snapshot_locked(MaiStats* out) {
         out->policy_car_target_recent_chunks =
             policy_car_target_recent_chunks;
     }
+    policy_bestoffset_snapshot_locked(out);
 }
 
 int mai_get_stats_sized(MaiStats* out, size_t stats_size) {
@@ -8635,6 +9067,8 @@ static int configure_runtime(void) {
         getenv("MAI_SPATIAL_LEARN_THRESHOLD");
     const char* spatial_admit =
         getenv("MAI_SPATIAL_ADMIT_THRESHOLD");
+    const char* best_offset_min =
+        getenv("MAI_POLICY_BEST_OFFSET_MIN_CHUNKS");
     const char* migration_policy_env = getenv("MAI_MIGRATION_POLICY");
     if (!migration_policy_env || migration_policy_env[0] == '\0') {
         migration_policy_env = getenv("MAI_POLICY");
@@ -8737,6 +9171,7 @@ static int configure_runtime(void) {
     atomic_store_explicit(&background_heartbeat_stop, 0, memory_order_relaxed);
     migration_chunk_bytes = MAI_DEFAULT_MIGRATION_CHUNK_BYTES;
     uffd_prefetch_chunks = MAI_DEFAULT_UFFD_PREFETCH_CHUNKS;
+    policy_best_offset_min_chunks = 0;
     spatial_region_chunks = MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS;
     spatial_table_slots = MAI_POLICY_SPATIAL_DEFAULT_SLOTS;
     spatial_learn_threshold = MAI_POLICY_SPATIAL_DEFAULT_LEARN_THRESHOLD;
@@ -8882,6 +9317,11 @@ static int configure_runtime(void) {
     }
     if (uffd_prefetch &&
         parse_count_env(uffd_prefetch, &uffd_prefetch_chunks) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (best_offset_min &&
+        parse_count_env(best_offset_min, &policy_best_offset_min_chunks) != 0) {
         runtime_config_error = 1;
         return -1;
     }

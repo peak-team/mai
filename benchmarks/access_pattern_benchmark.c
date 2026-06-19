@@ -236,6 +236,20 @@ static size_t coprime_stride(size_t units, size_t salt) {
     return stride;
 }
 
+static void shuffle_size_order(size_t* order, size_t count, uint64_t seed) {
+    for (size_t i = 0; i < count; i++) {
+        order[i] = i;
+    }
+    uint64_t state = seed == 0 ? 0x9e3779b97f4a7c15ULL : seed;
+    for (size_t i = count; i > 1; i--) {
+        state = state * 2862933555777941757ULL + 3037000493ULL;
+        size_t j = (size_t)(state % i);
+        size_t tmp = order[i - 1];
+        order[i - 1] = order[j];
+        order[j] = tmp;
+    }
+}
+
 static int parse_size_value(const char* value, size_t* out) {
     char* end = NULL;
     errno = 0;
@@ -1801,6 +1815,144 @@ static int run_policy_long_tail_admission(unsigned char* buffer, size_t size,
     stream_pipeline_seed_recorded = seed;
 
     free(visited);
+    free(expected);
+    return 0;
+}
+
+static int run_policy_best_offset_lag(unsigned char* buffer, size_t size,
+                                      uint64_t* checksum, size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_OFFSET_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t offset_chunks =
+        env_count("MAI_BENCH_POLICY_OFFSET_CHUNKS", 8);
+    size_t lookahead =
+        env_count("MAI_BENCH_POLICY_OFFSET_LOOKAHEAD", 4);
+    size_t passes = env_count("MAI_BENCH_POLICY_OFFSET_PASSES", 3);
+    size_t seed = env_count("MAI_BENCH_POLICY_OFFSET_SEED", 11);
+    size_t noise = env_count("MAI_BENCH_POLICY_OFFSET_NOISE", 0);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    size_t units = size / unit_bytes;
+    if (units < 4) {
+        return -1;
+    }
+    if (offset_chunks == 0) {
+        offset_chunks = 2;
+    }
+    if (offset_chunks == 1 && units > 3) {
+        offset_chunks = 2;
+    }
+    if (offset_chunks >= units) {
+        offset_chunks = units / 2;
+    }
+    if (offset_chunks == 0 || offset_chunks >= units) {
+        return -1;
+    }
+    if (lookahead == 0) {
+        lookahead = 1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+
+    size_t pair_count = offset_chunks;
+    if (pair_count > units - offset_chunks) {
+        pair_count = units - offset_chunks;
+    }
+    if (pair_count == 0) {
+        return -1;
+    }
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+    size_t* order = malloc(pair_count * sizeof(*order));
+    if (!order) {
+        free(expected);
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        size_t salt = seed + pass * 2654435761ULL;
+        shuffle_size_order(order, pair_count, salt ^ 1103515245ULL);
+        size_t steps = pair_count + lookahead;
+        for (size_t step = 0; step < steps; step++) {
+            if (step < pair_count) {
+                size_t anchor = order[step];
+                size_t offset = anchor * unit_bytes;
+                expected[anchor]++;
+                buffer[offset] = expected[anchor];
+                if (buffer[offset] != expected[anchor]) {
+                    free(order);
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+            if (noise != 0 && step < pair_count) {
+                size_t noise_index =
+                    (salt + step * 1664525ULL + 1013904223ULL) % units;
+                size_t offset = noise_index * unit_bytes;
+                expected[noise_index]++;
+                buffer[offset] = expected[noise_index];
+                if (buffer[offset] != expected[noise_index]) {
+                    free(order);
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+            if (step >= lookahead &&
+                step - lookahead < pair_count) {
+                size_t delayed = step - lookahead;
+                size_t anchor = order[delayed];
+                size_t target = anchor + offset_chunks;
+                size_t offset = target * unit_bytes;
+                expected[target]++;
+                buffer[offset] = expected[target];
+                if (buffer[offset] != expected[target]) {
+                    free(order);
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(order);
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "best_offset_lag";
+    stream_pipeline_prediction_recorded = "best_offset";
+    stream_pipeline_groups_recorded = pair_count;
+    stream_pipeline_group_visits_recorded = pair_count;
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_lag_recorded = lookahead;
+    stream_pipeline_reclaim_horizon_recorded = offset_chunks;
+    stream_pipeline_seed_recorded = seed;
+
+    free(order);
     free(expected);
     return 0;
 }
@@ -3795,6 +3947,7 @@ int main(int argc, char** argv) {
                 "policy_phase_shift_hotset|"
                 "policy_recency_frequency_pivot|"
                 "policy_long_tail_admission|"
+                "policy_best_offset_lag|"
                 "policy_successor_cycle|policy_spatial_region_mask|"
                 "policy_spatial_interleaved_mask|"
                 "stream_kernel_pipeline|"
@@ -3888,6 +4041,8 @@ int main(int argc, char** argv) {
     } else if (strcmp(argv[1], "policy_long_tail_admission") == 0) {
         rc = run_policy_long_tail_admission(buffer, size, &checksum,
                                             &touches);
+    } else if (strcmp(argv[1], "policy_best_offset_lag") == 0) {
+        rc = run_policy_best_offset_lag(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_successor_cycle") == 0) {
         rc = run_policy_successor_cycle(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_spatial_region_mask") == 0) {
@@ -4059,6 +4214,33 @@ int main(int argc, char** argv) {
         before.policy_tinylfu_admission_rejected : 0;
     size_t policy_tinylfu_min_score = after_stats_available ?
         after.policy_tinylfu_min_score : 0;
+    size_t policy_bestoffset_train_samples = after_stats_available ?
+        after.policy_bestoffset_train_samples -
+        before.policy_bestoffset_train_samples : 0;
+    size_t policy_bestoffset_train_hits = after_stats_available ?
+        after.policy_bestoffset_train_hits -
+        before.policy_bestoffset_train_hits : 0;
+    size_t policy_bestoffset_slots_created = after_stats_available ?
+        after.policy_bestoffset_slots_created -
+        before.policy_bestoffset_slots_created : 0;
+    size_t policy_bestoffset_score_decays = after_stats_available ?
+        after.policy_bestoffset_score_decays -
+        before.policy_bestoffset_score_decays : 0;
+    size_t policy_bestoffset_candidates = after_stats_available ?
+        after.policy_bestoffset_candidates -
+        before.policy_bestoffset_candidates : 0;
+    size_t policy_bestoffset_pressure_rejected = after_stats_available ?
+        after.policy_bestoffset_pressure_rejected -
+        before.policy_bestoffset_pressure_rejected : 0;
+    size_t policy_bestoffset_unused_penalties = after_stats_available ?
+        after.policy_bestoffset_unused_penalties -
+        before.policy_bestoffset_unused_penalties : 0;
+    size_t policy_bestoffset_top_offset_magnitude = after_stats_available ?
+        after.policy_bestoffset_top_offset_magnitude : 0;
+    size_t policy_bestoffset_top_offset_sign = after_stats_available ?
+        after.policy_bestoffset_top_offset_sign : 0;
+    size_t policy_bestoffset_top_score = after_stats_available ?
+        after.policy_bestoffset_top_score : 0;
     const char* policy_prefetch_observation =
         after_stats_available && after.policy_prefetch_observation != 0 ?
         "write_protect" : "unobserved";
@@ -4150,6 +4332,16 @@ int main(int argc, char** argv) {
            "policy_tinylfu_sketch_decays=%zu "
            "policy_tinylfu_admission_rejected=%zu "
            "policy_tinylfu_min_score=%zu "
+           "policy_bestoffset_train_samples=%zu "
+           "policy_bestoffset_train_hits=%zu "
+           "policy_bestoffset_slots_created=%zu "
+           "policy_bestoffset_score_decays=%zu "
+           "policy_bestoffset_candidates=%zu "
+           "policy_bestoffset_pressure_rejected=%zu "
+           "policy_bestoffset_unused_penalties=%zu "
+           "policy_bestoffset_top_offset_magnitude=%zu "
+           "policy_bestoffset_top_offset_sign=%zu "
+           "policy_bestoffset_top_score=%zu "
            "max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
@@ -4265,6 +4457,16 @@ int main(int argc, char** argv) {
            policy_tinylfu_sketch_decays,
            policy_tinylfu_admission_rejected,
            policy_tinylfu_min_score,
+           policy_bestoffset_train_samples,
+           policy_bestoffset_train_hits,
+           policy_bestoffset_slots_created,
+           policy_bestoffset_score_decays,
+           policy_bestoffset_candidates,
+           policy_bestoffset_pressure_rejected,
+           policy_bestoffset_unused_penalties,
+           policy_bestoffset_top_offset_magnitude,
+           policy_bestoffset_top_offset_sign,
+           policy_bestoffset_top_score,
            after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,

@@ -193,9 +193,10 @@ Policy pressure scenarios can use `mai_policy_pipeline` with
 `MAI_MIGRATION_POLICY`, or a policy-specific scenario such as
 `mai_policy_stream_pipeline`, `mai_policy_clock_pipeline`, or
 `mai_policy_2q_pipeline`. The runtime accepts `legacy`, `lru`, `clock`,
-`fifo`, `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, and
-`lruk`/`lru-k`, `car`/`car-lite`, `markov`/`successor`, and
-`spatial`/`spatial-mask`, and `tinylfu`/`tiny-lfu`.
+`fifo`, `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`,
+`lruk`/`lru-k`, `car`/`car-lite`, `markov`/`successor`,
+`spatial`/`spatial-mask`, `tinylfu`/`tiny-lfu`, and
+`best-offset`/`offset-prefetch`.
 
 `policy_multistream_stride` is a focused no-oracle workload for stride
 predictors. It walks fixed-size units inside one allocation as independent
@@ -260,6 +261,18 @@ and `car`: the expected signal is lower cold-tail pollution and migration
 traffic, not universal improvement on every phase-shift probe. Output includes
 `stream_pipeline_unique_cold_visits`, which should equal the cold-tail unit
 count times the number of cold-tail passes.
+
+`policy_best_offset_lag` is a no-oracle workload for recurring non-adjacent
+offset predictors. It shuffles a source range, touches each anchor now, then
+touches a disjoint `anchor + offset` target after a configurable lookahead.
+Control it with `MAI_BENCH_POLICY_OFFSET_UNIT`,
+`MAI_BENCH_POLICY_OFFSET_CHUNKS`, `MAI_BENCH_POLICY_OFFSET_LOOKAHEAD`,
+`MAI_BENCH_POLICY_OFFSET_PASSES`, `MAI_BENCH_POLICY_OFFSET_SEED`, and optional
+`MAI_BENCH_POLICY_OFFSET_NOISE`. Runtime policy tuning can also set
+`MAI_POLICY_BEST_OFFSET_MIN_CHUNKS` to keep nearby offsets in the stream/stride
+domain. Use it to compare `best-offset` against `stream`, `stride`, `markov`,
+and `spatial`: wins require lower demand events or stalls without higher
+migration amplification or unused-prefetch evictions.
 
 `policy_successor_cycle` is a no-oracle workload for repeated irregular
 transitions. It walks fixed-size units through an affine successor cycle, so
