@@ -1129,6 +1129,106 @@ static int run_random_hotset(unsigned char* buffer, size_t size,
     return 0;
 }
 
+static int run_policy_hotset_scan(unsigned char* buffer, size_t size,
+                                  uint64_t* checksum, size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_HOTSET_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t hotset_bytes =
+        env_size("MAI_BENCH_POLICY_HOTSET", 8ULL * 1024ULL * 1024ULL);
+    size_t hot_rounds = env_count("MAI_BENCH_POLICY_HOT_ROUNDS", 4);
+    size_t scan_passes = env_count("MAI_BENCH_POLICY_SCAN_PASSES", 3);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    size_t units = size / unit_bytes;
+    if (units < 2) {
+        return -1;
+    }
+    hotset_bytes -= hotset_bytes % unit_bytes;
+    size_t hot_units = hotset_bytes / unit_bytes;
+    if (hot_units == 0) {
+        hot_units = 1;
+    }
+    if (hot_units >= units) {
+        hot_units = units / 2;
+    }
+    if (hot_units == 0 || hot_units >= units) {
+        return -1;
+    }
+    if (hot_rounds == 0) {
+        hot_rounds = 1;
+    }
+    if (scan_passes == 0) {
+        scan_passes = 1;
+    }
+
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t pass = 0; pass < scan_passes; pass++) {
+        for (size_t round = 0; round < hot_rounds; round++) {
+            for (size_t unit = 0; unit < hot_units; unit++) {
+                size_t offset = unit * unit_bytes;
+                expected[unit]++;
+                buffer[offset] = expected[unit];
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+        for (size_t unit = hot_units; unit < units; unit++) {
+            size_t offset = unit * unit_bytes;
+            expected[unit]++;
+            buffer[offset] = expected[unit];
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t offset = unit * unit_bytes;
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "hotset_scan";
+    stream_pipeline_prediction_recorded = "admission_lfu";
+    stream_pipeline_groups_recorded = hot_units;
+    stream_pipeline_group_visits_recorded = units - hot_units;
+    stream_pipeline_group_iterations_recorded = scan_passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+
+    free(expected);
+    return 0;
+}
+
 static int run_trace_chunks(unsigned char* buffer, size_t size,
                             uint64_t* checksum, size_t* touches) {
     if (load_trace_symbols() != 0) {
@@ -2742,7 +2842,7 @@ int main(int argc, char** argv) {
                 "heartbeat_concurrent|stream_bandwidth|stream_anon_mmap|"
                 "stream_shared_file|stream_private_file|"
                 "stream_tiled_bandwidth|policy_stream_pipeline|"
-                "policy_multistream_stride|"
+                "policy_multistream_stride|policy_hotset_scan|"
                 "stream_kernel_pipeline|"
                 "stream_kernel_pipeline_anon_mmap|"
                 "stream_kernel_pipeline_shared_file|"
@@ -2824,6 +2924,8 @@ int main(int argc, char** argv) {
                                         &touches);
     } else if (strcmp(argv[1], "policy_multistream_stride") == 0) {
         rc = run_policy_multistream_stride(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_hotset_scan") == 0) {
+        rc = run_policy_hotset_scan(buffer, size, &checksum, &touches);
     } else if (mode_uses_stream_kernel(argv[1])) {
         rc = run_stream_bandwidth(argv[1], buffer, size, &checksum, &touches);
     } else {

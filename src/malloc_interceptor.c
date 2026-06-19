@@ -115,7 +115,8 @@ typedef enum {
     MIGRATION_POLICY_RANDOM,
     MIGRATION_POLICY_STREAM,
     MIGRATION_POLICY_STRIDE,
-    MIGRATION_POLICY_2Q
+    MIGRATION_POLICY_2Q,
+    MIGRATION_POLICY_LFU
 } MigrationPolicy;
 
 enum {
@@ -938,6 +939,10 @@ static int parse_migration_policy_env(const char* value,
     if (strcmp(value, "2q") == 0 || strcmp(value, "twoq") == 0 ||
         strcmp(value, "prefetch-aware-2q") == 0) {
         *out = MIGRATION_POLICY_2Q;
+        return 0;
+    }
+    if (strcmp(value, "lfu") == 0 || strcmp(value, "decayed-lfu") == 0) {
+        *out = MIGRATION_POLICY_LFU;
         return 0;
     }
     return -1;
@@ -4021,6 +4026,48 @@ static int policy_chunk_is_prefetched_unused(MaiChunkPolicyMeta* meta) {
         (meta->flags & MAI_CHUNK_POLICY_DEMANDED) == 0;
 }
 
+static size_t policy_lfu_score_locked(MaiChunkPolicyMeta* meta) {
+    if (!meta || meta->frequency == 0) {
+        return 0;
+    }
+    size_t epoch = uffd_touch_epoch + 1;
+    size_t last = meta->last_access_epoch;
+    if (last == 0) {
+        last = meta->first_resident_epoch;
+    }
+    if (last == 0) {
+        last = meta->last_prefetch_epoch;
+    }
+    size_t age = last == 0 || epoch <= last ? 0 : epoch - last;
+    size_t decay = age / 16;
+    if (decay >= sizeof(size_t) * CHAR_BIT - 1) {
+        return 1;
+    }
+    size_t score = meta->frequency >> decay;
+    return score == 0 ? 1 : score;
+}
+
+static void policy_lfu_note_touch_locked(MaiChunkPolicyMeta* meta) {
+    if (!meta) {
+        return;
+    }
+    if (migration_policy == MIGRATION_POLICY_LFU) {
+        meta->frequency = policy_lfu_score_locked(meta);
+    }
+    if (meta->frequency < SIZE_MAX) {
+        meta->frequency++;
+    }
+}
+
+static int policy_lfu_candidate_class(MaiChunkPolicyMeta* meta) {
+    if (policy_chunk_is_prefetched_unused(meta) ||
+        (meta && (meta->flags & MAI_CHUNK_POLICY_PROBATION) != 0 &&
+         (meta->flags & MAI_CHUNK_POLICY_PREFETCH_USED) == 0)) {
+        return 0;
+    }
+    return 1;
+}
+
 static int policy_index_add(size_t index, ptrdiff_t delta, size_t limit,
                             size_t* out) {
     if (delta >= 0) {
@@ -4132,7 +4179,7 @@ static void policy_note_demand_fault_locked(AllocationRecord* record,
     MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
     meta->last_delta = record->policy_last_delta;
     meta->flags |= MAI_CHUNK_POLICY_DEMANDED | MAI_CHUNK_POLICY_REFERENCED;
-    meta->frequency++;
+    policy_lfu_note_touch_locked(meta);
     meta->last_access_epoch = uffd_touch_epoch + 1;
 }
 
@@ -4158,6 +4205,10 @@ static size_t policy_prefetch_window_locked(AllocationRecord* record,
     record->policy_prefetch_window = adaptive;
     return adaptive;
 }
+
+static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
+                                            size_t* out_index,
+                                            const MaiProtectedChunkSet* protected_set);
 
 static size_t policy_build_prefetch_indices_locked(AllocationRecord* record,
                                                    size_t index,
@@ -4223,6 +4274,30 @@ static int policy_admit_prefetch_locked(AllocationRecord* record, size_t index,
         uffd_resident_limit_bytes != 0 &&
         uffd_resident_bytes + length > uffd_resident_limit_bytes) {
         admit = 0;
+    } else if (migration_policy == MIGRATION_POLICY_LFU &&
+               uffd_resident_limit_bytes != 0 &&
+               uffd_resident_bytes + length > uffd_resident_limit_bytes) {
+        MaiChunkPolicyMeta* candidate = record->chunk_policy_meta ?
+            &record->chunk_policy_meta[index] : NULL;
+        size_t candidate_score = policy_lfu_score_locked(candidate);
+        AllocationRecord* victim_record = NULL;
+        size_t victim_index = 0;
+        if (policy_choose_uffd_victim_locked(&victim_record, &victim_index,
+                                             NULL) &&
+            victim_record && victim_record->chunk_policy_meta) {
+            MaiChunkPolicyMeta* victim =
+                &victim_record->chunk_policy_meta[victim_index];
+            int victim_class = policy_lfu_candidate_class(victim);
+            size_t victim_score = policy_lfu_score_locked(victim);
+            if (candidate_score > victim_score ||
+                (candidate_score == victim_score && victim_class == 0)) {
+                admit = 1;
+            } else {
+                admit = 0;
+            }
+        } else {
+            admit = candidate_score > 0;
+        }
     }
     if (!admit) {
         stats_snapshot.policy_admission_rejected++;
@@ -4308,7 +4383,7 @@ static void policy_note_resident_demand_locked(AllocationRecord* record,
         stats_snapshot.policy_prefetch_useful_bytes += length;
     }
     meta->flags |= MAI_CHUNK_POLICY_DEMANDED | MAI_CHUNK_POLICY_REFERENCED;
-    meta->frequency++;
+    policy_lfu_note_touch_locked(meta);
     meta->last_access_epoch = uffd_touch_epoch + 1;
     stats_snapshot.policy_demand_faults++;
 }
@@ -4329,7 +4404,15 @@ static void policy_note_evict_locked(AllocationRecord* record, size_t index,
                meta->frequency > 1) {
         stats_snapshot.policy_evicted_hot_bytes += length;
     }
+    size_t ghost_frequency = 0;
+    if (migration_policy == MIGRATION_POLICY_LFU) {
+        ghost_frequency = policy_lfu_score_locked(meta);
+    }
     memset(meta, 0, sizeof(*meta));
+    if (ghost_frequency != 0) {
+        meta->frequency = ghost_frequency;
+        meta->last_access_epoch = uffd_touch_epoch + 1;
+    }
 }
 
 static void policy_note_evict_runtime_locked(AllocationRecord* record,
@@ -4356,7 +4439,7 @@ static void policy_note_promote_runtime_locked(AllocationRecord* record,
     MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
     meta->flags |= MAI_CHUNK_POLICY_DEMANDED |
         MAI_CHUNK_POLICY_PROTECTED | MAI_CHUNK_POLICY_REFERENCED;
-    meta->frequency++;
+    policy_lfu_note_touch_locked(meta);
     meta->last_access_epoch = reclaim_epoch + 1;
     meta->first_resident_epoch = meta->last_access_epoch;
 }
@@ -4412,6 +4495,7 @@ static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
     AllocationRecord* best_record = NULL;
     size_t best_index = 0;
     size_t best_epoch = SIZE_MAX;
+    size_t best_score = SIZE_MAX;
     int best_class = 2;
     size_t candidates_seen = 0;
 
@@ -4451,17 +4535,27 @@ static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
             }
 
             int candidate_class =
-                (migration_policy != MIGRATION_POLICY_LEGACY &&
-                 policy_chunk_is_prefetched_unused(meta)) ? 0 : 1;
+                (migration_policy == MIGRATION_POLICY_LFU) ?
+                policy_lfu_candidate_class(meta) :
+                ((migration_policy != MIGRATION_POLICY_LEGACY &&
+                  policy_chunk_is_prefetched_unused(meta)) ? 0 : 1);
+            size_t candidate_score =
+                migration_policy == MIGRATION_POLICY_LFU ?
+                policy_lfu_score_locked(meta) : 0;
             if (migration_policy == MIGRATION_POLICY_FIFO && meta &&
                 meta->first_resident_epoch != 0) {
                 epoch = meta->first_resident_epoch;
             }
             if (!best_record || candidate_class < best_class ||
-                (candidate_class == best_class && epoch < best_epoch)) {
+                (candidate_class == best_class &&
+                 migration_policy == MIGRATION_POLICY_LFU &&
+                 candidate_score < best_score) ||
+                (candidate_class == best_class &&
+                 candidate_score == best_score && epoch < best_epoch)) {
                 best_record = record;
                 best_index = i;
                 best_epoch = epoch;
+                best_score = candidate_score;
                 best_class = candidate_class;
             }
         }
@@ -4674,7 +4768,8 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
         }
         policy_note_populate_locked(record, index, count_fault_event,
                                     has_storage, length);
-        if (!count_fault_event && policy_observe_prefetch_writes) {
+        if (policy_observe_prefetch_writes &&
+            (!count_fault_event || migration_policy == MIGRATION_POLICY_LFU)) {
             (void)uffd_writeprotect_range(chunk_start, length, 1);
         }
     }

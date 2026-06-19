@@ -160,7 +160,7 @@ observed lower bounds unless the row says
 | Family | Integrated policy design | MAI priority |
 | --- | --- | --- |
 | LRU, CLOCK, FIFO, Random | Demand faults admit chunks. Prefetch enters probation. Eviction uses oldest touch, second-chance reference bit, admission order, or random victim. Throttling is fixed by resident limits and migration chunk size. | Implemented as baselines. |
-| LFU and decayed LFU | Track per-chunk frequency with decay. Admit a candidate only if its recent frequency beats the current victim. Evict low-frequency probation chunks first. | Candidate after baseline counters stabilize. |
+| LFU and decayed LFU | Track exact per-chunk frequency with lazy decay and ghost scores after eviction. Admit a prefetch under pressure only if its score beats the current victim or ties an unused/probation victim. Evict unused prefetches first, then low-frequency chunks. Optional write-protect observation can add one resident reuse signal but also adds handler overhead. | Implemented as `lfu`/`decayed-lfu`; approximate TinyLFU sketches remain future work. |
 | 2Q | New or prefetched chunks enter a probation queue. A second demand touch promotes them to the protected set. Eviction demotes probation before protected chunks. | Implemented as a conservative admission baseline; queue refinement remains future work. |
 | ARC, CAR, CART | Maintain recent and frequent resident sets plus ghost histories. Ghost hits tune the split between recency and frequency. Prefetched chunks never enter the frequent set until a demand touch confirms them. | Design target; CAR/CLOCK-style approximations are preferred before exact ARC. |
 | LIRS, LRU-K | Protect chunks with low inter-reference recency or repeated Kth references. Demote high inter-reference recency chunks even if they were touched recently by a scan. | Simulator/reference first; exact LIRS metadata is too heavy for the initial C runtime. |
@@ -235,6 +235,15 @@ because each unit touch samples one byte rather than sweeping complete arrays.
 Use `policy_sampled_units_per_sec` and migration counters for this workload.
 Set `MAI_BENCH_POLICY_ACTIVE_STREAMS=1` when you need a negative control where
 adjacent forward prefetches are never consumed.
+`policy_hotset_scan` is the corresponding no-oracle admission workload: it
+reuses a small hot chunk set, scans colder chunks, and verifies whether policy
+counters show less prefetch pollution and migration traffic. It is the preferred
+first check for `2q` and `lfu`/`decayed-lfu`.
+Current local smoke results show `lfu` with write-protect observation reducing
+migration traffic versus `legacy` on this workload, but still trailing `2q` on
+this small shape. Without observation, this first exact per-chunk LFU roughly
+ties or trails the simpler policies. That result is expected and does not make
+`lfu` the default policy.
 
 ## Benchmarks
 

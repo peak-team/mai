@@ -56,4 +56,20 @@ if(BUILD_TESTING)
     set_tests_properties(mai_policy_multistream_stride_smoke PROPERTIES
         PASS_REGULAR_EXPRESSION "mode=policy_multistream_stride .*logical_mib=128\\.000 .*stream_pipeline_groups=4 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=strided_streams .*stream_pipeline_prediction=stride"
     )
+
+    add_test(
+        NAME mai_policy_hotset_scan_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_POLICY_HOTSET=4M"
+            "MAI_BENCH_POLICY_HOTSET_UNIT=2M"
+            "MAI_BENCH_POLICY_HOT_ROUNDS=2"
+            "MAI_BENCH_POLICY_SCAN_PASSES=2"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            policy_hotset_scan
+            16M
+    )
+    set_tests_properties(mai_policy_hotset_scan_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=policy_hotset_scan .*logical_mib=48\\.000 .*stream_pipeline_group_visits=6 .*stream_pipeline_groups=2 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=hotset_scan .*stream_pipeline_prediction=admission_lfu"
+    )
 endif()

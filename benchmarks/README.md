@@ -174,7 +174,8 @@ Runtime policy knobs are intentionally separate from benchmark knobs:
 Policy pressure scenarios can use `mai_policy_pipeline` with
 `MAI_MIGRATION_POLICY`, or a policy-specific scenario such as
 `mai_policy_stream_pipeline`, `mai_policy_clock_pipeline`, or
-`mai_policy_2q_pipeline`.
+`mai_policy_2q_pipeline`. The runtime accepts `legacy`, `lru`, `clock`,
+`fifo`, `random`, `stream`, `stride`, `2q`, and `lfu`/`decayed-lfu`.
 
 `policy_multistream_stride` is a focused no-oracle workload for stride
 predictors. It walks fixed-size units inside one allocation as independent
@@ -186,6 +187,18 @@ throughput is a policy-event score, not a STREAM bandwidth claim, because each
 unit touch samples the unit instead of sweeping every byte. Use
 `policy_sampled_units_per_sec` and policy counters as the primary metrics for
 this workload.
+
+`policy_hotset_scan` is a policy-event workload for admission and eviction
+pollution. It repeatedly touches a hot chunk set, scans a larger cold region,
+then verifies the hot set. Control it with `MAI_BENCH_POLICY_HOTSET`,
+`MAI_BENCH_POLICY_HOTSET_UNIT`, `MAI_BENCH_POLICY_HOT_ROUNDS`, and
+`MAI_BENCH_POLICY_SCAN_PASSES`. Use it to compare `2q` and `lfu` against
+legacy prefetch admission under the same resident limit.
+On the local 32M allocation / 8M resident-limit smoke shape, `lfu` with
+write-protect observation reduced migration traffic versus `legacy`, while
+`2q` remained as good or better on migration and sampled-unit throughput.
+Without observation, this first exact LFU roughly tied or trailed the simpler
+policies. Treat `lfu` as a frequency-admission baseline, not a default win.
 
 Benchmark-only knobs keep the `MAI_BENCH_` prefix. Source policy tests reject
 `MAI_BENCH_*` and `MAI_STREAM_*` references from runtime source files so MAI
