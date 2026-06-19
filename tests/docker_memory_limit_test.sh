@@ -45,6 +45,7 @@ docker run --rm \
         MAI_PATH=/mai-scratch \
         MAI_THRESHOLD=4K \
         MAI_ARENA_SIZE=128M \
+        MAI_BACKEND=file \
         MAI_MAX_RSS=auto \
         MAI_RECLAIM_POLICY=donthneed \
         LD_PRELOAD=/mai-lib/libmai.so \
