@@ -2040,6 +2040,94 @@ static int mode_uffd_pager_async_prefetch(void) {
     return 0;
 }
 
+static int mode_uffd_pager_record_protect_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 16 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t chunks = size / unit;
+    unsigned char expected_a[8] = {0};
+    unsigned char expected_b[8] = {0};
+
+    if (chunks > sizeof(expected_a) || chunks > sizeof(expected_b)) {
+        return fail("record protect expected arrays are too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD record protect test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for record protect test");
+    }
+
+    unsigned char* a = malloc(size);
+    unsigned char* b = malloc(size);
+    if (!a || !b) {
+        free(a);
+        free(b);
+        return fail("UFFD record protect allocations failed");
+    }
+
+    for (size_t i = 0; i < 4; i++) {
+        expected_a[i] = (unsigned char)(0x70 + i);
+        a[i * unit] = expected_a[i];
+    }
+    for (size_t i = 0; i < chunks; i++) {
+        expected_b[i] = (unsigned char)(0x90 + i);
+        b[i * unit] = expected_b[i];
+    }
+    for (size_t i = 0; i < 4; i++) {
+        if (a[i * unit] != expected_a[i]) {
+            free(a);
+            free(b);
+            return fail("UFFD record protect lost hot record data");
+        }
+    }
+    for (size_t i = 0; i < chunks; i++) {
+        if (b[i * unit] != expected_b[i]) {
+            free(a);
+            free(b);
+            return fail("UFFD record protect lost scan record data");
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(a);
+        free(b);
+        return fail("mai_get_stats failed after UFFD record protect touches");
+    }
+    size_t unused_evictions =
+        after_touch.policy_prefetch_unused_evictions -
+        before.policy_prefetch_unused_evictions;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.managed_allocations < before.managed_allocations + 2 ||
+        after_touch.uffd_pager_allocations < before.uffd_pager_allocations + 2 ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(a);
+        free(b);
+        return fail("UFFD record protect did not exercise two-record pressure");
+    }
+    if (unused_evictions == 0) {
+        free(a);
+        free(b);
+        return fail("UFFD record protect did not evict unused prefetches");
+    }
+
+    free(a);
+    free(b);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD record protect free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD record protect allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
 static int mode_uffd_pager_stride_policy(void) {
     MaiStats before;
     MaiStats after_touch;
@@ -3628,6 +3716,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_async_prefetch") == 0) {
         return mode_uffd_pager_async_prefetch();
+    }
+    if (strcmp(argv[1], "uffd_pager_record_protect_policy") == 0) {
+        return mode_uffd_pager_record_protect_policy();
     }
     if (strcmp(argv[1], "uffd_pager_stride_policy") == 0) {
         return mode_uffd_pager_stride_policy();

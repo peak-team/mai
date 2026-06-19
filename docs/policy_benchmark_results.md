@@ -141,6 +141,35 @@ The async counters verify that the worker actually executed.
 | off | `2q` | 5635 | 15986 | 137 | 534 | 630 | 231 | 0 |
 | on | `2q` | 7105 | 17865 | 147 | 337 | 427 | 140 | 137 |
 
+### Record-Aware Eviction Probe
+
+`MAI_RECORD_PROTECT_EPOCHS` biases eviction away from demand-confirmed chunks
+in allocation records that recently faulted, while still letting unused
+prefetched chunks be evicted first. These rows keep async prefetch disabled.
+`legacy` is excluded from the record bias so it remains a stable baseline; its
+row movement below reflects run variance because the migration counters do not
+change.
+
+| Low watermark | Policy | Protect epochs | End-to-end MiB/s | Kernel MiB/s | Demand faults | Read MiB | Write MiB | Unused evictions | Stall ms |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 48 MiB | `legacy` | 0 | 7695 | 23634 | 48 | 240 | 336 | 126 | 155 |
+| 48 MiB | `legacy` | 32 | 8527 | 26014 | 48 | 240 | 336 | 126 | 145 |
+| 48 MiB | `markov` | 0 | 7140 | 21651 | 175 | 246 | 342 | 20 | 147 |
+| 48 MiB | `markov` | 32 | 7570 | 22478 | 175 | 246 | 342 | 20 | 137 |
+| 48 MiB | `2q` | 0 | 5568 | 15320 | 137 | 534 | 630 | 202 | 232 |
+| 48 MiB | `2q` | 8 | 5709 | 15826 | 138 | 534 | 630 | 201 | 225 |
+| 64 MiB | `legacy` | 0 | 7861 | 22896 | 48 | 240 | 320 | 120 | 134 |
+| 64 MiB | `legacy` | 32 | 7738 | 23241 | 48 | 240 | 320 | 120 | 137 |
+| 64 MiB | `markov` | 0 | 8190 | 24829 | 192 | 240 | 320 | 0 | 119 |
+| 64 MiB | `markov` | 32 | 6814 | 20799 | 192 | 240 | 320 | 0 | 151 |
+| 64 MiB | `2q` | 0 | 7904 | 22798 | 168 | 240 | 320 | 24 | 131 |
+| 64 MiB | `2q` | 8 | 7940 | 23852 | 168 | 240 | 320 | 24 | 128 |
+
+With async prefetch enabled on the 48 MiB low-watermark shape, `2q` improved
+from 6700 MiB/s at protect 0 to 7328 MiB/s at protect 8, then regressed to
+6314 MiB/s at protect 32. The two knobs can compose, but the useful range is
+narrow.
+
 ## Interpretation
 
 - Sufficient-memory MAI does not trigger migration in these runs; faster
@@ -174,6 +203,11 @@ The async counters verify that the worker actually executed.
   speculative work off the fault path and reducing migration bytes, but it
   hurts `legacy` and `markov`. It should stay policy-selected or experimental
   until admission and worker scheduling can avoid that regression.
+- Record-aware eviction is also a tuning control, not a default strategy. It
+  gives small selected `markov` and `2q` gains in the 48 MiB low-watermark
+  shape, but it regresses `markov` in the 64 MiB low-watermark shape and has no
+  stable dose response. The `legacy` baseline is deliberately excluded from the
+  record bias.
 - A clean-shadow write-amplification experiment was attempted but rejected:
   retaining storage shadows and using UFFD write-protect to avoid clean
   write-back corrupted the successor-policy correctness workload. Any future

@@ -160,6 +160,16 @@ by `MAI_UFFD_ASYNC_SLACK_CHUNKS` and the resident high/low watermarks. It is
 not a default policy because it can help admission-heavy policies while hurting
 policies whose synchronous forward prefetch is already cheap.
 
+`MAI_RECORD_PROTECT_EPOCHS=N` enables an experimental record-aware eviction
+bias for prefetch-aware policies. A record is an allocation call, so this
+protects demand-confirmed chunks from allocations that recently faulted while
+still letting unused prefetched chunks be reclaimed first. It is generic
+allocation-level recency, not a benchmark group hint, and defaults to zero
+because stale record protection can preserve scan pollution. The `legacy`
+baseline is excluded so its oldest-touch behavior remains stable; `random`
+does not use ordered victim classes, and CLOCK's fallback pass may bypass the
+record bias after second-chance references are cleared.
+
 Read-only usefulness of a UFFD-prefetched chunk is not directly observable
 without adding another faulting mechanism, because a successful prefetch avoids
 the later missing-page fault. `MAI_POLICY_OBSERVE_PREFETCH_WRITES=1` adds
@@ -187,6 +197,7 @@ observed lower bounds unless the row says
 | Spatial region masks | Divide allocations into fixed chunk regions and learn stable touched masks. A small tagged region table lets interleaved regions keep separate masks. Under pressure, same-region transitions may prefetch a learned mask, while inter-region transitions prefetch conservatively to limit pollution. | Implemented as `spatial`/`spatial-mask`; tune width, table slots, and confidence with `MAI_SPATIAL_REGION_CHUNKS`, `MAI_SPATIAL_TABLE_SLOTS`, `MAI_SPATIAL_LEARN_THRESHOLD`, and `MAI_SPATIAL_ADMIT_THRESHOLD`. |
 | TinyLFU and frequency sketches | Use a compact approximate frequency sketch for admission. Compare candidate score against victim score to prevent pollution. | Important for hot/cold classification under mixed scans. |
 | TPP/AutoNUMA-style tiering | Maintain high/low DRAM watermarks. Proactively demote cold chunks during quiet epochs, promote on demand, and keep headroom for new hot allocations. | Core design principle for MAI pressure handling. |
+| Record-aware demotion | Treat an allocation record as a coarse working-set unit. Under pressure, avoid demoting demand-confirmed chunks from records with recent faults, but still evict unused prefetched chunks first. | Implemented as opt-in `MAI_RECORD_PROTECT_EPOCHS`; useful as a tuning control, not a default. |
 | Nomad-style shadowing | Keep valid clean storage shadows after promotion until a write invalidates them. Clean demotion can then avoid rewriting the chunk. | High-value write-amplification reduction, not yet implemented. |
 | Application hints | Treat `mai_hint_range()`, `mai_prefetch()`, and `mai_prepare_write()` as confidence and intent signals, not commands that bypass budgets. | Supported primitives; not used by no-oracle claims. |
 | Queue-aware policies | Accept future ranges with deadlines from schedulers. Admission depends on whether migration can finish before the request executes. | Integration API candidate, separate from autonomous benchmarks. |
