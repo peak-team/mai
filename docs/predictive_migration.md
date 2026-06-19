@@ -221,9 +221,12 @@ speculative work instead of sleeping in the fault handler.
 `MAI_UFFD_ASYNC_PREFETCH=1` enables an experimental UFFD background policy
 worker. Demand faults are still resolved synchronously. The worker only moves
 speculative prefetch and follow-on reclaim work off the fault handler, bounded
-by `MAI_UFFD_ASYNC_SLACK_CHUNKS` and the resident high/low watermarks. It is
-not a default policy because it can help admission-heavy policies while hurting
-policies whose synchronous forward prefetch is already cheap.
+by `MAI_UFFD_ASYNC_SLACK_CHUNKS` and the resident high/low watermarks. Async
+tasks preserve per-candidate allocation identity, so hybrid cross-record cohort
+targets are validated against live allocation sequence numbers before the
+worker admits them. Async is not a default policy because it can help
+admission-heavy policies while hurting policies whose synchronous forward
+prefetch is already cheap.
 
 `MAI_RECORD_PROTECT_EPOCHS=N` enables an experimental record-aware eviction
 bias for prefetch-aware policies. A record is an allocation call, so this

@@ -453,6 +453,8 @@ typedef struct {
     size_t allocation_seq;
     size_t source_index;
     size_t prefetch_count;
+    uintptr_t prefetch_addresses[MAI_MAX_UFFD_PREFETCH_CHUNKS];
+    size_t prefetch_allocation_seqs[MAI_MAX_UFFD_PREFETCH_CHUNKS];
     size_t prefetch_indices[MAI_MAX_UFFD_PREFETCH_CHUNKS];
     MaiHybridSource prefetch_sources[MAI_MAX_UFFD_PREFETCH_CHUNKS];
 } MaiAsyncPolicyTask;
@@ -8699,15 +8701,16 @@ static int policy_enqueue_async_after_access_locked(AllocationRecord* record,
         return 0;
     }
 
+    AllocationRecord* prefetch_records[MAI_MAX_UFFD_PREFETCH_CHUNKS];
     size_t prefetch_indices[MAI_MAX_UFFD_PREFETCH_CHUNKS];
     MaiHybridSource prefetch_sources[MAI_MAX_UFFD_PREFETCH_CHUNKS];
     size_t prefetch_count =
         policy_build_access_prefetch_plan_locked(record, index,
-                                                 NULL,
+                                                 prefetch_records,
                                                  prefetch_indices,
                                                  prefetch_sources,
                                                  MAI_MAX_UFFD_PREFETCH_CHUNKS,
-                                                 0);
+                                                 1);
     size_t target = policy_effective_resident_target_locked(runtime_lock_held);
     int needs_reclaim = target != SIZE_MAX && uffd_resident_bytes > target;
     if (prefetch_count == 0 && !needs_reclaim) {
@@ -8729,11 +8732,28 @@ static int policy_enqueue_async_after_access_locked(AllocationRecord* record,
     task->address = chunk_start;
     task->allocation_seq = record->allocation_seq;
     task->source_index = index;
-    task->prefetch_count = prefetch_count;
+    size_t serialized_count = 0;
     for (size_t i = 0; i < prefetch_count; i++) {
-        task->prefetch_indices[i] = prefetch_indices[i];
-        task->prefetch_sources[i] = prefetch_sources[i];
+        AllocationRecord* target_record = prefetch_records[i] ?
+            prefetch_records[i] : record;
+        if (!target_record || prefetch_indices[i] >= target_record->chunk_count) {
+            continue;
+        }
+        uintptr_t prefetch_start = 0;
+        if (uffd_record_chunk_length_locked(target_record, prefetch_indices[i],
+                                            &prefetch_start) == 0) {
+            continue;
+        }
+        if (target_record != record) {
+            task->prefetch_addresses[serialized_count] = prefetch_start;
+            task->prefetch_allocation_seqs[serialized_count] =
+                target_record->allocation_seq;
+        }
+        task->prefetch_indices[serialized_count] = prefetch_indices[i];
+        task->prefetch_sources[serialized_count] = prefetch_sources[i];
+        serialized_count++;
     }
+    task->prefetch_count = serialized_count;
     uffd_async_task_tail =
         (uffd_async_task_tail + 1) % MAI_UFFD_ASYNC_QUEUE_CAPACITY;
     uffd_async_task_count++;
@@ -8884,9 +8904,34 @@ static void* uffd_async_policy_main(void* arg) {
         if (record && record->allocation_seq == task.allocation_seq &&
             record->backend == BACKEND_UFFD_PAGER && !record->uffd_closing &&
             task.source_index < record->chunk_count) {
+            AllocationRecord* prefetch_records[MAI_MAX_UFFD_PREFETCH_CHUNKS];
+            size_t prefetch_indices[MAI_MAX_UFFD_PREFETCH_CHUNKS];
+            MaiHybridSource prefetch_sources[MAI_MAX_UFFD_PREFETCH_CHUNKS];
+            size_t prefetch_count = 0;
+            for (size_t i = 0; i < task.prefetch_count; i++) {
+                AllocationRecord* target_record = NULL;
+                if (task.prefetch_addresses[i] != 0) {
+                    target_record = find_uffd_record_containing_locked(
+                        task.prefetch_addresses[i],
+                        task.prefetch_addresses[i] + 1);
+                    if (!target_record ||
+                        target_record->allocation_seq !=
+                            task.prefetch_allocation_seqs[i] ||
+                        target_record->backend != BACKEND_UFFD_PAGER ||
+                        target_record->uffd_closing ||
+                        task.prefetch_indices[i] >=
+                            target_record->chunk_count) {
+                        continue;
+                    }
+                }
+                prefetch_records[prefetch_count] = target_record;
+                prefetch_indices[prefetch_count] = task.prefetch_indices[i];
+                prefetch_sources[prefetch_count] = task.prefetch_sources[i];
+                prefetch_count++;
+            }
             if (policy_apply_prefetch_plan_locked(
-                    record, task.source_index, NULL, task.prefetch_indices,
-                    task.prefetch_sources, task.prefetch_count, 0) != 0) {
+                    record, task.source_index, prefetch_records,
+                    prefetch_indices, prefetch_sources, prefetch_count, 0) != 0) {
                 stats_snapshot.policy_throttle_events++;
                 stats_snapshot.policy_async_prefetch_dropped++;
             } else {

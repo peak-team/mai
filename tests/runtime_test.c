@@ -3685,7 +3685,8 @@ static int mode_uffd_pager_hybrid_cohort_policy(void) {
     return 0;
 }
 
-static int mode_uffd_pager_hybrid_cross_record_cohort_policy(void) {
+static int mode_uffd_pager_hybrid_cross_record_cohort_policy_impl(
+    int expect_async) {
     const size_t size = 32 * 1024 * 1024;
     const size_t unit = 2 * 1024 * 1024;
     const size_t units = size / unit;
@@ -3756,10 +3757,22 @@ static int mode_uffd_pager_hybrid_cross_record_cohort_policy(void) {
         free(b);
         return fail("UFFD hybrid cross-record cohort lost A trigger data");
     }
-    if (load_stats(&after_prefetch) != 0) {
-        free(a);
-        free(b);
-        return fail("mai_get_stats failed after UFFD hybrid cross-record trigger");
+    for (size_t wait = 0; wait < 200; wait++) {
+        if (load_stats(&after_prefetch) != 0) {
+            free(a);
+            free(b);
+            return fail("mai_get_stats failed after UFFD hybrid cross-record trigger");
+        }
+        size_t completed =
+            after_prefetch.policy_hybrid_cohort_completed -
+            before_trigger.policy_hybrid_cohort_completed;
+        size_t async_completed =
+            after_prefetch.policy_async_prefetch_completed -
+            before_trigger.policy_async_prefetch_completed;
+        if (completed >= 1 && (!expect_async || async_completed >= 1)) {
+            break;
+        }
+        usleep(1000);
     }
 
     size_t cohort_candidates =
@@ -3780,6 +3793,12 @@ static int mode_uffd_pager_hybrid_cross_record_cohort_policy(void) {
     size_t prefetch_completed =
         after_prefetch.policy_prefetch_completed -
         before_trigger.policy_prefetch_completed;
+    size_t async_enqueued =
+        after_prefetch.policy_async_prefetch_enqueued -
+        before_trigger.policy_async_prefetch_enqueued;
+    size_t async_completed =
+        after_prefetch.policy_async_prefetch_completed -
+        before_trigger.policy_async_prefetch_completed;
     if (cohort_candidates != 1 || cohort_admitted != 1 ||
         cohort_completed != 1 || prefetch_requests < 1 ||
         prefetch_admitted != 1 || prefetch_completed != 1) {
@@ -3792,6 +3811,14 @@ static int mode_uffd_pager_hybrid_cross_record_cohort_policy(void) {
         free(a);
         free(b);
         return fail("UFFD hybrid cross-record cohort did not prefetch target chunk");
+    }
+    if (expect_async && (async_enqueued == 0 || async_completed == 0)) {
+        fprintf(stderr,
+                "hybrid cross-record async stats: enqueued=%zu completed=%zu\n",
+                async_enqueued, async_completed);
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort did not run asynchronously");
     }
 
     expected_b[target_index]++;
@@ -3844,6 +3871,14 @@ static int mode_uffd_pager_hybrid_cross_record_cohort_policy(void) {
         return fail("UFFD hybrid cross-record cohort allocation leaked managed or resident bytes");
     }
     return 0;
+}
+
+static int mode_uffd_pager_hybrid_cross_record_cohort_policy(void) {
+    return mode_uffd_pager_hybrid_cross_record_cohort_policy_impl(0);
+}
+
+static int mode_uffd_pager_hybrid_cross_record_cohort_async_policy(void) {
+    return mode_uffd_pager_hybrid_cross_record_cohort_policy_impl(1);
 }
 
 static int mode_uffd_pager_hybrid_default_low_window(void) {
@@ -5293,6 +5328,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_hybrid_cross_record_cohort_policy") == 0) {
         return mode_uffd_pager_hybrid_cross_record_cohort_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_hybrid_cross_record_cohort_async_policy") == 0) {
+        return mode_uffd_pager_hybrid_cross_record_cohort_async_policy();
     }
     if (strcmp(argv[1], "uffd_pager_hybrid_default_low_window") == 0) {
         return mode_uffd_pager_hybrid_default_low_window();
