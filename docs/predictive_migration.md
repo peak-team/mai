@@ -170,6 +170,17 @@ baseline is excluded so its oldest-touch behavior remains stable; `random`
 does not use ordered victim classes, and CLOCK's fallback pass may bypass the
 record bias after second-chance references are cleared.
 
+`MAI_ACTIVE_RECORD_EPOCHS=N` enables a stronger active-working-set controller.
+It treats allocation records with recent demand faults as the current active
+set, raises the UFFD reclaim low watermark to active resident
+demand-confirmed chunks plus `MAI_ACTIVE_RECORD_SLACK_CHUNKS`, prefers
+inactive records as demotion victims, and rejects speculative prefetches if the
+only available victims are demand-confirmed chunks from active records. This is
+still workload-agnostic: the runtime only sees demand-fault recency, not
+benchmark group names or future access order. It defaults to zero because long
+active windows can preserve scan pollution and because raising the low
+watermark uses more DRAM headroom.
+
 Read-only usefulness of a UFFD-prefetched chunk is not directly observable
 without adding another faulting mechanism, because a successful prefetch avoids
 the later missing-page fault. `MAI_POLICY_OBSERVE_PREFETCH_WRITES=1` adds
@@ -198,6 +209,7 @@ observed lower bounds unless the row says
 | TinyLFU and frequency sketches | Use a compact approximate frequency sketch for admission. Compare candidate score against victim score to prevent pollution. | Important for hot/cold classification under mixed scans. |
 | TPP/AutoNUMA-style tiering | Maintain high/low DRAM watermarks. Proactively demote cold chunks during quiet epochs, promote on demand, and keep headroom for new hot allocations. | Core design principle for MAI pressure handling. |
 | Record-aware demotion | Treat an allocation record as a coarse working-set unit. Under pressure, avoid demoting demand-confirmed chunks from records with recent faults, but still evict unused prefetched chunks first. | Implemented as opt-in `MAI_RECORD_PROTECT_EPOCHS`; useful as a tuning control, not a default. |
+| Active-record working-set control | Infer the active allocation-record set from demand faults. Coordinate admission, eviction, and the reclaim floor so active resident demand-confirmed chunks are not displaced by speculative prefetch or an overly tight low watermark. | Implemented as opt-in `MAI_ACTIVE_RECORD_EPOCHS` plus `MAI_ACTIVE_RECORD_SLACK_CHUNKS`; designed for phase-capture experiments such as the no-oracle 9-matrix pipeline. |
 | Nomad-style shadowing | Keep valid clean storage shadows after promotion until a write invalidates them. Clean demotion can then avoid rewriting the chunk. | High-value write-amplification reduction, not yet implemented. |
 | Application hints | Treat `mai_hint_range()`, `mai_prefetch()`, and `mai_prepare_write()` as confidence and intent signals, not commands that bypass budgets. | Supported primitives; not used by no-oracle claims. |
 | Queue-aware policies | Accept future ranges with deadlines from schedulers. Admission depends on whether migration can finish before the request executes. | Integration API candidate, separate from autonomous benchmarks. |

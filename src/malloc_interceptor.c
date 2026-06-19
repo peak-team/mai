@@ -60,6 +60,10 @@
 #define MAI_DEFAULT_UFFD_ASYNC_SLACK_CHUNKS 2
 #define MAI_DEFAULT_RECORD_PROTECT_EPOCHS 0
 #define MAI_MAX_RECORD_PROTECT_EPOCHS 1024
+#define MAI_DEFAULT_ACTIVE_RECORD_EPOCHS 0
+#define MAI_MAX_ACTIVE_RECORD_EPOCHS 4096
+#define MAI_DEFAULT_ACTIVE_RECORD_SLACK_CHUNKS 8
+#define MAI_MAX_ACTIVE_RECORD_SLACK_CHUNKS 1024
 #define MAI_POLICY_STALL_HIST_BUCKETS 64
 #define MAI_POLICY_STREAM_SLOTS 4
 #define MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS 8
@@ -465,6 +469,9 @@ static size_t uffd_scratch_length = 0;
 static size_t migration_chunk_bytes = MAI_DEFAULT_MIGRATION_CHUNK_BYTES;
 static size_t uffd_prefetch_chunks = MAI_DEFAULT_UFFD_PREFETCH_CHUNKS;
 static size_t record_protect_epochs = MAI_DEFAULT_RECORD_PROTECT_EPOCHS;
+static size_t active_record_epochs = MAI_DEFAULT_ACTIVE_RECORD_EPOCHS;
+static size_t active_record_slack_chunks =
+    MAI_DEFAULT_ACTIVE_RECORD_SLACK_CHUNKS;
 static size_t spatial_region_chunks =
     MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS;
 static size_t spatial_table_slots = MAI_POLICY_SPATIAL_DEFAULT_SLOTS;
@@ -4099,6 +4106,13 @@ static int policy_chunk_is_prefetched_unused(MaiChunkPolicyMeta* meta) {
         (meta->flags & MAI_CHUNK_POLICY_DEMANDED) == 0;
 }
 
+static int policy_chunk_is_demand_confirmed(MaiChunkPolicyMeta* meta) {
+    return meta &&
+        (((meta->flags & MAI_CHUNK_POLICY_DEMANDED) != 0) ||
+         ((meta->flags & MAI_CHUNK_POLICY_PREFETCH_USED) != 0) ||
+         meta->frequency > 1);
+}
+
 static size_t policy_lfu_score_locked(MaiChunkPolicyMeta* meta) {
     if (!meta || meta->frequency == 0) {
         return 0;
@@ -4427,6 +4441,10 @@ static size_t policy_prefetch_window_locked(AllocationRecord* record,
 static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
                                             size_t* out_index,
                                             const MaiProtectedChunkSet* protected_set);
+static int policy_active_prefetch_has_safe_victim_locked(
+    AllocationRecord* source_record,
+    size_t source_index,
+    const MaiProtectedChunkSet* protected_set);
 
 static size_t policy_build_prefetch_indices_locked(AllocationRecord* record,
                                                    size_t index,
@@ -4540,7 +4558,8 @@ static size_t policy_build_prefetch_indices_locked(AllocationRecord* record,
 static int policy_admit_prefetch_locked(AllocationRecord* record,
                                         size_t source_index,
                                         size_t index,
-                                        size_t length) {
+                                        size_t length,
+                                        const MaiProtectedChunkSet* protected_set) {
     if (!record || index >= record->chunk_count) {
         return 0;
     }
@@ -4548,7 +4567,13 @@ static int policy_admit_prefetch_locked(AllocationRecord* record,
     stats_snapshot.policy_admission_requests++;
 
     int admit = 1;
-    if (migration_policy == MIGRATION_POLICY_2Q &&
+    if (active_record_epochs != 0 &&
+        uffd_resident_limit_bytes != 0 &&
+        uffd_resident_bytes + length > uffd_resident_limit_bytes &&
+        !policy_active_prefetch_has_safe_victim_locked(record, source_index,
+                                                       protected_set)) {
+        admit = 0;
+    } else if (migration_policy == MIGRATION_POLICY_2Q &&
         uffd_resident_limit_bytes != 0 &&
         uffd_resident_bytes + length > uffd_resident_limit_bytes) {
         admit = 0;
@@ -4839,6 +4864,56 @@ static int policy_record_recently_demanded_locked(AllocationRecord* record) {
     return current - last <= record_protect_epochs;
 }
 
+static int policy_record_active_locked(AllocationRecord* record) {
+    if (!record || active_record_epochs == 0 ||
+        record->policy_record_last_demand_epoch == 0) {
+        return 0;
+    }
+    size_t current = uffd_touch_epoch + 1;
+    size_t last = record->policy_record_last_demand_epoch;
+    if (last >= current) {
+        return 1;
+    }
+    return current - last <= active_record_epochs;
+}
+
+static int policy_active_prefetch_has_safe_victim_locked(
+    AllocationRecord* source_record,
+    size_t source_index,
+    const MaiProtectedChunkSet* protected_set) {
+    if (active_record_epochs == 0) {
+        return 1;
+    }
+
+    for (AllocationRecord* record = uffd_head; record; record = record->uffd_next) {
+        if (record->backend != BACKEND_UFFD_PAGER || record->uffd_closing ||
+            !record->chunk_states || !record->uffd_registered) {
+            continue;
+        }
+        int record_active = policy_record_active_locked(record);
+        for (size_t i = 0; i < record->chunk_count; i++) {
+            if (record == source_record && i == source_index) {
+                continue;
+            }
+            if (policy_chunk_is_protected(record, i, protected_set)) {
+                continue;
+            }
+            if (record->chunk_states[i] != CHUNK_ANON_HOT) {
+                continue;
+            }
+            MaiChunkPolicyMeta* meta = record->chunk_policy_meta ?
+                &record->chunk_policy_meta[i] : NULL;
+            if (policy_chunk_is_prefetched_unused(meta) ||
+                !record_active ||
+                !policy_chunk_is_demand_confirmed(meta)) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
                                             size_t* out_index,
                                             const MaiProtectedChunkSet* protected_set) {
@@ -4897,8 +4972,14 @@ static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
                        policy_chunk_is_prefetched_unused(meta)) {
                 candidate_class = 0;
             }
-            if (candidate_class > 0 &&
-                policy_record_recently_demanded_locked(record)) {
+            if (policy_record_active_locked(record) &&
+                policy_chunk_is_demand_confirmed(meta)) {
+                candidate_class += 2;
+            } else if (candidate_class > 0 &&
+                       policy_record_active_locked(record)) {
+                candidate_class++;
+            } else if (candidate_class > 0 &&
+                       policy_record_recently_demanded_locked(record)) {
                 candidate_class++;
             }
             if (migration_policy == MIGRATION_POLICY_FIFO && meta &&
@@ -5153,6 +5234,71 @@ static size_t policy_effective_resident_target_locked(int runtime_lock_held) {
     return target;
 }
 
+static size_t policy_active_record_slack_bytes_locked(void) {
+    if (active_record_epochs == 0 || active_record_slack_chunks == 0) {
+        return 0;
+    }
+    size_t chunk = migration_chunk_bytes == 0 ? page_size : migration_chunk_bytes;
+    if (active_record_slack_chunks > SIZE_MAX / chunk) {
+        return SIZE_MAX;
+    }
+    return active_record_slack_chunks * chunk;
+}
+
+static size_t policy_active_record_target_locked(size_t target) {
+    if (active_record_epochs == 0 || target == 0) {
+        return 0;
+    }
+
+    size_t active_bytes = 0;
+    for (AllocationRecord* record = uffd_head; record; record = record->uffd_next) {
+        if (record->backend != BACKEND_UFFD_PAGER || record->uffd_closing ||
+            !record->uffd_registered || !record->chunk_states ||
+            !policy_record_active_locked(record)) {
+            continue;
+        }
+        for (size_t i = 0; i < record->chunk_count; i++) {
+            if (record->chunk_states[i] != CHUNK_ANON_HOT) {
+                continue;
+            }
+            MaiChunkPolicyMeta* meta = record->chunk_policy_meta ?
+                &record->chunk_policy_meta[i] : NULL;
+            if (!policy_chunk_is_demand_confirmed(meta)) {
+                continue;
+            }
+            uintptr_t chunk_start = 0;
+            size_t length =
+                uffd_record_chunk_length_locked(record, i, &chunk_start);
+            if (length == 0) {
+                continue;
+            }
+            if (target != SIZE_MAX && active_bytes >= target) {
+                return target;
+            }
+            size_t remaining =
+                target == SIZE_MAX ? SIZE_MAX : target - active_bytes;
+            if (length > remaining) {
+                active_bytes = target;
+                break;
+            }
+            active_bytes += length;
+        }
+    }
+
+    size_t slack = policy_active_record_slack_bytes_locked();
+    if (target != SIZE_MAX && active_bytes >= target) {
+        return target;
+    }
+    if (slack == SIZE_MAX ||
+        (target == SIZE_MAX && active_bytes > SIZE_MAX - slack)) {
+        return target;
+    }
+    if (target != SIZE_MAX && slack > target - active_bytes) {
+        return target;
+    }
+    return active_bytes + slack;
+}
+
 static size_t policy_resident_low_target_locked(size_t target) {
     size_t low_target = uffd_resident_low_limit_bytes;
     if (low_target == 0) {
@@ -5160,6 +5306,10 @@ static size_t policy_resident_low_target_locked(size_t target) {
     }
     if (low_target > target) {
         low_target = target;
+    }
+    size_t active_target = policy_active_record_target_locked(target);
+    if (active_target > low_target) {
+        low_target = active_target;
     }
     return low_target;
 }
@@ -5214,7 +5364,7 @@ static int policy_apply_prefetch_plan_locked(AllocationRecord* record,
                                             &prefetch_start);
         if (prefetch_length == 0 ||
             !policy_admit_prefetch_locked(record, index, prefetch_index,
-                                          prefetch_length)) {
+                                          prefetch_length, &protected_set)) {
             continue;
         }
         if (populate_uffd_chunk_locked(record, prefetch_index, 0, NULL) != 0) {
@@ -7456,6 +7606,10 @@ static int configure_runtime(void) {
         getenv("MAI_UFFD_ASYNC_SLACK_CHUNKS");
     const char* record_protect =
         getenv("MAI_RECORD_PROTECT_EPOCHS");
+    const char* active_record =
+        getenv("MAI_ACTIVE_RECORD_EPOCHS");
+    const char* active_record_slack =
+        getenv("MAI_ACTIVE_RECORD_SLACK_CHUNKS");
     const char* migration_chunk = getenv("MAI_MIGRATION_CHUNK");
     const char* spatial_region =
         getenv("MAI_SPATIAL_REGION_CHUNKS");
@@ -7516,6 +7670,8 @@ static int configure_runtime(void) {
     uffd_touch_epoch = 0;
     uffd_head = NULL;
     record_protect_epochs = MAI_DEFAULT_RECORD_PROTECT_EPOCHS;
+    active_record_epochs = MAI_DEFAULT_ACTIVE_RECORD_EPOCHS;
+    active_record_slack_chunks = MAI_DEFAULT_ACTIVE_RECORD_SLACK_CHUNKS;
 
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     if (page_size == 0) {
@@ -7703,6 +7859,17 @@ static int configure_runtime(void) {
         runtime_config_error = 1;
         return -1;
     }
+    if (active_record &&
+        parse_count_env(active_record, &active_record_epochs) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (active_record_slack &&
+        parse_count_env(active_record_slack,
+                        &active_record_slack_chunks) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
     if (migration_chunk && parse_size_env(migration_chunk, &migration_chunk_bytes) != 0) {
         runtime_config_error = 1;
         return -1;
@@ -7833,6 +8000,12 @@ static int configure_runtime(void) {
     }
     if (record_protect_epochs > MAI_MAX_RECORD_PROTECT_EPOCHS) {
         record_protect_epochs = MAI_MAX_RECORD_PROTECT_EPOCHS;
+    }
+    if (active_record_epochs > MAI_MAX_ACTIVE_RECORD_EPOCHS) {
+        active_record_epochs = MAI_MAX_ACTIVE_RECORD_EPOCHS;
+    }
+    if (active_record_slack_chunks > MAI_MAX_ACTIVE_RECORD_SLACK_CHUNKS) {
+        active_record_slack_chunks = MAI_MAX_ACTIVE_RECORD_SLACK_CHUNKS;
     }
     if (uffd_pager_mode != UFFD_PAGER_OFF && !uffd_resident_limit_explicit) {
         size_t cap = 0;

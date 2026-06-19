@@ -170,6 +170,29 @@ from 6700 MiB/s at protect 0 to 7328 MiB/s at protect 8, then regressed to
 6314 MiB/s at protect 32. The two knobs can compose, but the useful range is
 narrow.
 
+### Active-Record Working-Set Probe
+
+`MAI_ACTIVE_RECORD_EPOCHS` coordinates admission, eviction, and the UFFD
+reclaim floor around allocation records that recently had demand faults. These
+rows use the same no-oracle 9-matrix pressure shape as above, async prefetch
+disabled, `MAI_MAX_RSS=128M`, and a valid `MAI_RECLAIM_POLICY=donthneed`.
+The first benchmark attempt used the invalid spelling `dontneed`; those rows
+were discarded because MAI reported zero managed allocations and zero migration.
+
+| Policy | Active epochs | Slack chunks | End-to-end MiB/s | E2E SD | Kernel MiB/s | Demand faults | Read MiB | Write MiB | Stall ms | Stall p99 ns | Unused evictions | Hot-evicted MiB | Admission rejects |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `legacy` | 0 | 0 | 6040 | 734 | 12479 | 54 | 288 | 384 | 166 | 8388608 | 144 | 96 | 0 |
+| `legacy` | 8 | 4 | 6295 | 232 | 13017 | 54 | 288 | 384 | 161 | 9786709 | 144 | 96 | 0 |
+| `markov` | 0 | 0 | 5672 | 301 | 11185 | 201 | 310 | 396 | 153 | 4194304 | 26 | 344 | 6 |
+| `markov` | 32 | 4 | 6161 | 306 | 12748 | 216 | 288 | 368 | 140 | 1048576 | 0 | 368 | 63 |
+
+This is a useful opt-in control, not a default. It improves the corrected local
+six-run `legacy` and `markov` rows, but still reaches only about 17-18% of the
+matching MAI-managed sufficient-memory end-to-end baseline. For `markov`, the
+controller trades unused-prefetch evictions for more demand-confirmed hot
+evictions while reducing migration bytes and tail stall; that tradeoff needs
+broader seed and pressure sweeps before it can be promoted.
+
 ## Interpretation
 
 - Sufficient-memory MAI does not trigger migration in these runs; faster
@@ -208,6 +231,12 @@ narrow.
   shape, but it regresses `markov` in the 64 MiB low-watermark shape and has no
   stable dose response. The `legacy` baseline is deliberately excluded from the
   record bias.
+- Active-record working-set control is stronger than record protection because
+  it also shapes admission and the reclaim floor. In this local slice it helps
+  the best tested `legacy` and `markov` rows, but the absolute gap to
+  sufficient-memory STREAM remains large, so the next work should target
+  reduced write/read amplification and phase-transition stalls rather than
+  adding another standalone predictor.
 - A clean-shadow write-amplification experiment was attempted but rejected:
   retaining storage shadows and using UFFD write-protect to avoid clean
   write-back corrupted the successor-policy correctness workload. Any future

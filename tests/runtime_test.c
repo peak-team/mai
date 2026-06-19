@@ -2128,6 +2128,171 @@ static int mode_uffd_pager_record_protect_policy(void) {
     return 0;
 }
 
+static int mode_uffd_pager_active_record_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t records = 3;
+    const size_t record_size = 4 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t resident_limit = 8 * 1024 * 1024;
+    const size_t configured_low = 2 * 1024 * 1024;
+    unsigned char* ptrs[3] = {0};
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD active record test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for active record test");
+    }
+
+    for (size_t r = 0; r < records; r++) {
+        ptrs[r] = malloc(record_size);
+        if (!ptrs[r]) {
+            for (size_t i = 0; i < r; i++) {
+                free(ptrs[i]);
+            }
+            return fail("UFFD active record allocation failed");
+        }
+    }
+
+    for (size_t r = 0; r < records; r++) {
+        ptrs[r][0] = (unsigned char)(0x60 + r);
+        ptrs[r][unit] = (unsigned char)(0x70 + r);
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        for (size_t r = 0; r < records; r++) {
+            free(ptrs[r]);
+        }
+        return fail("mai_get_stats failed after UFFD active record touches");
+    }
+    if (after_touch.uffd_evictions <= before.uffd_evictions) {
+        for (size_t r = 0; r < records; r++) {
+            free(ptrs[r]);
+        }
+        return fail("UFFD active record test did not exercise pressure eviction");
+    }
+    if (after_touch.uffd_resident_bytes > resident_limit) {
+        fprintf(stderr,
+                "active record resident above limit: resident=%zu limit=%zu\n",
+                after_touch.uffd_resident_bytes, resident_limit);
+        for (size_t r = 0; r < records; r++) {
+            free(ptrs[r]);
+        }
+        return fail("UFFD active record controller exceeded resident limit");
+    }
+    if (after_touch.uffd_resident_bytes <= configured_low + unit) {
+        fprintf(stderr,
+                "active record resident too low: resident=%zu low=%zu unit=%zu\n",
+                after_touch.uffd_resident_bytes, configured_low, unit);
+        for (size_t r = 0; r < records; r++) {
+            free(ptrs[r]);
+        }
+        return fail("UFFD active record controller reclaimed to configured low watermark");
+    }
+
+    for (size_t r = 0; r < records; r++) {
+        if (ptrs[r][0] != (unsigned char)(0x60 + r) ||
+            ptrs[r][unit] != (unsigned char)(0x70 + r)) {
+            for (size_t i = 0; i < records; i++) {
+                free(ptrs[i]);
+            }
+            return fail("UFFD active record controller lost data");
+        }
+    }
+
+    for (size_t r = 0; r < records; r++) {
+        free(ptrs[r]);
+    }
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD active record free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD active record allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_active_record_prefetch_guard(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 16 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t chunks = size / unit;
+    unsigned char expected[8] = {0};
+
+    if (chunks > sizeof(expected)) {
+        return fail("active prefetch guard expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before active prefetch guard test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for active prefetch guard test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("active prefetch guard allocation failed");
+    }
+
+    for (size_t i = 0; i < chunks; i++) {
+        expected[i] = (unsigned char)(0x80 + i);
+        ptr[i * unit] = expected[i];
+    }
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after active prefetch guard touches");
+    }
+
+    size_t rejected =
+        after_touch.policy_admission_rejected -
+        before.policy_admission_rejected;
+    size_t completed =
+        after_touch.policy_prefetch_completed -
+        before.policy_prefetch_completed;
+    if (after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("active prefetch guard did not exercise pressure eviction");
+    }
+    if (rejected == 0) {
+        free(ptr);
+        return fail("active prefetch guard did not reject speculative prefetches");
+    }
+    if (completed > chunks) {
+        fprintf(stderr,
+                "active prefetch guard completed too much prefetch: completed=%zu chunks=%zu\n",
+                completed, chunks);
+        free(ptr);
+        return fail("active prefetch guard over-admitted protected prefetches");
+    }
+    for (size_t i = 0; i < chunks; i++) {
+        if (ptr[i * unit] != expected[i]) {
+            free(ptr);
+            return fail("active prefetch guard lost data");
+        }
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after active prefetch guard free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("active prefetch guard allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
 static int mode_uffd_pager_stride_policy(void) {
     MaiStats before;
     MaiStats after_touch;
@@ -3719,6 +3884,12 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_record_protect_policy") == 0) {
         return mode_uffd_pager_record_protect_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_active_record_policy") == 0) {
+        return mode_uffd_pager_active_record_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_active_record_prefetch_guard") == 0) {
+        return mode_uffd_pager_active_record_prefetch_guard();
     }
     if (strcmp(argv[1], "uffd_pager_stride_policy") == 0) {
         return mode_uffd_pager_stride_policy();
