@@ -3352,6 +3352,15 @@ int main(int argc, char** argv) {
         after.policy_throttle_events - before.policy_throttle_events : 0;
     size_t policy_throttle_slept_ns = after_stats_available ?
         after.policy_throttle_slept_ns - before.policy_throttle_slept_ns : 0;
+    size_t policy_async_prefetch_enqueued = after_stats_available ?
+        after.policy_async_prefetch_enqueued -
+        before.policy_async_prefetch_enqueued : 0;
+    size_t policy_async_prefetch_completed = after_stats_available ?
+        after.policy_async_prefetch_completed -
+        before.policy_async_prefetch_completed : 0;
+    size_t policy_async_prefetch_dropped = after_stats_available ?
+        after.policy_async_prefetch_dropped -
+        before.policy_async_prefetch_dropped : 0;
     const char* policy_prefetch_observation =
         after_stats_available && after.policy_prefetch_observation != 0 ?
         "write_protect" : "unobserved";
@@ -3415,7 +3424,11 @@ int main(int argc, char** argv) {
            "policy_demand_fault_stall_p99_ns=%zu "
            "policy_demand_fault_stall_max_ns=%zu "
            "policy_throttle_events=%zu "
-           "policy_throttle_slept_ns=%zu max_rss=%zu "
+           "policy_throttle_slept_ns=%zu "
+           "policy_async_prefetch_enqueued=%zu "
+           "policy_async_prefetch_completed=%zu "
+           "policy_async_prefetch_dropped=%zu "
+           "max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
            "heartbeat_calls=%zu heartbeat_busy_ticks=%zu "
@@ -3499,6 +3512,9 @@ int main(int argc, char** argv) {
            after.policy_demand_fault_stall_p99_ns,
            after.policy_demand_fault_stall_max_ns,
            policy_throttle_events, policy_throttle_slept_ns,
+           policy_async_prefetch_enqueued,
+           policy_async_prefetch_completed,
+           policy_async_prefetch_dropped,
            after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,

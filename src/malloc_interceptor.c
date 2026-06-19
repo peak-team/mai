@@ -56,6 +56,8 @@
 #define MAI_DEFAULT_MIGRATION_CHUNK_BYTES (2ULL * 1024ULL * 1024ULL)
 #define MAI_DEFAULT_UFFD_PREFETCH_CHUNKS 4
 #define MAI_MAX_UFFD_PREFETCH_CHUNKS 16
+#define MAI_UFFD_ASYNC_QUEUE_CAPACITY 256
+#define MAI_DEFAULT_UFFD_ASYNC_SLACK_CHUNKS 2
 #define MAI_POLICY_STALL_HIST_BUCKETS 64
 #define MAI_POLICY_STREAM_SLOTS 4
 #define MAI_POLICY_SPATIAL_DEFAULT_REGION_CHUNKS 8
@@ -322,6 +324,14 @@ typedef struct {
 } MaiProtectedChunkSet;
 
 typedef struct {
+    uintptr_t address;
+    size_t allocation_seq;
+    size_t source_index;
+    size_t prefetch_count;
+    size_t prefetch_indices[MAI_MAX_UFFD_PREFETCH_CHUNKS];
+} MaiAsyncPolicyTask;
+
+typedef struct {
     size_t length;
 } MetaHeader;
 
@@ -427,6 +437,18 @@ static int uffd_fd = -1;
 static pthread_t uffd_thread;
 static int uffd_thread_started = 0;
 static atomic_int uffd_thread_stop;
+static pthread_t uffd_async_thread;
+static atomic_int uffd_async_thread_started;
+static atomic_int uffd_async_thread_stop;
+static pthread_cond_t uffd_async_cond = PTHREAD_COND_INITIALIZER;
+static int uffd_async_prefetch_enabled = 0;
+static size_t uffd_async_slack_chunks =
+    MAI_DEFAULT_UFFD_ASYNC_SLACK_CHUNKS;
+static MaiAsyncPolicyTask
+    uffd_async_tasks[MAI_UFFD_ASYNC_QUEUE_CAPACITY];
+static size_t uffd_async_task_head = 0;
+static size_t uffd_async_task_tail = 0;
+static size_t uffd_async_task_count = 0;
 static size_t uffd_resident_limit_bytes = 0;
 static size_t uffd_resident_low_limit_bytes = 0;
 static int uffd_resident_limit_explicit = 0;
@@ -5091,11 +5113,36 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
     return 0;
 }
 
-static int policy_prefetch_and_reclaim_after_access_locked(AllocationRecord* record,
-                                                           size_t index,
-                                                           int runtime_lock_held) {
-    MaiProtectedChunkSet protected_set = {0};
-    policy_protect_chunk_index(&protected_set, record, index);
+static size_t policy_effective_resident_target_locked(int runtime_lock_held) {
+    size_t target = uffd_resident_limit_bytes;
+    if (target == 0 && runtime_lock_held) {
+        size_t cap = effective_max_rss_locked(stats_snapshot.current_rss_bytes);
+        target = cap == 0 ? SIZE_MAX :
+            percent_of_size(cap, MAI_AUTO_ANON_LIMIT_PERCENT);
+    } else if (target == 0) {
+        target = SIZE_MAX;
+    }
+    return target;
+}
+
+static size_t policy_resident_low_target_locked(size_t target) {
+    size_t low_target = uffd_resident_low_limit_bytes;
+    if (low_target == 0) {
+        low_target = target;
+    }
+    if (low_target > target) {
+        low_target = target;
+    }
+    return low_target;
+}
+
+static size_t policy_build_access_prefetch_plan_locked(AllocationRecord* record,
+                                                       size_t index,
+                                                       size_t* prefetch_indices,
+                                                       size_t prefetch_cap) {
+    if (!record || !prefetch_indices || prefetch_cap == 0) {
+        return 0;
+    }
     size_t prefetch_window = policy_prefetch_window_locked(record, index);
     if (record->chunk_bytes != 0 && uffd_resident_limit_bytes != 0) {
         size_t cap_window = (uffd_resident_limit_bytes / 2) / record->chunk_bytes;
@@ -5106,13 +5153,29 @@ static int policy_prefetch_and_reclaim_after_access_locked(AllocationRecord* rec
             prefetch_window = cap_window;
         }
     }
-    size_t prefetch_indices[MAI_MAX_UFFD_PREFETCH_CHUNKS];
-    size_t prefetch_count =
-        policy_build_prefetch_indices_locked(record, index, prefetch_window,
-                                             prefetch_indices,
-                                             MAI_MAX_UFFD_PREFETCH_CHUNKS);
+    return policy_build_prefetch_indices_locked(record, index, prefetch_window,
+                                                prefetch_indices,
+                                                prefetch_cap);
+}
+
+static int policy_apply_prefetch_plan_locked(AllocationRecord* record,
+                                             size_t index,
+                                             const size_t* prefetch_indices,
+                                             size_t prefetch_count,
+                                             int runtime_lock_held) {
+    if (!record || record->backend != BACKEND_UFFD_PAGER ||
+        record->uffd_closing || !record->chunk_states ||
+        index >= record->chunk_count) {
+        return 0;
+    }
+
+    MaiProtectedChunkSet protected_set = {0};
+    policy_protect_chunk_index(&protected_set, record, index);
     for (size_t candidate = 0; candidate < prefetch_count; candidate++) {
         size_t prefetch_index = prefetch_indices[candidate];
+        if (prefetch_index >= record->chunk_count) {
+            continue;
+        }
         if (record->chunk_states[prefetch_index] == CHUNK_ANON_HOT) {
             policy_protect_chunk_index(&protected_set, record, prefetch_index);
             continue;
@@ -5133,28 +5196,120 @@ static int policy_prefetch_and_reclaim_after_access_locked(AllocationRecord* rec
     }
 
     int explicit_resident_limit = uffd_resident_limit_bytes != 0;
-    size_t target = uffd_resident_limit_bytes;
-    if (target == 0 && runtime_lock_held) {
-        size_t cap = effective_max_rss_locked(stats_snapshot.current_rss_bytes);
-        target = cap == 0 ? SIZE_MAX : percent_of_size(cap, MAI_AUTO_ANON_LIMIT_PERCENT);
-    } else if (target == 0) {
-        target = SIZE_MAX;
-    }
+    size_t target = policy_effective_resident_target_locked(runtime_lock_held);
     if ((explicit_resident_limit || runtime_lock_held) &&
         target != SIZE_MAX && uffd_resident_bytes > target) {
-        size_t low_target = uffd_resident_low_limit_bytes;
-        if (low_target == 0) {
-            low_target = target;
-        }
-        if (low_target > target) {
-            low_target = target;
-        }
+        size_t low_target = policy_resident_low_target_locked(target);
         if (evict_uffd_chunks_locked(low_target, &protected_set,
                                      runtime_lock_held) != 0) {
             return -1;
         }
     }
     return 0;
+}
+
+static int policy_prefetch_and_reclaim_after_access_locked(AllocationRecord* record,
+                                                           size_t index,
+                                                           int runtime_lock_held) {
+    size_t prefetch_indices[MAI_MAX_UFFD_PREFETCH_CHUNKS];
+    size_t prefetch_count =
+        policy_build_access_prefetch_plan_locked(record, index,
+                                                 prefetch_indices,
+                                                 MAI_MAX_UFFD_PREFETCH_CHUNKS);
+    return policy_apply_prefetch_plan_locked(record, index, prefetch_indices,
+                                             prefetch_count,
+                                             runtime_lock_held);
+}
+
+static size_t policy_async_slack_bytes_locked(AllocationRecord* record) {
+    if (uffd_async_slack_chunks == 0) {
+        return 0;
+    }
+    size_t chunk = record && record->chunk_bytes != 0 ?
+        record->chunk_bytes : migration_chunk_bytes;
+    if (chunk == 0) {
+        chunk = page_size;
+    }
+    if (uffd_async_slack_chunks > SIZE_MAX / chunk) {
+        return SIZE_MAX;
+    }
+    return uffd_async_slack_chunks * chunk;
+}
+
+static int policy_hard_reclaim_after_async_enqueue_locked(
+    AllocationRecord* record,
+    size_t index,
+    int runtime_lock_held) {
+    int explicit_resident_limit = uffd_resident_limit_bytes != 0;
+    size_t target = policy_effective_resident_target_locked(runtime_lock_held);
+    if ((!explicit_resident_limit && !runtime_lock_held) || target == SIZE_MAX) {
+        return 0;
+    }
+    size_t slack = policy_async_slack_bytes_locked(record);
+    size_t hard_target = target;
+    if (slack != SIZE_MAX && hard_target <= SIZE_MAX - slack) {
+        hard_target += slack;
+    } else {
+        hard_target = SIZE_MAX;
+    }
+    if (uffd_resident_bytes <= hard_target) {
+        return 0;
+    }
+
+    MaiProtectedChunkSet protected_set = {0};
+    policy_protect_chunk_index(&protected_set, record, index);
+    stats_snapshot.policy_throttle_events++;
+    return evict_uffd_chunks_locked(target, &protected_set,
+                                    runtime_lock_held);
+}
+
+static int policy_enqueue_async_after_access_locked(AllocationRecord* record,
+                                                    size_t index,
+                                                    int runtime_lock_held) {
+    if (!uffd_async_prefetch_enabled ||
+        atomic_load_explicit(&uffd_async_thread_started,
+                             memory_order_acquire) == 0 ||
+        !record || record->backend != BACKEND_UFFD_PAGER ||
+        record->uffd_closing || index >= record->chunk_count) {
+        return 0;
+    }
+
+    size_t prefetch_indices[MAI_MAX_UFFD_PREFETCH_CHUNKS];
+    size_t prefetch_count =
+        policy_build_access_prefetch_plan_locked(record, index,
+                                                 prefetch_indices,
+                                                 MAI_MAX_UFFD_PREFETCH_CHUNKS);
+    size_t target = policy_effective_resident_target_locked(runtime_lock_held);
+    int needs_reclaim = target != SIZE_MAX && uffd_resident_bytes > target;
+    if (prefetch_count == 0 && !needs_reclaim) {
+        return 1;
+    }
+    if (uffd_async_task_count >= MAI_UFFD_ASYNC_QUEUE_CAPACITY) {
+        stats_snapshot.policy_throttle_events++;
+        stats_snapshot.policy_async_prefetch_dropped++;
+        return 0;
+    }
+
+    uintptr_t chunk_start = 0;
+    if (uffd_record_chunk_length_locked(record, index, &chunk_start) == 0) {
+        return 0;
+    }
+
+    MaiAsyncPolicyTask* task = &uffd_async_tasks[uffd_async_task_tail];
+    memset(task, 0, sizeof(*task));
+    task->address = chunk_start;
+    task->allocation_seq = record->allocation_seq;
+    task->source_index = index;
+    task->prefetch_count = prefetch_count;
+    for (size_t i = 0; i < prefetch_count; i++) {
+        task->prefetch_indices[i] = prefetch_indices[i];
+    }
+    uffd_async_task_tail =
+        (uffd_async_task_tail + 1) % MAI_UFFD_ASYNC_QUEUE_CAPACITY;
+    uffd_async_task_count++;
+    stats_snapshot.policy_async_prefetch_enqueued++;
+    pthread_cond_signal(&uffd_async_cond);
+    return 1;
 }
 
 static int resolve_uffd_fault_locked(uintptr_t fault_address,
@@ -5198,12 +5353,22 @@ static int resolve_uffd_fault_locked(uintptr_t fault_address,
         policy_note_resident_demand_locked(record, index, length);
         record->chunk_touch_epochs[index] = ++uffd_touch_epoch;
         stats_snapshot.uffd_faults++;
+        if (policy_enqueue_async_after_access_locked(record, index,
+                                                     runtime_lock_held)) {
+            return policy_hard_reclaim_after_async_enqueue_locked(
+                record, index, runtime_lock_held);
+        }
         return policy_prefetch_and_reclaim_after_access_locked(
             record, index, runtime_lock_held);
     }
     policy_note_demand_fault_locked(record, index);
     if (populate_uffd_chunk_locked(record, index, 1, NULL) != 0) {
         return -1;
+    }
+    if (policy_enqueue_async_after_access_locked(record, index,
+                                                 runtime_lock_held)) {
+        return policy_hard_reclaim_after_async_enqueue_locked(
+            record, index, runtime_lock_held);
     }
     return policy_prefetch_and_reclaim_after_access_locked(
         record, index, runtime_lock_held);
@@ -5212,11 +5377,150 @@ static int resolve_uffd_fault_locked(uintptr_t fault_address,
 static void fail_uffd_pager_locked(void) {
     stats_snapshot.uffd_fallbacks++;
     atomic_store_explicit(&uffd_thread_stop, 1, memory_order_release);
+    atomic_store_explicit(&uffd_async_thread_stop, 1, memory_order_release);
+    pthread_cond_broadcast(&uffd_async_cond);
     if (uffd_fd >= 0) {
         int fd = uffd_fd;
         uffd_fd = -1;
         close(fd);
     }
+}
+
+static void reset_uffd_async_queue_locked(void) {
+    uffd_async_task_head = 0;
+    uffd_async_task_tail = 0;
+    uffd_async_task_count = 0;
+}
+
+static int uffd_async_fault_pending(void);
+static void uffd_async_requeue_task_locked(const MaiAsyncPolicyTask* task);
+
+static void* uffd_async_policy_main(void* arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&uffd_fault_lock);
+        while (uffd_async_task_count == 0 &&
+               atomic_load_explicit(&uffd_async_thread_stop,
+                                    memory_order_acquire) == 0) {
+            pthread_cond_wait(&uffd_async_cond, &uffd_fault_lock);
+        }
+        if (atomic_load_explicit(&uffd_async_thread_stop,
+                                 memory_order_acquire) != 0) {
+            pthread_mutex_unlock(&uffd_fault_lock);
+            return NULL;
+        }
+
+        MaiAsyncPolicyTask task = uffd_async_tasks[uffd_async_task_head];
+        uffd_async_task_head =
+            (uffd_async_task_head + 1) % MAI_UFFD_ASYNC_QUEUE_CAPACITY;
+        uffd_async_task_count--;
+        pthread_mutex_unlock(&uffd_fault_lock);
+
+        if (uffd_async_fault_pending()) {
+            pthread_mutex_lock(&uffd_fault_lock);
+            if (atomic_load_explicit(&uffd_async_thread_stop,
+                                     memory_order_acquire) == 0) {
+                uffd_async_requeue_task_locked(&task);
+            }
+            pthread_mutex_unlock(&uffd_fault_lock);
+            sched_yield();
+            continue;
+        }
+
+        pthread_mutex_lock(&uffd_fault_lock);
+        AllocationRecord* record =
+            find_uffd_record_containing_locked(task.address, task.address + 1);
+        if (record && record->allocation_seq == task.allocation_seq &&
+            record->backend == BACKEND_UFFD_PAGER && !record->uffd_closing &&
+            task.source_index < record->chunk_count) {
+            if (policy_apply_prefetch_plan_locked(
+                    record, task.source_index, task.prefetch_indices,
+                    task.prefetch_count, 0) != 0) {
+                stats_snapshot.policy_throttle_events++;
+                stats_snapshot.policy_async_prefetch_dropped++;
+            } else {
+                stats_snapshot.policy_async_prefetch_completed++;
+            }
+        } else {
+            stats_snapshot.policy_async_prefetch_dropped++;
+        }
+        pthread_mutex_unlock(&uffd_fault_lock);
+    }
+}
+
+static int uffd_async_fault_pending(void) {
+    if (uffd_fd < 0) {
+        return 1;
+    }
+    struct pollfd pfd;
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = uffd_fd;
+    pfd.events = POLLIN;
+    int rc = poll(&pfd, 1, 0);
+    return rc > 0 && (pfd.revents & POLLIN);
+}
+
+static void uffd_async_requeue_task_locked(const MaiAsyncPolicyTask* task) {
+    if (!task) {
+        return;
+    }
+    if (uffd_async_task_count >= MAI_UFFD_ASYNC_QUEUE_CAPACITY) {
+        stats_snapshot.policy_throttle_events++;
+        stats_snapshot.policy_async_prefetch_dropped++;
+        return;
+    }
+    uffd_async_tasks[uffd_async_task_tail] = *task;
+    uffd_async_task_tail =
+        (uffd_async_task_tail + 1) % MAI_UFFD_ASYNC_QUEUE_CAPACITY;
+    uffd_async_task_count++;
+}
+
+static int start_uffd_async_worker(void) {
+    if (!uffd_async_prefetch_enabled ||
+        atomic_load_explicit(&uffd_async_thread_started,
+                             memory_order_acquire) != 0) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&uffd_fault_lock);
+    reset_uffd_async_queue_locked();
+    atomic_store_explicit(&uffd_async_thread_stop, 0, memory_order_release);
+    pthread_mutex_unlock(&uffd_fault_lock);
+
+    if (pthread_create(&uffd_async_thread, NULL,
+                       uffd_async_policy_main, NULL) != 0) {
+        pthread_mutex_lock(&uffd_fault_lock);
+        stats_snapshot.policy_throttle_events++;
+        uffd_async_prefetch_enabled = 0;
+        reset_uffd_async_queue_locked();
+        pthread_mutex_unlock(&uffd_fault_lock);
+        return -1;
+    }
+    atomic_store_explicit(&uffd_async_thread_started, 1,
+                          memory_order_release);
+    return 0;
+}
+
+static void stop_uffd_async_worker(void) {
+    if (atomic_load_explicit(&uffd_async_thread_started,
+                             memory_order_acquire) == 0) {
+        pthread_mutex_lock(&uffd_fault_lock);
+        reset_uffd_async_queue_locked();
+        pthread_mutex_unlock(&uffd_fault_lock);
+        return;
+    }
+
+    atomic_store_explicit(&uffd_async_thread_stop, 1, memory_order_release);
+    pthread_mutex_lock(&uffd_fault_lock);
+    pthread_cond_broadcast(&uffd_async_cond);
+    pthread_mutex_unlock(&uffd_fault_lock);
+    (void)pthread_join(uffd_async_thread, NULL);
+    atomic_store_explicit(&uffd_async_thread_started, 0,
+                          memory_order_release);
+
+    pthread_mutex_lock(&uffd_fault_lock);
+    reset_uffd_async_queue_locked();
+    pthread_mutex_unlock(&uffd_fault_lock);
 }
 
 static void* uffd_pager_main(void* arg) {
@@ -5256,8 +5560,8 @@ static void* uffd_pager_main(void* arg) {
                 continue;
             }
             int runtime_lock_held = 0;
-            pthread_mutex_lock(&uffd_fault_lock);
             uint64_t fault_start_ns = monotonic_time_ns_signal_safe();
+            pthread_mutex_lock(&uffd_fault_lock);
             int rc = resolve_uffd_fault_locked(
                 (uintptr_t)msg.arg.pagefault.address,
                 msg.arg.pagefault.flags,
@@ -5326,11 +5630,15 @@ static int ensure_uffd_pager_started_locked(void) {
         return -1;
     }
     uffd_thread_started = 1;
+    if (start_uffd_async_worker() != 0) {
+        uffd_async_prefetch_enabled = 0;
+    }
     return 0;
 }
 
 static void stop_uffd_pager(void) {
     if (!uffd_thread_started) {
+        stop_uffd_async_worker();
         if (uffd_fd >= 0) {
             close(uffd_fd);
             uffd_fd = -1;
@@ -5340,6 +5648,7 @@ static void stop_uffd_pager(void) {
     atomic_store_explicit(&uffd_thread_stop, 1, memory_order_release);
     (void)pthread_join(uffd_thread, NULL);
     uffd_thread_started = 0;
+    stop_uffd_async_worker();
     if (uffd_fd >= 0) {
         close(uffd_fd);
         uffd_fd = -1;
@@ -6918,7 +7227,10 @@ static void print_stats(void) {
             "policy_demand_fault_stall_p50_ns=%zu "
             "policy_demand_fault_stall_p90_ns=%zu "
             "policy_demand_fault_stall_p99_ns=%zu "
-            "policy_demand_fault_stall_max_ns=%zu\n",
+            "policy_demand_fault_stall_max_ns=%zu "
+            "policy_async_prefetch_enqueued=%zu "
+            "policy_async_prefetch_completed=%zu "
+            "policy_async_prefetch_dropped=%zu\n",
             stats.enabled, stats.configured, stats.config_error, stats.threshold,
             stats.arena_size, stats.target_rss, stats.max_rss,
             stats.current_rss_bytes, stats.high_water_rss_bytes,
@@ -6961,7 +7273,10 @@ static void print_stats(void) {
             stats.policy_demand_fault_stall_p50_ns,
             stats.policy_demand_fault_stall_p90_ns,
             stats.policy_demand_fault_stall_p99_ns,
-            stats.policy_demand_fault_stall_max_ns);
+            stats.policy_demand_fault_stall_max_ns,
+            stats.policy_async_prefetch_enqueued,
+            stats.policy_async_prefetch_completed,
+            stats.policy_async_prefetch_dropped);
 }
 
 static void print_profile_report(void) {
@@ -7107,6 +7422,10 @@ static int configure_runtime(void) {
     const char* uffd_resident_low_limit =
         getenv("MAI_UFFD_RESIDENT_LOW_LIMIT");
     const char* uffd_prefetch = getenv("MAI_UFFD_PREFETCH_CHUNKS");
+    const char* uffd_async_prefetch =
+        getenv("MAI_UFFD_ASYNC_PREFETCH");
+    const char* uffd_async_slack =
+        getenv("MAI_UFFD_ASYNC_SLACK_CHUNKS");
     const char* migration_chunk = getenv("MAI_MIGRATION_CHUNK");
     const char* spatial_region =
         getenv("MAI_SPATIAL_REGION_CHUNKS");
@@ -7151,6 +7470,14 @@ static int configure_runtime(void) {
     uffd_pager_mode = UFFD_PAGER_OFF;
     migration_policy = MIGRATION_POLICY_LEGACY;
     policy_observe_prefetch_writes = 0;
+    uffd_async_prefetch_enabled = 0;
+    uffd_async_slack_chunks = MAI_DEFAULT_UFFD_ASYNC_SLACK_CHUNKS;
+    atomic_store_explicit(&uffd_async_thread_started, 0,
+                          memory_order_relaxed);
+    uffd_async_task_head = 0;
+    uffd_async_task_tail = 0;
+    uffd_async_task_count = 0;
+    atomic_store_explicit(&uffd_async_thread_stop, 0, memory_order_relaxed);
     uffd_pager_available = 0;
     uffd_resident_limit_bytes = 0;
     uffd_resident_low_limit_bytes = 0;
@@ -7334,6 +7661,12 @@ static int configure_runtime(void) {
         runtime_config_error = 1;
         return -1;
     }
+    uffd_async_prefetch_enabled = parse_bool_env(uffd_async_prefetch);
+    if (uffd_async_slack &&
+        parse_count_env(uffd_async_slack, &uffd_async_slack_chunks) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
     if (migration_chunk && parse_size_env(migration_chunk, &migration_chunk_bytes) != 0) {
         runtime_config_error = 1;
         return -1;
@@ -7458,6 +7791,9 @@ static int configure_runtime(void) {
     }
     if (uffd_prefetch_chunks > MAI_MAX_UFFD_PREFETCH_CHUNKS) {
         uffd_prefetch_chunks = MAI_MAX_UFFD_PREFETCH_CHUNKS;
+    }
+    if (uffd_async_slack_chunks > MAI_MAX_UFFD_PREFETCH_CHUNKS) {
+        uffd_async_slack_chunks = MAI_MAX_UFFD_PREFETCH_CHUNKS;
     }
     if (uffd_pager_mode != UFFD_PAGER_OFF && !uffd_resident_limit_explicit) {
         size_t cap = 0;

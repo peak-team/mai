@@ -125,6 +125,22 @@ back to the triplet size.
 | `markov` | 8452 | 427 | 25839 | 0.33 | 192 | 240 | 320 | 0 |
 | `spatial` | 5140 | 339 | 10629 | 0.48 | 443 | 970 | 1050 | 259 |
 
+### Async UFFD Policy Worker Probe
+
+These rows use the original 64 MiB high / 48 MiB low watermark pressure shape.
+`MAI_UFFD_ASYNC_PREFETCH=1` moves speculative prefetch and follow-on reclaim to
+a bounded background worker; demand faults are still resolved synchronously.
+The async counters verify that the worker actually executed.
+
+| Async | Policy | End-to-end MiB/s | Kernel MiB/s | Demand faults | Read MiB | Write MiB | Stall ms | Async tasks completed |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| off | `legacy` | 7719 | 23408 | 48 | 240 | 336 | 154 | 0 |
+| on | `legacy` | 7524 | 23224 | 109 | 288 | 373 | 110 | 105 |
+| off | `markov` | 7792 | 22743 | 175 | 246 | 342 | 131 | 0 |
+| on | `markov` | 6836 | 19728 | 190 | 244 | 337 | 123 | 74 |
+| off | `2q` | 5635 | 15986 | 137 | 534 | 630 | 231 | 0 |
+| on | `2q` | 7105 | 17865 | 147 | 337 | 427 | 140 | 137 |
+
 ## Interpretation
 
 - Sufficient-memory MAI does not trigger migration in these runs; faster
@@ -153,6 +169,11 @@ back to the triplet size.
   sufficient-memory end-to-end baseline. It also hurts `stream`, `stride`, and
   `spatial`, so fixed extra slack is not enough without better admission,
   eviction, and migration throttling.
+- The opt-in async UFFD policy worker is a mechanism improvement, not a global
+  strategy win. On this slice it improves `2q` end-to-end throughput by moving
+  speculative work off the fault path and reducing migration bytes, but it
+  hurts `legacy` and `markov`. It should stay policy-selected or experimental
+  until admission and worker scheduling can avoid that regression.
 - A clean-shadow write-amplification experiment was attempted but rejected:
   retaining storage shadows and using UFFD write-protect to avoid clean
   write-back corrupted the successor-policy correctness workload. Any future

@@ -1924,6 +1924,122 @@ static int mode_uffd_pager_spatial_prefetch(void) {
     return 0;
 }
 
+static int mode_uffd_pager_async_prefetch(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 16 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t resident_limit = 8 * 1024 * 1024;
+    const size_t resident_slack = 4 * 1024 * 1024;
+    const size_t chunks = size / unit;
+    unsigned char expected[8] = {0};
+
+    if (chunks > sizeof(expected)) {
+        return fail("async prefetch expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD async prefetch test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for async prefetch test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD async prefetch allocation failed");
+    }
+
+    for (size_t i = 0; i < chunks; i++) {
+        expected[i] = (unsigned char)(0x40 + i);
+        ptr[i * unit] = expected[i];
+        usleep(1000);
+    }
+    ptr[size - 1] = 0xc3;
+    for (size_t wait = 0; wait < 100; wait++) {
+        if (load_stats(&after_touch) != 0) {
+            free(ptr);
+            return fail("mai_get_stats failed while waiting for UFFD async prefetch");
+        }
+        if (after_touch.policy_async_prefetch_completed >
+            before.policy_async_prefetch_completed) {
+            break;
+        }
+        usleep(1000);
+    }
+
+    for (size_t i = 0; i < chunks; i++) {
+        if (ptr[i * unit] != expected[i]) {
+            free(ptr);
+            return fail("UFFD async prefetch lost chunk data");
+        }
+    }
+    if (ptr[size - 1] != 0xc3) {
+        free(ptr);
+        return fail("UFFD async prefetch lost tail data");
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD async prefetch touches");
+    }
+    size_t async_enqueued =
+        after_touch.policy_async_prefetch_enqueued -
+        before.policy_async_prefetch_enqueued;
+    size_t async_completed =
+        after_touch.policy_async_prefetch_completed -
+        before.policy_async_prefetch_completed;
+    size_t prefetch_completed =
+        after_touch.policy_prefetch_completed - before.policy_prefetch_completed;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults) {
+        free(ptr);
+        return fail("UFFD async prefetch did not exercise pager faults");
+    }
+    if (async_enqueued == 0 || async_completed == 0) {
+        fprintf(stderr,
+                "async worker stats: enqueued=%zu completed=%zu dropped=%zu\n",
+                async_enqueued, async_completed,
+                after_touch.policy_async_prefetch_dropped -
+                before.policy_async_prefetch_dropped);
+        free(ptr);
+        return fail("UFFD async prefetch worker did not run");
+    }
+    if (prefetch_completed == 0) {
+        fprintf(stderr,
+                "async prefetch stats: completed before=%zu after=%zu\n",
+                before.policy_prefetch_completed,
+                after_touch.policy_prefetch_completed);
+        free(ptr);
+        return fail("UFFD async prefetch worker did not complete prefetches");
+    }
+    if (after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD async prefetch did not exercise pressure eviction");
+    }
+    if (after_touch.uffd_resident_bytes > resident_limit + resident_slack) {
+        fprintf(stderr,
+                "async resident stats: resident=%zu limit=%zu slack=%zu\n",
+                after_touch.uffd_resident_bytes, resident_limit, resident_slack);
+        free(ptr);
+        return fail("UFFD async prefetch exceeded resident slack bound");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD async prefetch free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD async prefetch allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
 static int mode_uffd_pager_stride_policy(void) {
     MaiStats before;
     MaiStats after_touch;
@@ -3509,6 +3625,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_spatial_prefetch") == 0) {
         return mode_uffd_pager_spatial_prefetch();
+    }
+    if (strcmp(argv[1], "uffd_pager_async_prefetch") == 0) {
+        return mode_uffd_pager_async_prefetch();
     }
     if (strcmp(argv[1], "uffd_pager_stride_policy") == 0) {
         return mode_uffd_pager_stride_policy();

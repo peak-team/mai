@@ -145,11 +145,20 @@ runtime strategy:
 All policies share append-only `MaiStats` counters for prefetch requests,
 admissions, completions, useful prefetches, late demand faults, unused-prefetch
 evictions, migration read/write bytes, demand-fault stalls, demotions, and
-promotions. These counters are mechanism-derived and do not depend on benchmark
-scenario names.
-`policy_throttle_events` and `policy_throttle_slept_ns` are reserved for the
-next bandwidth/stall-budget throttle; current policies use resident limits and
+promotions. Async UFFD policy work also reports enqueued, completed, and
+dropped task counters. These counters are mechanism-derived and do not depend
+on benchmark scenario names.
+`policy_throttle_events` reports bounded-queue drops and resident-limit hard
+reclaim events. `policy_throttle_slept_ns` is reserved for a future
+bandwidth/stall-budget throttle; current policies use resident limits and
 migration chunk size but do not yet report active throttle sleeps.
+
+`MAI_UFFD_ASYNC_PREFETCH=1` enables an experimental UFFD background policy
+worker. Demand faults are still resolved synchronously. The worker only moves
+speculative prefetch and follow-on reclaim work off the fault handler, bounded
+by `MAI_UFFD_ASYNC_SLACK_CHUNKS` and the resident high/low watermarks. It is
+not a default policy because it can help admission-heavy policies while hurting
+policies whose synchronous forward prefetch is already cheap.
 
 Read-only usefulness of a UFFD-prefetched chunk is not directly observable
 without adding another faulting mechanism, because a successful prefetch avoids

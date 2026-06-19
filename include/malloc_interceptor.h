@@ -114,6 +114,9 @@ typedef struct {
     size_t policy_demand_fault_stall_p90_ns;
     size_t policy_demand_fault_stall_p99_ns;
     size_t policy_demand_fault_stall_max_ns;
+    size_t policy_async_prefetch_enqueued;
+    size_t policy_async_prefetch_completed;
+    size_t policy_async_prefetch_dropped;
 } MaiStats;
 
 /**
