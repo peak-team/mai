@@ -267,6 +267,11 @@ from the same host, seed, binary, and workload before making performance
 claims. The observed prefetch metrics are lower bounds unless
 `policy_prefetch_observation=write_protect`; Linux mmap and swap baselines do
 not populate MAI migration-byte counters.
+For `policy_stream_pipeline`, the
+`stream_pipeline_max_cycle_policy_*` fields report the largest per-group-visit
+delta after matrix initialization. They show whether faults, migration bytes,
+demotions, hot evictions, or stall time concentrate at phase transitions even
+when aggregate means look acceptable.
 
 This is the intended pressure condition: `3 * matrix_bytes` should fit in
 physical memory while `9 * matrix_bytes` does not. It verifies sampled final

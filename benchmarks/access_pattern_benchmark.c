@@ -106,6 +106,12 @@ static const char* stream_pipeline_order_recorded = "sequential";
 static const char* stream_pipeline_prediction_recorded = "entry";
 static size_t stream_pipeline_reclaim_lag_recorded = 0;
 static size_t stream_pipeline_reclaim_horizon_recorded = 0;
+static size_t stream_pipeline_max_cycle_policy_demand_faults = 0;
+static size_t stream_pipeline_max_cycle_policy_read_bytes = 0;
+static size_t stream_pipeline_max_cycle_policy_write_bytes = 0;
+static size_t stream_pipeline_max_cycle_policy_stall_ns = 0;
+static size_t stream_pipeline_max_cycle_policy_demotions = 0;
+static size_t stream_pipeline_max_cycle_policy_hot_evicted_bytes = 0;
 static size_t stream_passes_recorded = 0;
 
 typedef enum {
@@ -163,6 +169,10 @@ static int compare_double(const void* left, const void* right) {
     double a = *(const double*)left;
     double b = *(const double*)right;
     return (a > b) - (a < b);
+}
+
+static size_t size_delta(size_t after, size_t before) {
+    return after >= before ? after - before : 0;
 }
 
 static double seconds_since(const struct timespec* start, const struct timespec* end) {
@@ -3021,6 +3031,11 @@ static int run_stream_kernel_pipeline(const char* mode, unsigned char* buffer,
     }
 
     size_t group_visits[STREAM_PIPELINE_GROUPS] = {0};
+    MaiStats previous_cycle_stats;
+    int cycle_stats_available = 0;
+    if (load_stats_optional(&previous_cycle_stats, &cycle_stats_available) != 0) {
+        cycle_stats_available = 0;
+    }
 
     for (size_t cycle = 0; cycle < cycles; cycle++) {
         uint64_t cycle_copy_ns = 0;
@@ -3059,6 +3074,48 @@ static int run_stream_kernel_pipeline(const char* mode, unsigned char* buffer,
         cycle_rates[cycle] = cycle_ns != 0 ?
             cycle_mib / ((double)cycle_ns / 1000000000.0) : 0.0;
         group_visits[group]++;
+
+        if (cycle_stats_available) {
+            MaiStats cycle_stats;
+            int current_stats_available = 0;
+            if (load_stats_optional(&cycle_stats, &current_stats_available) == 0 &&
+                current_stats_available) {
+                size_t delta =
+                    size_delta(cycle_stats.policy_demand_faults,
+                               previous_cycle_stats.policy_demand_faults);
+                if (delta > stream_pipeline_max_cycle_policy_demand_faults) {
+                    stream_pipeline_max_cycle_policy_demand_faults = delta;
+                }
+                delta = size_delta(cycle_stats.policy_migration_read_bytes,
+                                   previous_cycle_stats.policy_migration_read_bytes);
+                if (delta > stream_pipeline_max_cycle_policy_read_bytes) {
+                    stream_pipeline_max_cycle_policy_read_bytes = delta;
+                }
+                delta = size_delta(cycle_stats.policy_migration_write_bytes,
+                                   previous_cycle_stats.policy_migration_write_bytes);
+                if (delta > stream_pipeline_max_cycle_policy_write_bytes) {
+                    stream_pipeline_max_cycle_policy_write_bytes = delta;
+                }
+                delta = size_delta(cycle_stats.policy_demand_fault_stall_ns,
+                                   previous_cycle_stats.policy_demand_fault_stall_ns);
+                if (delta > stream_pipeline_max_cycle_policy_stall_ns) {
+                    stream_pipeline_max_cycle_policy_stall_ns = delta;
+                }
+                delta = size_delta(cycle_stats.policy_demotions,
+                                   previous_cycle_stats.policy_demotions);
+                if (delta > stream_pipeline_max_cycle_policy_demotions) {
+                    stream_pipeline_max_cycle_policy_demotions = delta;
+                }
+                delta = size_delta(cycle_stats.policy_evicted_hot_bytes,
+                                   previous_cycle_stats.policy_evicted_hot_bytes);
+                if (delta > stream_pipeline_max_cycle_policy_hot_evicted_bytes) {
+                    stream_pipeline_max_cycle_policy_hot_evicted_bytes = delta;
+                }
+                previous_cycle_stats = cycle_stats;
+            } else {
+                cycle_stats_available = 0;
+            }
+        }
     }
 
     double copy_mib =
@@ -3483,6 +3540,12 @@ int main(int argc, char** argv) {
            "stream_pipeline_prediction=%s "
            "stream_pipeline_reclaim_lag=%zu "
            "stream_pipeline_reclaim_horizon=%zu "
+           "stream_pipeline_max_cycle_policy_demand_faults=%zu "
+           "stream_pipeline_max_cycle_policy_read_bytes=%zu "
+           "stream_pipeline_max_cycle_policy_write_bytes=%zu "
+           "stream_pipeline_max_cycle_policy_stall_ns=%zu "
+           "stream_pipeline_max_cycle_policy_demotions=%zu "
+           "stream_pipeline_max_cycle_policy_hot_evicted_bytes=%zu "
            "stream_prefetch_ns=%llu stream_prepare_write_ns=%llu "
            "stream_reclaim_ns=%llu stream_init_ns=%llu "
            "stream_copy_ns=%llu stream_scale_ns=%llu "
@@ -3557,6 +3620,12 @@ int main(int argc, char** argv) {
            stream_pipeline_prediction_recorded,
            stream_pipeline_reclaim_lag_recorded,
            stream_pipeline_reclaim_horizon_recorded,
+           stream_pipeline_max_cycle_policy_demand_faults,
+           stream_pipeline_max_cycle_policy_read_bytes,
+           stream_pipeline_max_cycle_policy_write_bytes,
+           stream_pipeline_max_cycle_policy_stall_ns,
+           stream_pipeline_max_cycle_policy_demotions,
+           stream_pipeline_max_cycle_policy_hot_evicted_bytes,
            (unsigned long long)stream_prefetch_ns,
            (unsigned long long)stream_prepare_write_ns,
            (unsigned long long)stream_reclaim_ns,
