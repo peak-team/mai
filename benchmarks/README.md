@@ -163,7 +163,8 @@ only for explicit quiescent-boundary or unsafe experimental runs.
 Runtime policy knobs are intentionally separate from benchmark knobs:
 
 - `MAI_MIGRATION_POLICY` or `MAI_POLICY`: `legacy`, `lru`, `clock`, `fifo`,
-  `random`, `stream`, `stride`, or `2q`
+  `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, or
+  `markov`/`successor`
 - `MAI_UFFD_PREFETCH_CHUNKS`: maximum UFFD prefetch lookahead
 - `MAI_UFFD_RESIDENT_LIMIT` and `MAI_UFFD_RESIDENT_LOW_LIMIT`: resident
   high/low watermarks for UFFD-managed chunks
@@ -175,7 +176,8 @@ Policy pressure scenarios can use `mai_policy_pipeline` with
 `MAI_MIGRATION_POLICY`, or a policy-specific scenario such as
 `mai_policy_stream_pipeline`, `mai_policy_clock_pipeline`, or
 `mai_policy_2q_pipeline`. The runtime accepts `legacy`, `lru`, `clock`,
-`fifo`, `random`, `stream`, `stride`, `2q`, and `lfu`/`decayed-lfu`.
+`fifo`, `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, and
+`markov`/`successor`.
 
 `policy_multistream_stride` is a focused no-oracle workload for stride
 predictors. It walks fixed-size units inside one allocation as independent
@@ -199,6 +201,17 @@ write-protect observation reduced migration traffic versus `legacy`, while
 `2q` remained as good or better on migration and sampled-unit throughput.
 Without observation, this first exact LFU roughly tied or trailed the simpler
 policies. Treat `lfu` as a frequency-admission baseline, not a default win.
+
+`policy_successor_cycle` is a no-oracle workload for repeated irregular
+transitions. It walks fixed-size units through an affine successor cycle, so
+next-chunk and constant-stride predictors should not be credited for the
+pattern. Control it with `MAI_BENCH_POLICY_SUCCESSOR_UNIT`,
+`MAI_BENCH_POLICY_SUCCESSOR_MULTIPLIER`,
+`MAI_BENCH_POLICY_SUCCESSOR_ADDEND`, and `MAI_BENCH_POLICY_PASSES`.
+On the local 64M allocation / 16M resident-limit smoke shape, `markov`
+reduced demand faults versus `stride` and modestly improved sampled-unit rate
+when write-protect observation was disabled. Enable observation only when you
+need useful-prefetch accounting, because it changes fault behavior.
 
 Benchmark-only knobs keep the `MAI_BENCH_` prefix. Source policy tests reject
 `MAI_BENCH_*` and `MAI_STREAM_*` references from runtime source files so MAI

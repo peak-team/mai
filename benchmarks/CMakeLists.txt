@@ -72,4 +72,20 @@ if(BUILD_TESTING)
     set_tests_properties(mai_policy_hotset_scan_smoke PROPERTIES
         PASS_REGULAR_EXPRESSION "mode=policy_hotset_scan .*logical_mib=48\\.000 .*stream_pipeline_group_visits=6 .*stream_pipeline_groups=2 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=hotset_scan .*stream_pipeline_prediction=admission_lfu"
     )
+
+    add_test(
+        NAME mai_policy_successor_cycle_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_POLICY_PASSES=2"
+            "MAI_BENCH_POLICY_SUCCESSOR_UNIT=2M"
+            "MAI_BENCH_POLICY_SUCCESSOR_MULTIPLIER=5"
+            "MAI_BENCH_POLICY_SUCCESSOR_ADDEND=3"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            policy_successor_cycle
+            32M
+    )
+    set_tests_properties(mai_policy_successor_cycle_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=policy_successor_cycle .*logical_mib=128\\.000 .*stream_pipeline_group_visits=2 .*stream_pipeline_groups=16 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=successor_cycle .*stream_pipeline_prediction=successor"
+    )
 endif()

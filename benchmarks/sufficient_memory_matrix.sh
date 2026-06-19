@@ -23,7 +23,7 @@ allocation_size=${MAI_BENCH_ALLOCATION_SIZE:-64M}
 stream_allocation_size=${MAI_BENCH_STREAM_ALLOCATION_SIZE:-512M}
 iterations=${MAI_BENCH_ALLOC_ITERATIONS:-5000}
 allocator_sizes=${MAI_BENCH_ALLOC_SIZES:-"64 4096 65536"}
-access_patterns=${MAI_BENCH_ACCESS_PATTERNS:-"stream_plain stream_bandwidth policy_stream_pipeline policy_multistream_stride policy_hotset_scan stride_plain sparse_plain random_hotset"}
+access_patterns=${MAI_BENCH_ACCESS_PATTERNS:-"stream_plain stream_bandwidth policy_stream_pipeline policy_multistream_stride policy_hotset_scan policy_successor_cycle stride_plain sparse_plain random_hotset"}
 min_mib_per_sec=${MAI_BENCH_MIN_MIB_PER_SEC:-0}
 passthrough_threshold=${MAI_BENCH_PASSTHROUGH_THRESHOLD:-16T}
 
@@ -61,7 +61,8 @@ run_access() {
     if [ "$pattern" = "stream_bandwidth" ] ||
        [ "$pattern" = "policy_stream_pipeline" ] ||
        [ "$pattern" = "policy_multistream_stride" ] ||
-       [ "$pattern" = "policy_hotset_scan" ]; then
+       [ "$pattern" = "policy_hotset_scan" ] ||
+       [ "$pattern" = "policy_successor_cycle" ]; then
         pattern_size=$stream_allocation_size
     fi
     if [ "$scenario" = "native" ]; then

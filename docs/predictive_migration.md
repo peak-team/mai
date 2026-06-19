@@ -135,6 +135,10 @@ runtime strategy:
 - `2q`: first prefetch-aware admission baseline; prefetched chunks enter
   probation and are rejected when admitting them would exceed the resident
   limit.
+- `lfu` or `decayed-lfu`: exact per-chunk decayed-frequency admission and
+  victim selection baseline.
+- `markov`, `successor`, or `successor-table`: one-successor transition
+  predictor for repeated irregular chunk order.
 
 All policies share append-only `MaiStats` counters for prefetch requests,
 admissions, completions, useful prefetches, late demand faults, unused-prefetch
@@ -167,7 +171,7 @@ observed lower bounds unless the row says
 | Sequential readahead | Detect monotonic chunk faults and adapt the forward window with additive increase and multiplicative decrease from accuracy feedback. Admit only while headroom and budget permit. | Implemented as `stream` in first form. |
 | Stride and multi-stream | Track several `{last, delta, confidence, window}` streams per allocation. Admit only after repeated deltas. Evict chunks far behind active streams. | Implemented as `stride` in first form. |
 | Best-offset and multi-lookahead offset | Score candidate offsets by later demand hits. Prefetch the highest-confidence offsets, not necessarily the next chunk. | Useful for blocked and stencil-like patterns after stream baselines. |
-| Markov and delta-correlation | Keep bounded successor tables keyed by previous chunk or delta signature. Admit only high-confidence successors and decay tables quickly under phase changes. | Later; metadata and pollution risk are higher. |
+| Markov and delta-correlation | Keep one bounded successor edge per chunk. Admit only repeated high-confidence successors, and require stronger confidence under resident pressure. | Implemented as `markov`/`successor` in first form; no fanout or chaining yet. |
 | Signature/history-table | Use rolling delta signatures to predict multi-step sequences. Confidence controls depth and admission. | Later; best paired with a global budget and quick decay. |
 | Spatial region masks | Divide allocations into fixed chunk regions and learn stable touched masks. On first fault in a region, prefetch the historically useful mask. | Good fit for MAI chunks; planned after stride. |
 | TinyLFU and frequency sketches | Use a compact approximate frequency sketch for admission. Compare candidate score against victim score to prevent pollution. | Important for hot/cold classification under mixed scans. |
@@ -244,6 +248,13 @@ migration traffic versus `legacy` on this workload, but still trailing `2q` on
 this small shape. Without observation, this first exact per-chunk LFU roughly
 ties or trails the simpler policies. That result is expected and does not make
 `lfu` the default policy.
+`policy_successor_cycle` is the no-oracle irregular-transition workload for
+`markov`/`successor`. It uses a deterministic successor cycle so simple
+next-chunk and constant-stride predictors do not receive the same signal.
+Current local smoke results show `markov` reducing demand faults versus
+`stride` on this workload without increasing migration volume, with the best
+throughput when write-protect observation is disabled. Observation mode is
+still useful for accuracy counters, but it changes the measured cost.
 
 ## Benchmarks
 

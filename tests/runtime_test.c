@@ -2132,6 +2132,90 @@ static int mode_uffd_pager_lfu_hotset_scan(void) {
     return 0;
 }
 
+static int mode_uffd_pager_successor_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t passes = 4;
+    const size_t multiplier = 5;
+    const size_t addend = 3;
+    unsigned char expected[32] = {0};
+
+    if (units > sizeof(expected)) {
+        return fail("successor policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD successor policy test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for successor policy test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD successor policy allocation failed");
+    }
+    for (size_t pass = 0; pass < passes; pass++) {
+        size_t index = 0;
+        for (size_t step = 0; step < units; step++) {
+            expected[index]++;
+            ptr[index * unit] = expected[index];
+            if (ptr[index * unit] != expected[index]) {
+                free(ptr);
+                return fail("UFFD successor policy lost write data");
+            }
+            index = (multiplier * index + addend) % units;
+        }
+        index = 0;
+        for (size_t step = 0; step < units; step++) {
+            if (ptr[index * unit] != expected[index]) {
+                free(ptr);
+                return fail("UFFD successor policy lost read data");
+            }
+            index = (multiplier * index + addend) % units;
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD successor policy touches");
+    }
+    size_t prefetch_completed =
+        after_touch.policy_prefetch_completed - before.policy_prefetch_completed;
+    size_t prefetch_useful =
+        after_touch.policy_prefetch_useful - before.policy_prefetch_useful;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD successor policy did not exercise pager pressure");
+    }
+    if (prefetch_completed == 0 || prefetch_useful == 0) {
+        fprintf(stderr,
+                "successor policy prefetch stats: completed=%zu useful=%zu\n",
+                prefetch_completed, prefetch_useful);
+        free(ptr);
+        return fail("UFFD successor policy did not produce useful prefetches");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD successor policy free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD successor policy allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
 typedef struct {
     int id;
     int iterations;
@@ -3314,6 +3398,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_lfu_hotset_scan") == 0) {
         return mode_uffd_pager_lfu_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_successor_policy") == 0) {
+        return mode_uffd_pager_successor_policy();
     }
     if (strcmp(argv[1], "uffd_pager_concurrent_stress") == 0) {
         return mode_uffd_pager_concurrent_stress();

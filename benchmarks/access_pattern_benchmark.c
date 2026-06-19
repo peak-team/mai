@@ -1229,6 +1229,119 @@ static int run_policy_hotset_scan(unsigned char* buffer, size_t size,
     return 0;
 }
 
+static int run_policy_successor_cycle(unsigned char* buffer, size_t size,
+                                      uint64_t* checksum,
+                                      size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_SUCCESSOR_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t passes = env_count_compat("MAI_BENCH_POLICY_PASSES",
+                                     "MAI_BENCH_STREAM_PASSES", 3);
+    size_t multiplier = env_count("MAI_BENCH_POLICY_SUCCESSOR_MULTIPLIER", 5);
+    size_t addend = env_count("MAI_BENCH_POLICY_SUCCESSOR_ADDEND", 3);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    size_t units = size / unit_bytes;
+    if (units < 4) {
+        return -1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+    if (multiplier == 0) {
+        multiplier = 5;
+    }
+    if (addend == 0) {
+        addend = 3;
+    }
+    if ((multiplier % units) == 0) {
+        multiplier++;
+    }
+    if ((addend % units) == 0) {
+        addend++;
+    }
+
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+    unsigned char* visited = calloc(units, sizeof(*visited));
+    if (!visited) {
+        free(expected);
+        return -1;
+    }
+    size_t cycle_index = 0;
+    for (size_t step = 0; step < units; step++) {
+        if (visited[cycle_index]) {
+            free(visited);
+            free(expected);
+            return -1;
+        }
+        visited[cycle_index] = 1;
+        cycle_index = (multiplier * cycle_index + addend) % units;
+    }
+    if (cycle_index != 0) {
+        free(visited);
+        free(expected);
+        return -1;
+    }
+    free(visited);
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t pass = 0; pass < passes; pass++) {
+        size_t unit = 0;
+        for (size_t step = 0; step < units; step++) {
+            size_t offset = unit * unit_bytes;
+            expected[unit]++;
+            buffer[offset] = expected[unit];
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+            unit = (multiplier * unit + addend) % units;
+        }
+        unit = 0;
+        for (size_t step = 0; step < units; step++) {
+            size_t offset = unit * unit_bytes;
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+            unit = (multiplier * unit + addend) % units;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "successor_cycle";
+    stream_pipeline_prediction_recorded = "successor";
+    stream_pipeline_groups_recorded = units;
+    stream_pipeline_group_visits_recorded = passes;
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_scalar_recorded = (double)multiplier;
+    stream_pipeline_reclaim_horizon_recorded = addend;
+
+    free(expected);
+    return 0;
+}
+
 static int run_trace_chunks(unsigned char* buffer, size_t size,
                             uint64_t* checksum, size_t* touches) {
     if (load_trace_symbols() != 0) {
@@ -2843,6 +2956,7 @@ int main(int argc, char** argv) {
                 "stream_shared_file|stream_private_file|"
                 "stream_tiled_bandwidth|policy_stream_pipeline|"
                 "policy_multistream_stride|policy_hotset_scan|"
+                "policy_successor_cycle|"
                 "stream_kernel_pipeline|"
                 "stream_kernel_pipeline_anon_mmap|"
                 "stream_kernel_pipeline_shared_file|"
@@ -2926,6 +3040,8 @@ int main(int argc, char** argv) {
         rc = run_policy_multistream_stride(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_hotset_scan") == 0) {
         rc = run_policy_hotset_scan(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_successor_cycle") == 0) {
+        rc = run_policy_successor_cycle(buffer, size, &checksum, &touches);
     } else if (mode_uses_stream_kernel(argv[1])) {
         rc = run_stream_bandwidth(argv[1], buffer, size, &checksum, &touches);
     } else {
