@@ -4396,6 +4396,45 @@ int main(int argc, char** argv) {
         after.policy_signature_top_delta_sign : 0;
     size_t policy_signature_top_score = after_stats_available ?
         after.policy_signature_top_score : 0;
+    size_t policy_hybrid_signature_candidates = after_stats_available ?
+        after.policy_hybrid_signature_candidates -
+        before.policy_hybrid_signature_candidates : 0;
+    size_t policy_hybrid_successor_candidates = after_stats_available ?
+        after.policy_hybrid_successor_candidates -
+        before.policy_hybrid_successor_candidates : 0;
+    size_t policy_hybrid_stream_candidates = after_stats_available ?
+        after.policy_hybrid_stream_candidates -
+        before.policy_hybrid_stream_candidates : 0;
+    size_t policy_hybrid_admission_rejected = after_stats_available ?
+        after.policy_hybrid_admission_rejected -
+        before.policy_hybrid_admission_rejected : 0;
+    size_t policy_hybrid_signature_admitted = after_stats_available ?
+        after.policy_hybrid_signature_admitted -
+        before.policy_hybrid_signature_admitted : 0;
+    size_t policy_hybrid_successor_admitted = after_stats_available ?
+        after.policy_hybrid_successor_admitted -
+        before.policy_hybrid_successor_admitted : 0;
+    size_t policy_hybrid_stream_admitted = after_stats_available ?
+        after.policy_hybrid_stream_admitted -
+        before.policy_hybrid_stream_admitted : 0;
+    size_t policy_hybrid_signature_completed = after_stats_available ?
+        after.policy_hybrid_signature_completed -
+        before.policy_hybrid_signature_completed : 0;
+    size_t policy_hybrid_successor_completed = after_stats_available ?
+        after.policy_hybrid_successor_completed -
+        before.policy_hybrid_successor_completed : 0;
+    size_t policy_hybrid_stream_completed = after_stats_available ?
+        after.policy_hybrid_stream_completed -
+        before.policy_hybrid_stream_completed : 0;
+    size_t policy_hybrid_signature_useful = after_stats_available ?
+        after.policy_hybrid_signature_useful -
+        before.policy_hybrid_signature_useful : 0;
+    size_t policy_hybrid_successor_useful = after_stats_available ?
+        after.policy_hybrid_successor_useful -
+        before.policy_hybrid_successor_useful : 0;
+    size_t policy_hybrid_stream_useful = after_stats_available ?
+        after.policy_hybrid_stream_useful -
+        before.policy_hybrid_stream_useful : 0;
     const char* policy_prefetch_observation =
         after_stats_available && after.policy_prefetch_observation != 0 ?
         "write_protect" : "unobserved";
@@ -4519,6 +4558,19 @@ int main(int argc, char** argv) {
            "policy_signature_top_delta_magnitude=%zu "
            "policy_signature_top_delta_sign=%zu "
            "policy_signature_top_score=%zu "
+           "policy_hybrid_signature_candidates=%zu "
+           "policy_hybrid_successor_candidates=%zu "
+           "policy_hybrid_stream_candidates=%zu "
+           "policy_hybrid_admission_rejected=%zu "
+           "policy_hybrid_signature_admitted=%zu "
+           "policy_hybrid_successor_admitted=%zu "
+           "policy_hybrid_stream_admitted=%zu "
+           "policy_hybrid_signature_completed=%zu "
+           "policy_hybrid_successor_completed=%zu "
+           "policy_hybrid_stream_completed=%zu "
+           "policy_hybrid_signature_useful=%zu "
+           "policy_hybrid_successor_useful=%zu "
+           "policy_hybrid_stream_useful=%zu "
            "max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
@@ -4666,6 +4718,19 @@ int main(int argc, char** argv) {
            policy_signature_top_delta_magnitude,
            policy_signature_top_delta_sign,
            policy_signature_top_score,
+           policy_hybrid_signature_candidates,
+           policy_hybrid_successor_candidates,
+           policy_hybrid_stream_candidates,
+           policy_hybrid_admission_rejected,
+           policy_hybrid_signature_admitted,
+           policy_hybrid_successor_admitted,
+           policy_hybrid_stream_admitted,
+           policy_hybrid_signature_completed,
+           policy_hybrid_successor_completed,
+           policy_hybrid_stream_completed,
+           policy_hybrid_signature_useful,
+           policy_hybrid_successor_useful,
+           policy_hybrid_stream_useful,
            after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,

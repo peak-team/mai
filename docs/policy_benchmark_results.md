@@ -129,18 +129,21 @@ use a 64 MiB allocation, 2 MiB chunks, 16 MiB/12 MiB resident high/low
 watermarks, four passes, seeds `1,7,13,29,31,43`, and write-protect
 observation enabled so useful-prefetch accounting is visible.
 
-| Policy | End-to-end MiB/s | Demand faults | Prefetches | Useful | Late events | Unused evictions | Read MiB | Write MiB | Hot-evicted MiB | Signature train | Signature hits | Signature candidates | Signature chain candidates | Signature pressure rejects |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `stride` | 3158 | 123 | 48 | 11 | 112 | 37 | 255 | 306 | 232 | 0 | 0 | 0 | 0 | 0 |
-| `markov` | 4167 | 122 | 24 | 22 | 100 | 2 | 185 | 235 | 231 | 0 | 0 | 0 | 0 | 0 |
-| `wtinylfu` | 4116 | 123 | 13 | 12 | 110 | 1 | 183 | 233 | 232 | 0 | 0 | 0 | 0 | 0 |
-| `signature` | 3372 | 130 | 50 | 42 | 89 | 8 | 213 | 265 | 248 | 128 | 55 | 86 | 35 | 1 |
+| Policy | End-to-end MiB/s | Demand faults | Prefetches | Useful | Late events | Unused evictions | Read MiB | Write MiB | Hot-evicted MiB | Signature train | Signature hits | Signature candidates | Signature chain candidates | Hybrid candidates sig/succ/stream | Hybrid admitted sig/succ/stream | Hybrid useful sig/succ/stream |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `markov` | 4030 | 122 | 24 | 23 | 100 | 2 | 184 | 235 | 232 | 0 | 0 | 0 | 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `wtinylfu` | 4202 | 123 | 13 | 12 | 111 | 0 | 183 | 233 | 232 | 0 | 0 | 0 | 0 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `signature` | 2906 | 132 | 52 | 44 | 88 | 8 | 215 | 266 | 250 | 128 | 57 | 91 | 37 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `hybrid` | 3312 | 128 | 32 | 26 | 102 | 6 | 204 | 256 | 244 | 126 | 69 | 106 | 44 | 106 / 41 / 63 | 20 / 4 / 8 | 18 / 4 / 4 |
 
-The signature table learns the context-dependent transition and emits useful
-prefetches, including depth-greater-than-one chain candidates, but the current
-admission policy buys timeliness with extra migration traffic and hotter
-evictions. This is useful diagnostic progress, not yet a replacement for the
-more conservative W-TinyLFU row.
+The signature table learns the context-dependent transition and emits the most
+useful prefetches, but it buys timeliness with extra migration traffic and
+hotter evictions. `hybrid` preserves that training signal while adding
+source-attributed admission and W-TinyLFU-style gating; on this local rerun it
+cuts pure-signature prefetches, unused evictions, read/write traffic, and hot
+evictions, but it still trails the conservative `markov` and `wtinylfu` rows on
+throughput and migration volume. Treat it as experimental infrastructure for
+source-aware tuning, not a default policy win.
 
 ## 9-Matrix Pipeline Pressure
 

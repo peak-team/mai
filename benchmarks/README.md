@@ -303,7 +303,9 @@ an ambiguous transition and constant-stride predictors see no stable stream.
 Control it with `MAI_BENCH_POLICY_SIGNATURE_UNIT`,
 `MAI_BENCH_POLICY_SIGNATURE_REGION_UNITS`,
 `MAI_BENCH_POLICY_SIGNATURE_PASSES`, and
-`MAI_BENCH_POLICY_SIGNATURE_SEED`.
+`MAI_BENCH_POLICY_SIGNATURE_SEED`. With `MAI_MIGRATION_POLICY=hybrid`, the
+same probe also reports source-attributed hybrid candidates, admitted
+prefetches, and useful prefetches for signature, successor, and stream legs.
 
 `policy_spatial_region_mask` is a policy-event workload for region-mask
 predictors. It divides one allocation into eight-unit regions and repeatedly

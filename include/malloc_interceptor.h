@@ -173,6 +173,19 @@ typedef struct {
     size_t policy_signature_top_delta_magnitude;
     size_t policy_signature_top_delta_sign;
     size_t policy_signature_top_score;
+    size_t policy_hybrid_signature_candidates;
+    size_t policy_hybrid_successor_candidates;
+    size_t policy_hybrid_stream_candidates;
+    size_t policy_hybrid_admission_rejected;
+    size_t policy_hybrid_signature_admitted;
+    size_t policy_hybrid_successor_admitted;
+    size_t policy_hybrid_stream_admitted;
+    size_t policy_hybrid_signature_completed;
+    size_t policy_hybrid_successor_completed;
+    size_t policy_hybrid_stream_completed;
+    size_t policy_hybrid_signature_useful;
+    size_t policy_hybrid_successor_useful;
+    size_t policy_hybrid_stream_useful;
 } MaiStats;
 
 /**
