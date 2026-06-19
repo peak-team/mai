@@ -322,6 +322,111 @@ add_test(
 )
 
 add_test(
+    NAME mai_sufficient_memory_fast_path
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_MAX_RSS=off"
+        "MAI_RECLAIM_POLICY=none"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        sufficient_memory_fast_path
+)
+
+add_test(
+    NAME mai_predictive_range_api
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_RECLAIM_POLICY=donthneed"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        predictive_range_api
+)
+
+add_test(
+    NAME mai_intrusive_access_trace
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        access_trace
+)
+
+add_test(
+    NAME mai_adaptive_heartbeat
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_RECLAIM_POLICY=donthneed"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        adaptive_heartbeat
+)
+
+add_test(
+    NAME mai_heartbeat_busy_tick_no_migration
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_RECLAIM_POLICY=donthneed"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        heartbeat_busy_no_migration
+)
+
+add_test(
+    NAME mai_heartbeat_chunk_size_sensitivity
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=2M"
+        "MAI_MIGRATION_CHUNK=4K"
+        "MAI_RECLAIM_POLICY=donthneed"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        heartbeat_chunk_sensitivity
+)
+
+add_test(
+    NAME mai_access_trace_concurrent_stress
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_RECLAIM_POLICY=none"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        access_trace_concurrent_stress
+)
+
+add_test(
+    NAME mai_heartbeat_round_robin_fairness
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=1M"
+        "MAI_RECLAIM_POLICY=none"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        heartbeat_round_robin_fairness
+)
+
+add_test(
     NAME mai_target_rss_policy_reclaim
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"
@@ -400,11 +505,151 @@ add_test(
         "MAI_PATH=${MAI_TEST_SCRATCH}"
         "MAI_THRESHOLD=4K"
         "MAI_ARENA_SIZE=1M"
+        "MAI_BACKEND=file"
         "MAI_MAX_RSS=32M"
         "LD_PRELOAD=$<TARGET_FILE:mai>"
         $<TARGET_FILE:mai_runtime_test>
         memory_cap_chunked_calloc
 )
+
+add_test(
+    NAME mai_backend_auto_pressure_prefers_file
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=32M"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=16M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        backend_auto_pressure_file
+)
+
+add_test(
+    NAME mai_file_large_allocations_use_dedicated_segments
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=32M"
+        "MAI_FILE_DEDICATED_MIN=4M"
+        "MAI_BACKEND=file"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        file_dedicated_segments
+)
+
+add_test(
+    NAME mai_legacy_stats_abi
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        legacy_stats_abi
+)
+
+add_test(
+    NAME mai_uffd_pager_auto_probe
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_UFFD_PAGER=auto"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_probe
+)
+
+add_test(
+    NAME mai_uffd_pager_required_probe
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_probe
+)
+set_tests_properties(mai_uffd_pager_required_probe PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
+    NAME mai_uffd_pager_auto_register_fallback
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=32M"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=16M"
+        "MAI_UFFD_PAGER=auto"
+        "MAI_UFFD_TEST_REGISTER_FAIL=1"
+        "MAI_MIGRATION_CHUNK=2M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_auto_register_fallback
+)
+
+add_test(
+    NAME mai_uffd_pager_faults
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=32M"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=16M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "MAI_UFFD_EXPECT_EVICTIONS=1"
+        "MAI_UFFD_RESIDENT_LIMIT=8M"
+        "MAI_MIGRATION_CHUNK=2M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_faults
+)
+set_tests_properties(mai_uffd_pager_faults PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
+    NAME mai_uffd_pager_spatial_prefetch
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=32M"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=32M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "MAI_UFFD_RESIDENT_LIMIT=64M"
+        "MAI_UFFD_PREFETCH_CHUNKS=4"
+        "MAI_MIGRATION_CHUNK=2M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_spatial_prefetch
+)
+set_tests_properties(mai_uffd_pager_spatial_prefetch PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
+    NAME mai_uffd_pager_concurrent_stress
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=32M"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=16M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "MAI_UFFD_RESIDENT_LIMIT=24M"
+        "MAI_MIGRATION_CHUNK=2M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_concurrent_stress
+)
+set_tests_properties(mai_uffd_pager_concurrent_stress PROPERTIES SKIP_RETURN_CODE 77)
 
 if(MAI_ENABLE_DOCKER_TESTS)
     add_test(
@@ -427,6 +672,7 @@ add_test(
         "MAI_PATH=${MAI_TEST_SCRATCH}"
         "MAI_THRESHOLD=4K"
         "MAI_ARENA_SIZE=8388608T"
+        "MAI_BACKEND=file"
         "LD_PRELOAD=$<TARGET_FILE:mai>"
         $<TARGET_FILE:mai_runtime_test>
         backing_failure

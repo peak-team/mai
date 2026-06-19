@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <malloc.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,8 +17,17 @@
 #include <unistd.h>
 
 typedef int (*get_stats_fn)(MaiStats*);
+typedef int (*get_stats_sized_fn)(MaiStats*, size_t);
 typedef int (*reclaim_all_fn)(void);
 typedef int (*sample_hotness_fn)(void);
+typedef int (*hint_range_fn)(void*, size_t, uint32_t, const MaiHintOptions*);
+typedef int (*reclaim_range_fn)(void*, size_t);
+typedef int (*prefetch_fn)(void*, size_t);
+typedef int (*prepare_write_fn)(void*, size_t);
+typedef int (*trace_access_fn)(void*, size_t, const MaiAccessTraceOptions*);
+typedef int (*get_access_trace_fn)(void*, MaiAccessTraceSnapshot*);
+typedef int (*stop_access_trace_fn)(void*);
+typedef int (*heartbeat_fn)(const MaiHeartbeatOptions*, MaiHeartbeatSnapshot*);
 typedef void* (*plugin_alloc_fn)(size_t);
 typedef size_t (*plugin_usable_fn)(void*);
 typedef void (*plugin_free_fn)(void*);
@@ -49,6 +60,11 @@ static int has_prefix(const char* value, const char* prefix) {
 }
 
 static int load_stats(MaiStats* stats) {
+    get_stats_sized_fn get_stats_sized =
+        (get_stats_sized_fn)dlsym(RTLD_DEFAULT, "mai_get_stats_sized");
+    if (get_stats_sized) {
+        return get_stats_sized(stats, sizeof(*stats));
+    }
     get_stats_fn get_stats = (get_stats_fn)dlsym(RTLD_DEFAULT, "mai_get_stats");
     if (!get_stats) {
         return -1;
@@ -87,7 +103,10 @@ static int stats_show_managed_alloc(const MaiStats* before, const MaiStats* afte
     return after->managed_allocations > before->managed_allocations &&
            after->managed_bytes_total >= before->managed_bytes_total + size &&
            after->live_managed_bytes >= before->live_managed_bytes + size &&
-           after->arena_segments > 0;
+           (after->anon_allocations > before->anon_allocations ||
+            after->file_allocations > before->file_allocations ||
+            after->uffd_pager_allocations > before->uffd_pager_allocations ||
+            after->arena_segments > 0);
 }
 
 static int stats_show_managed_free(const MaiStats* before, const MaiStats* after_alloc,
@@ -424,11 +443,9 @@ static int mode_large(void) {
         free(ptr);
         return fail("mai_get_stats failed after large allocation");
     }
-    if (after_alloc.managed_allocations <= before.managed_allocations ||
-        after_alloc.live_managed_bytes < before.live_managed_bytes + 8192 ||
-        after_alloc.arena_segments == 0) {
+    if (!stats_show_managed_alloc(&before, &after_alloc, 8192)) {
         free(ptr);
-        return fail("large allocation was not routed to MAI arena");
+        return fail("large allocation was not routed to MAI management");
     }
     if (visible_arena_files() != 0) {
         free(ptr);
@@ -470,7 +487,7 @@ static int mode_calloc(void) {
     }
     if (!stats_show_managed_alloc(&before, &after_alloc, 8192)) {
         free(ptr);
-        return fail("large calloc was not routed to MAI arena");
+        return fail("large calloc was not routed to MAI management");
     }
     free(ptr);
     if (load_stats(&after_free) != 0) {
@@ -526,7 +543,7 @@ static int mode_realloc(void) {
     }
     if (!stats_show_managed_alloc(&before, &after_grow, 8192)) {
         free(grown);
-        return fail("realloc growth was not routed to MAI arena");
+        return fail("realloc growth was not routed to MAI management");
     }
 
     unsigned char* grown_again = realloc(grown, 16384);
@@ -829,6 +846,700 @@ static int mode_reclaim(void) {
     return 0;
 }
 
+static int stats_reclaim_unchanged(const MaiStats* before, const MaiStats* after) {
+    return after->reclaim_calls == before->reclaim_calls &&
+           after->policy_reclaim_calls == before->policy_reclaim_calls &&
+           after->memory_cap_reclaim_calls == before->memory_cap_reclaim_calls &&
+           after->reclaimed_bytes == before->reclaimed_bytes &&
+           after->memory_cap_failures == before->memory_cap_failures;
+}
+
+static int mode_sufficient_memory_fast_path(void) {
+    MaiStats before;
+    MaiStats after;
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before sufficient-memory fast path");
+    }
+
+    const size_t size = 65536;
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("sufficient-memory allocation failed");
+    }
+    for (size_t i = 0; i < size; i += 4096) {
+        ptr[i] = (unsigned char)(i & 0xff);
+    }
+    for (size_t i = 0; i < size; i += 4096) {
+        if (ptr[i] != (unsigned char)(i & 0xff)) {
+            free(ptr);
+            return fail("sufficient-memory allocation data changed");
+        }
+    }
+
+    if (load_stats(&after) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after sufficient-memory fast path");
+    }
+    if (!stats_show_managed_alloc(&before, &after, size)) {
+        free(ptr);
+        return fail("sufficient-memory fast path did not record managed allocation");
+    }
+    if (!stats_reclaim_unchanged(&before, &after)) {
+        free(ptr);
+        return fail("sufficient-memory fast path performed reclaim");
+    }
+    if (after.anon_allocations <= before.anon_allocations ||
+        after.file_allocations != before.file_allocations ||
+        after.migrated_to_file_bytes != before.migrated_to_file_bytes ||
+        after.promoted_to_anon_bytes != before.promoted_to_anon_bytes) {
+        free(ptr);
+        return fail("sufficient-memory fast path did not stay anonymous");
+    }
+
+    free(ptr);
+    return 0;
+}
+
+static int mode_predictive_range_api(void) {
+    hint_range_fn hint_range = (hint_range_fn)dlsym(RTLD_DEFAULT, "mai_hint_range");
+    reclaim_range_fn reclaim_range =
+        (reclaim_range_fn)dlsym(RTLD_DEFAULT, "mai_reclaim_range");
+    prefetch_fn prefetch = (prefetch_fn)dlsym(RTLD_DEFAULT, "mai_prefetch");
+    prepare_write_fn prepare_write =
+        (prepare_write_fn)dlsym(RTLD_DEFAULT, "mai_prepare_write");
+    if (!hint_range || !reclaim_range || !prefetch || !prepare_write) {
+        return fail("predictive range API symbols are unavailable");
+    }
+
+    unsigned char unmanaged[256];
+    MaiHintOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.size = sizeof(opts);
+    opts.hotset_bytes = 4096;
+    opts.window_bytes = 8192;
+
+    if (hint_range(unmanaged, sizeof(unmanaged), MAI_HINT_SEQUENTIAL, &opts) != 0 ||
+        reclaim_range(unmanaged, sizeof(unmanaged)) != 0 ||
+        prefetch(unmanaged, sizeof(unmanaged)) != 0 ||
+        prepare_write(unmanaged, sizeof(unmanaged)) != 0) {
+        return fail("predictive APIs did not no-op for unmanaged memory");
+    }
+
+    errno = 0;
+    if (reclaim_range(NULL, 4096) == 0 || errno != EINVAL) {
+        return fail("mai_reclaim_range accepted NULL with nonzero length");
+    }
+    errno = 0;
+    if (hint_range(unmanaged, sizeof(unmanaged), 9999, &opts) == 0 || errno != EINVAL) {
+        return fail("mai_hint_range accepted an invalid hint kind");
+    }
+    opts.size = 0;
+    errno = 0;
+    if (hint_range(unmanaged, sizeof(unmanaged), MAI_HINT_SEQUENTIAL, &opts) == 0 ||
+        errno != EINVAL) {
+        return fail("mai_hint_range accepted invalid options size");
+    }
+    opts.size = sizeof(opts);
+
+    MaiStats before;
+    MaiStats after;
+    const size_t size = 32768;
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("predictive range allocation failed");
+    }
+
+    for (size_t i = 0; i < size; i++) {
+        ptr[i] = (unsigned char)(i & 0xff);
+    }
+    if (load_stats(&before) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed before predictive range test");
+    }
+
+    if (hint_range(ptr, 8192, MAI_HINT_SEQUENTIAL, &opts) != 0 ||
+        hint_range(ptr, 8192, MAI_HINT_RANDOM_HOTSET, &opts) != 0 ||
+        hint_range(ptr, 8192, MAI_HINT_SPARSE, &opts) != 0) {
+        free(ptr);
+        return fail("mai_hint_range rejected a valid managed hint");
+    }
+    errno = 0;
+    if (hint_range(ptr + size - 1024, 4096, MAI_HINT_SEQUENTIAL, &opts) == 0 ||
+        errno != EINVAL) {
+        free(ptr);
+        return fail("mai_hint_range accepted a partial managed overlap");
+    }
+
+    if (reclaim_range(ptr + 4096, 8192) != 0) {
+        free(ptr);
+        return fail("mai_reclaim_range failed on a valid managed range");
+    }
+    MaiStats after_reclaim;
+    if (load_stats(&after_reclaim) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after range reclaim");
+    }
+    if (after_reclaim.migrated_to_file_bytes <= before.migrated_to_file_bytes) {
+        free(ptr);
+        return fail("range reclaim did not migrate anonymous bytes to storage");
+    }
+
+    if (prefetch(ptr + 4096, 8192) != 0) {
+        free(ptr);
+        return fail("mai_prefetch failed on a valid managed range");
+    }
+
+    for (size_t i = 0; i < size; i++) {
+        if (ptr[i] != (unsigned char)(i & 0xff)) {
+            free(ptr);
+            return fail("data changed after range reclaim/prefetch");
+        }
+    }
+
+    if (load_stats(&after) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after predictive range test");
+    }
+    if (after.reclaim_calls <= before.reclaim_calls ||
+        after.reclaimed_bytes <= before.reclaimed_bytes) {
+        free(ptr);
+        return fail("range reclaim did not update reclaim stats");
+    }
+    if (after.promoted_to_anon_bytes <= after_reclaim.promoted_to_anon_bytes) {
+        free(ptr);
+        return fail("range prefetch did not promote storage-backed bytes");
+    }
+
+    MaiStats before_prepare;
+    if (load_stats(&before_prepare) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed before prepare-write test");
+    }
+    if (reclaim_range(ptr + 16384, 8192) != 0 ||
+        prepare_write(ptr + 16384, 8192) != 0) {
+        free(ptr);
+        return fail("mai_prepare_write failed on a valid managed range");
+    }
+    memset(ptr + 16384, 0x5a, 8192);
+    for (size_t i = 16384; i < 16384 + 8192; i++) {
+        if (ptr[i] != 0x5a) {
+            free(ptr);
+            return fail("prepared write range did not accept overwrite");
+        }
+    }
+    MaiStats after_prepare;
+    if (load_stats(&after_prepare) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after prepare-write test");
+    }
+    if (after_prepare.promoted_to_anon_bytes <= before_prepare.promoted_to_anon_bytes) {
+        free(ptr);
+        return fail("mai_prepare_write did not promote storage-backed bytes");
+    }
+
+    free(ptr);
+    return 0;
+}
+
+static int mode_access_trace(void) {
+    trace_access_fn trace_access =
+        (trace_access_fn)dlsym(RTLD_DEFAULT, "mai_trace_access");
+    get_access_trace_fn get_trace =
+        (get_access_trace_fn)dlsym(RTLD_DEFAULT, "mai_get_access_trace");
+    stop_access_trace_fn stop_trace =
+        (stop_access_trace_fn)dlsym(RTLD_DEFAULT, "mai_stop_access_trace");
+    if (!trace_access || !get_trace || !stop_trace) {
+        return fail("access trace symbols are unavailable");
+    }
+
+    MaiAccessTraceOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.size = sizeof(opts);
+    opts.max_pages = 4;
+
+    errno = 0;
+    if (trace_access(NULL, 4096, &opts) == 0 || errno != EINVAL) {
+        return fail("mai_trace_access accepted NULL with nonzero length");
+    }
+    opts.size = 0;
+    errno = 0;
+    unsigned char unmanaged[256];
+    if (trace_access(unmanaged, sizeof(unmanaged), &opts) == 0 || errno != EINVAL) {
+        return fail("mai_trace_access accepted invalid options size");
+    }
+    opts.size = sizeof(opts);
+    if (trace_access(unmanaged, sizeof(unmanaged), &opts) != 0) {
+        return fail("mai_trace_access did not no-op for unmanaged memory");
+    }
+
+    const size_t size = 65536;
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("access trace allocation failed");
+    }
+    memset(ptr, 0x11, size);
+
+    if (trace_access(ptr, size, &opts) != 0) {
+        free(ptr);
+        return fail("mai_trace_access failed on managed memory");
+    }
+
+    MaiAccessTraceSnapshot before_touch;
+    if (get_trace(ptr, &before_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_access_trace failed before touch");
+    }
+    if (before_touch.armed_pages == 0 ||
+        before_touch.armed_pages > opts.max_pages ||
+        before_touch.touched_pages != 0) {
+        free(ptr);
+        return fail("unexpected initial access trace snapshot");
+    }
+
+    memset(ptr, 0x5a, size);
+
+    MaiAccessTraceSnapshot after_touch;
+    if (get_trace(ptr, &after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_access_trace failed after touch");
+    }
+    if (after_touch.armed_pages != before_touch.armed_pages ||
+        after_touch.touched_pages != after_touch.armed_pages ||
+        after_touch.touched_bitmap == 0 ||
+        after_touch.first_touch_sequence == 0 ||
+        after_touch.last_touch_sequence < after_touch.first_touch_sequence) {
+        free(ptr);
+        return fail("access trace did not record sampled first touches");
+    }
+
+    if (stop_trace(ptr) != 0) {
+        free(ptr);
+        return fail("mai_stop_access_trace failed");
+    }
+    memset(ptr, 0xa5, size);
+    for (size_t i = 0; i < size; i += 4096) {
+        if (ptr[i] != 0xa5) {
+            free(ptr);
+            return fail("access trace stop did not restore access");
+        }
+    }
+
+    free(ptr);
+    return 0;
+}
+
+static int mode_adaptive_heartbeat(void) {
+    heartbeat_fn heartbeat = (heartbeat_fn)dlsym(RTLD_DEFAULT, "mai_heartbeat");
+    if (!heartbeat) {
+        return fail("mai_heartbeat symbol is unavailable");
+    }
+
+    MaiHeartbeatOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.size = sizeof(opts);
+    opts.observe_pages = 4;
+    opts.chunk_bytes = 16384;
+
+    MaiHeartbeatSnapshot snapshot;
+    errno = 0;
+    MaiHeartbeatOptions invalid = opts;
+    invalid.size = 0;
+    if (heartbeat(&invalid, &snapshot) == 0 || errno != EINVAL) {
+        return fail("mai_heartbeat accepted invalid options size");
+    }
+
+    const size_t size = 65536;
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("adaptive heartbeat allocation failed");
+    }
+    memset(ptr, 0x21, size);
+
+    if (heartbeat(&opts, &snapshot) != 0) {
+        free(ptr);
+        return fail("mai_heartbeat failed to arm initial samples");
+    }
+    if (snapshot.epoch == 0 ||
+        snapshot.observed_allocations == 0 ||
+        snapshot.armed_pages == 0 ||
+        snapshot.armed_pages > opts.observe_pages ||
+        snapshot.touched_pages != 0 ||
+        snapshot.busy) {
+        free(ptr);
+        return fail("unexpected initial heartbeat snapshot");
+    }
+
+    for (size_t offset = 0; offset < size; offset += opts.chunk_bytes) {
+        ptr[offset] = (unsigned char)(ptr[offset] + 1);
+    }
+
+    MaiHeartbeatSnapshot busy_snapshot;
+    if (heartbeat(&opts, &busy_snapshot) != 0) {
+        free(ptr);
+        return fail("mai_heartbeat failed after sampled touches");
+    }
+    if (!busy_snapshot.busy ||
+        busy_snapshot.touched_pages == 0 ||
+        busy_snapshot.armed_pages == 0 ||
+        busy_snapshot.armed_pages >= snapshot.armed_pages) {
+        free(ptr);
+        return fail("heartbeat did not adapt to busy access");
+    }
+
+    opts.migrate_bytes = 32768;
+    for (size_t quiet_epoch = 0; quiet_epoch < 2; quiet_epoch++) {
+        MaiHeartbeatSnapshot early_quiet_snapshot;
+        if (heartbeat(&opts, &early_quiet_snapshot) != 0) {
+            free(ptr);
+            return fail("mai_heartbeat failed during early quiet epoch");
+        }
+        if (early_quiet_snapshot.busy ||
+            early_quiet_snapshot.touched_pages != 0 ||
+            early_quiet_snapshot.reclaimed_bytes != 0) {
+            free(ptr);
+            return fail("heartbeat reclaimed before the minimum quiet epochs");
+        }
+    }
+
+    MaiHeartbeatSnapshot quiet_snapshot;
+    if (heartbeat(&opts, &quiet_snapshot) != 0) {
+        free(ptr);
+        return fail("mai_heartbeat failed during quiet migration");
+    }
+    if (quiet_snapshot.busy ||
+        quiet_snapshot.touched_pages != 0 ||
+        quiet_snapshot.reclaimed_bytes == 0 ||
+        quiet_snapshot.reclaimed_bytes > opts.migrate_bytes ||
+        quiet_snapshot.armed_pages < busy_snapshot.armed_pages) {
+        free(ptr);
+        return fail("heartbeat did not reclaim and re-arm during quiet epoch");
+    }
+
+    for (size_t offset = 0; offset < size; offset += opts.chunk_bytes) {
+        if (ptr[offset] != 0x22) {
+            free(ptr);
+            return fail("heartbeat migration did not preserve data");
+        }
+    }
+
+    free(ptr);
+    return 0;
+}
+
+static int mode_heartbeat_busy_no_migration(void) {
+    heartbeat_fn heartbeat = (heartbeat_fn)dlsym(RTLD_DEFAULT, "mai_heartbeat");
+    if (!heartbeat) {
+        return fail("mai_heartbeat symbol is unavailable");
+    }
+
+    const size_t size = 65536;
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("busy heartbeat allocation failed");
+    }
+    memset(ptr, 0x31, size);
+
+    MaiHeartbeatOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.size = sizeof(opts);
+    opts.observe_pages = 4;
+    opts.chunk_bytes = 16384;
+    opts.migrate_bytes = 32768;
+
+    MaiHeartbeatSnapshot snapshot;
+    if (heartbeat(&opts, &snapshot) != 0 || snapshot.armed_pages != 4) {
+        free(ptr);
+        return fail("busy heartbeat failed to arm initial samples");
+    }
+
+    for (size_t offset = 0; offset < size; offset += opts.chunk_bytes) {
+        ptr[offset] = (unsigned char)(ptr[offset] + 1);
+    }
+
+    MaiStats before;
+    MaiStats after;
+    if (load_stats(&before) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed before busy heartbeat tick");
+    }
+
+    MaiHeartbeatSnapshot busy_snapshot;
+    if (heartbeat(&opts, &busy_snapshot) != 0) {
+        free(ptr);
+        return fail("busy heartbeat tick failed");
+    }
+
+    if (load_stats(&after) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after busy heartbeat tick");
+    }
+    if (!busy_snapshot.busy ||
+        busy_snapshot.touched_pages == 0 ||
+        busy_snapshot.reclaimed_bytes != 0 ||
+        !stats_reclaim_unchanged(&before, &after)) {
+        free(ptr);
+        return fail("busy heartbeat reclaimed despite migration budget");
+    }
+
+    free(ptr);
+    return 0;
+}
+
+static int heartbeat_quiet_reclaimed_bytes(heartbeat_fn heartbeat,
+                                           size_t chunk_bytes,
+                                           size_t* reclaimed_out) {
+    const size_t observe_pages = 4;
+    const size_t size = 256 * 1024;
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return -1;
+    }
+    memset(ptr, 0x41, size);
+
+    MaiHeartbeatOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.size = sizeof(opts);
+    opts.observe_pages = observe_pages;
+    opts.chunk_bytes = chunk_bytes;
+    opts.migrate_bytes = size;
+
+    MaiHeartbeatSnapshot arm_snapshot;
+    MaiHeartbeatSnapshot first_quiet_snapshot;
+    MaiHeartbeatSnapshot second_quiet_snapshot;
+    MaiHeartbeatSnapshot reclaim_snapshot;
+    int rc = 0;
+    if (heartbeat(&opts, &arm_snapshot) != 0 ||
+        arm_snapshot.armed_pages != observe_pages ||
+        heartbeat(&opts, &first_quiet_snapshot) != 0 ||
+        first_quiet_snapshot.busy ||
+        first_quiet_snapshot.reclaimed_bytes != 0 ||
+        heartbeat(&opts, &second_quiet_snapshot) != 0 ||
+        second_quiet_snapshot.busy ||
+        second_quiet_snapshot.reclaimed_bytes != 0 ||
+        heartbeat(&opts, &reclaim_snapshot) != 0 ||
+        reclaim_snapshot.busy ||
+        reclaim_snapshot.reclaimed_bytes == 0) {
+        rc = -1;
+    } else {
+        *reclaimed_out = reclaim_snapshot.reclaimed_bytes;
+    }
+
+    for (size_t offset = 0; offset < size; offset += chunk_bytes) {
+        if (ptr[offset] != 0x41) {
+            rc = -1;
+            break;
+        }
+    }
+
+    free(ptr);
+    return rc;
+}
+
+static int mode_heartbeat_chunk_sensitivity(void) {
+    heartbeat_fn heartbeat = (heartbeat_fn)dlsym(RTLD_DEFAULT, "mai_heartbeat");
+    if (!heartbeat) {
+        return fail("mai_heartbeat symbol is unavailable");
+    }
+
+    size_t reclaimed_4k = 0;
+    size_t reclaimed_16k = 0;
+    size_t reclaimed_64k = 0;
+    if (heartbeat_quiet_reclaimed_bytes(heartbeat, 4096, &reclaimed_4k) != 0 ||
+        heartbeat_quiet_reclaimed_bytes(heartbeat, 16384, &reclaimed_16k) != 0 ||
+        heartbeat_quiet_reclaimed_bytes(heartbeat, 65536, &reclaimed_64k) != 0) {
+        return fail("heartbeat chunk sensitivity setup failed");
+    }
+
+    if (reclaimed_4k != 4 * 4096 ||
+        reclaimed_16k != 4 * 16384 ||
+        reclaimed_64k != 4 * 65536 ||
+        !(reclaimed_4k < reclaimed_16k && reclaimed_16k < reclaimed_64k)) {
+        fprintf(stderr,
+                "heartbeat reclaimed bytes did not scale with chunk size: "
+                "4K=%zu 16K=%zu 64K=%zu\n",
+                reclaimed_4k, reclaimed_16k, reclaimed_64k);
+        return 1;
+    }
+
+    return 0;
+}
+
+typedef struct {
+    unsigned char* ptr;
+    size_t size;
+    atomic_int* stop;
+    atomic_size_t touches;
+} TraceStressArgs;
+
+static void* trace_stress_worker(void* arg) {
+    TraceStressArgs* worker = (TraceStressArgs*)arg;
+    size_t pass = 0;
+
+    while (!atomic_load_explicit(worker->stop, memory_order_acquire)) {
+        for (size_t offset = 0; offset < worker->size; offset += 4096) {
+            worker->ptr[offset] = (unsigned char)((offset + pass) & 0xff);
+            atomic_fetch_add_explicit(&worker->touches, 1, memory_order_relaxed);
+        }
+        pass++;
+    }
+
+    return NULL;
+}
+
+static int mode_access_trace_concurrent_stress(void) {
+    trace_access_fn trace_access =
+        (trace_access_fn)dlsym(RTLD_DEFAULT, "mai_trace_access");
+    stop_access_trace_fn stop_trace =
+        (stop_access_trace_fn)dlsym(RTLD_DEFAULT, "mai_stop_access_trace");
+    heartbeat_fn heartbeat = (heartbeat_fn)dlsym(RTLD_DEFAULT, "mai_heartbeat");
+    if (!trace_access || !stop_trace || !heartbeat) {
+        return fail("trace stress symbols are unavailable");
+    }
+
+    const size_t size = 65536;
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("trace stress allocation failed");
+    }
+    memset(ptr, 0, size);
+
+    atomic_int stop;
+    atomic_init(&stop, 0);
+    TraceStressArgs args = {
+        .ptr = ptr,
+        .size = size,
+        .stop = &stop,
+    };
+    atomic_init(&args.touches, 0);
+
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, trace_stress_worker, &args) != 0) {
+        free(ptr);
+        return fail("trace stress worker create failed");
+    }
+
+    MaiAccessTraceOptions trace_opts;
+    memset(&trace_opts, 0, sizeof(trace_opts));
+    trace_opts.size = sizeof(trace_opts);
+    trace_opts.max_pages = 8;
+    trace_opts.chunk_bytes = 8192;
+
+    MaiHeartbeatOptions heartbeat_opts;
+    memset(&heartbeat_opts, 0, sizeof(heartbeat_opts));
+    heartbeat_opts.size = sizeof(heartbeat_opts);
+    heartbeat_opts.observe_pages = 8;
+    heartbeat_opts.chunk_bytes = 8192;
+    heartbeat_opts.migrate_bytes = 0;
+
+    int rc = 0;
+    for (size_t i = 0; i < 64; i++) {
+        if (trace_access(ptr, size, &trace_opts) != 0) {
+            rc = -1;
+            break;
+        }
+        if (i % 2 == 0) {
+            MaiHeartbeatSnapshot snapshot;
+            if (heartbeat(&heartbeat_opts, &snapshot) != 0) {
+                rc = -1;
+                break;
+            }
+        } else if (stop_trace(ptr) != 0) {
+            rc = -1;
+            break;
+        }
+    }
+
+    atomic_store_explicit(&stop, 1, memory_order_release);
+    if (pthread_join(thread, NULL) != 0) {
+        free(ptr);
+        return fail("trace stress worker join failed");
+    }
+
+    if (stop_trace(ptr) != 0) {
+        rc = -1;
+    }
+    if (atomic_load_explicit(&args.touches, memory_order_relaxed) == 0) {
+        rc = -1;
+    }
+
+    for (size_t offset = 0; offset < size; offset += 4096) {
+        ptr[offset] = 0xa7;
+        if (ptr[offset] != 0xa7) {
+            rc = -1;
+            break;
+        }
+    }
+
+    free(ptr);
+    return rc == 0 ? 0 : fail("access trace concurrent stress failed");
+}
+
+static int mode_heartbeat_round_robin_fairness(void) {
+    heartbeat_fn heartbeat = (heartbeat_fn)dlsym(RTLD_DEFAULT, "mai_heartbeat");
+    get_access_trace_fn get_trace =
+        (get_access_trace_fn)dlsym(RTLD_DEFAULT, "mai_get_access_trace");
+    if (!heartbeat || !get_trace) {
+        return fail("heartbeat fairness symbols are unavailable");
+    }
+
+    enum { allocation_count = 4 };
+    const size_t size = 16384;
+    unsigned char* ptrs[allocation_count];
+    memset(ptrs, 0, sizeof(ptrs));
+
+    for (size_t i = 0; i < allocation_count; i++) {
+        ptrs[i] = malloc(size);
+        if (!ptrs[i]) {
+            for (size_t j = 0; j < i; j++) {
+                free(ptrs[j]);
+            }
+            return fail("heartbeat fairness allocation failed");
+        }
+        memset(ptrs[i], (int)(0x20 + i), size);
+    }
+
+    MaiHeartbeatOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.size = sizeof(opts);
+    opts.observe_pages = 1;
+    opts.chunk_bytes = size;
+
+    int observed[allocation_count] = {0};
+    for (size_t epoch = 0; epoch < allocation_count; epoch++) {
+        MaiHeartbeatSnapshot snapshot;
+        if (heartbeat(&opts, &snapshot) != 0 || snapshot.armed_pages != 1) {
+            for (size_t i = 0; i < allocation_count; i++) {
+                free(ptrs[i]);
+            }
+            return fail("heartbeat fairness tick failed");
+        }
+
+        for (size_t i = 0; i < allocation_count; i++) {
+            MaiAccessTraceSnapshot trace_snapshot;
+            if (get_trace(ptrs[i], &trace_snapshot) != 0) {
+                for (size_t j = 0; j < allocation_count; j++) {
+                    free(ptrs[j]);
+                }
+                return fail("heartbeat fairness trace snapshot failed");
+            }
+            if (trace_snapshot.armed_pages != 0) {
+                observed[i] = 1;
+            }
+        }
+    }
+
+    int all_observed = 1;
+    for (size_t i = 0; i < allocation_count; i++) {
+        if (!observed[i]) {
+            all_observed = 0;
+        }
+        free(ptrs[i]);
+    }
+
+    return all_observed ? 0 :
+        fail("heartbeat did not rotate observation across allocations");
+}
+
 static int mode_mlock_exclusion(void) {
     return skip("real mlock syscall test is environment-dependent; preload_symbols covers exported mlock wrappers");
 }
@@ -925,6 +1636,427 @@ static int mode_memory_cap_chunked_calloc(void) {
         return fail("memory cap chunked calloc was not reclaimed correctly");
     }
     free(ptr);
+    return 0;
+}
+
+static int mode_backend_auto_pressure_file(void) {
+    MaiStats before;
+    MaiStats after_alloc;
+    MaiStats after_free;
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before auto backend pressure test");
+    }
+
+    size_t size = 15 * 1024 * 1024;
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("auto backend pressure allocation failed");
+    }
+    ptr[0] = 0x5a;
+    ptr[size - 1] = 0xa5;
+
+    if (load_stats(&after_alloc) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after auto backend pressure allocation");
+    }
+    if (!stats_show_managed_alloc(&before, &after_alloc, size) ||
+        after_alloc.anon_allocations <= before.anon_allocations ||
+        after_alloc.migrated_to_file_bytes <= before.migrated_to_file_bytes) {
+        free(ptr);
+        return fail("auto backend did not migrate pressure allocation to file backing");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after auto backend pressure free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes) {
+        return fail("auto backend pressure allocation leaked managed bytes");
+    }
+    return 0;
+}
+
+static int mode_legacy_stats_abi(void) {
+    typedef int (*legacy_get_stats_fn)(MaiStats*);
+    legacy_get_stats_fn legacy_get_stats =
+        (legacy_get_stats_fn)dlsym(RTLD_DEFAULT, "mai_get_stats");
+    if (!legacy_get_stats) {
+        return fail("legacy mai_get_stats symbol is unavailable");
+    }
+
+    size_t legacy_size = offsetof(MaiStats, uffd_pager_available);
+    unsigned char buffer[sizeof(MaiStats) + 32];
+    memset(buffer, 0, sizeof(buffer));
+    memset(buffer + legacy_size, 0xa5, sizeof(buffer) - legacy_size);
+
+    if (legacy_get_stats((MaiStats*)buffer) != 0) {
+        return fail("legacy mai_get_stats failed");
+    }
+    for (size_t i = legacy_size; i < sizeof(buffer); i++) {
+        if (buffer[i] != 0xa5) {
+            return fail("legacy mai_get_stats wrote past the stable stats prefix");
+        }
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_probe(void) {
+    MaiStats stats;
+    if (load_stats(&stats) != 0) {
+        return fail("mai_get_stats failed for UFFD pager probe");
+    }
+
+    if (stats.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (stats.config_error != 0) {
+        return fail("UFFD pager probe caused a configuration error");
+    }
+    if (getenv("MAI_UFFD_EXPECT_AVAILABLE") &&
+        stats.uffd_pager_available == 0) {
+        return fail("UFFD pager was expected but is unavailable");
+    }
+
+    return 0;
+}
+
+static int mode_uffd_pager_auto_register_fallback(void) {
+    MaiStats before;
+    MaiStats after_alloc;
+    MaiStats after_free;
+    const size_t size = 15 * 1024 * 1024;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD auto fallback test");
+    }
+    if (before.config_error != 0) {
+        return fail("UFFD auto fallback test started with configuration error");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("optional UFFD register failure did not fall back");
+    }
+    ptr[0] = 0x36;
+    ptr[size - 1] = 0x63;
+    if (ptr[0] != 0x36 || ptr[size - 1] != 0x63) {
+        free(ptr);
+        return fail("optional UFFD fallback allocation lost data");
+    }
+
+    if (load_stats(&after_alloc) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD auto fallback allocation");
+    }
+    if (!stats_show_managed_alloc(&before, &after_alloc, size) ||
+        after_alloc.uffd_fallbacks <= before.uffd_fallbacks ||
+        after_alloc.migrated_to_file_bytes <= before.migrated_to_file_bytes) {
+        free(ptr);
+        return fail("optional UFFD register failure did not use pressure fallback");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD auto fallback free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes) {
+        return fail("optional UFFD fallback allocation leaked managed bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_faults(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 24 * 1024 * 1024;
+    const size_t stride = 2 * 1024 * 1024;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD pager fault test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for fault test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD pager pressure allocation failed");
+    }
+
+    for (size_t i = 0; i < size; i += stride) {
+        ptr[i] = (unsigned char)((i / stride) + 1);
+    }
+    ptr[size - 1] = 0xa7;
+
+    for (size_t i = 0; i < size; i += stride) {
+        unsigned char expected = (unsigned char)((i / stride) + 1);
+        if (ptr[i] != expected) {
+            free(ptr);
+            return fail("UFFD pager lost data after fault resolution");
+        }
+    }
+    if (ptr[size - 1] != 0xa7) {
+        free(ptr);
+        return fail("UFFD pager lost tail data after fault resolution");
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD pager touches");
+    }
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_resident_bytes == 0) {
+        free(ptr);
+        return fail("UFFD pager did not service the allocation fault path");
+    }
+    if (getenv("MAI_UFFD_EXPECT_EVICTIONS") &&
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD pager resident limit did not trigger evictions");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD pager free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD pager allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_spatial_prefetch(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 16 * 1024 * 1024;
+    const size_t stride = 2 * 1024 * 1024;
+    const size_t chunks = size / stride;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD prefetch test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for prefetch test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD pager prefetch allocation failed");
+    }
+
+    for (size_t i = 0; i < size; i += stride) {
+        ptr[i] = (unsigned char)((i / stride) + 13);
+    }
+    ptr[size - 1] = 0x5d;
+
+    for (size_t i = 0; i < size; i += stride) {
+        unsigned char expected = (unsigned char)((i / stride) + 13);
+        if (ptr[i] != expected) {
+            free(ptr);
+            return fail("UFFD pager prefetch lost chunk data");
+        }
+    }
+    if (ptr[size - 1] != 0x5d) {
+        free(ptr);
+        return fail("UFFD pager prefetch lost tail data");
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD prefetch touches");
+    }
+    size_t fault_delta = after_touch.uffd_faults - before.uffd_faults;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations) {
+        fprintf(stderr,
+                "prefetch stats: managed_allocs before=%zu after=%zu "
+                "uffd_allocs before=%zu after=%zu live_before=%zu live_after=%zu\n",
+                before.managed_allocations, after_touch.managed_allocations,
+                before.uffd_pager_allocations, after_touch.uffd_pager_allocations,
+                before.live_managed_bytes, after_touch.live_managed_bytes);
+        free(ptr);
+        return fail("UFFD spatial prefetch did not use pager allocation");
+    }
+    if (fault_delta == 0 || fault_delta > (chunks / 2 + 1)) {
+        fprintf(stderr, "prefetch stats: chunks=%zu fault_delta=%zu\n",
+                chunks, fault_delta);
+        free(ptr);
+        return fail("UFFD spatial prefetch did not reduce sequential faults");
+    }
+    if (after_touch.uffd_resident_bytes < size) {
+        fprintf(stderr, "prefetch stats: resident=%zu size=%zu\n",
+                after_touch.uffd_resident_bytes, size);
+        free(ptr);
+        return fail("UFFD spatial prefetch did not keep prefetched chunks resident");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD prefetch free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD prefetch allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+typedef struct {
+    int id;
+    int iterations;
+    size_t size;
+    int failed;
+} UffdStressArgs;
+
+static void* uffd_stress_worker(void* arg) {
+    UffdStressArgs* worker = (UffdStressArgs*)arg;
+    const size_t page_stride = 4096;
+
+    for (int iter = 0; iter < worker->iterations; iter++) {
+        unsigned char value = (unsigned char)(0x30 + worker->id + iter);
+        unsigned char* ptr = malloc(worker->size);
+        if (!ptr) {
+            worker->failed = 1;
+            return NULL;
+        }
+        for (size_t offset = 0; offset < worker->size; offset += page_stride) {
+            ptr[offset] = value;
+        }
+        ptr[worker->size - 1] = (unsigned char)(value ^ 0x5a);
+        for (size_t offset = 0; offset < worker->size; offset += page_stride) {
+            if (ptr[offset] != value) {
+                worker->failed = 1;
+                free(ptr);
+                return NULL;
+            }
+        }
+        if (ptr[worker->size - 1] != (unsigned char)(value ^ 0x5a)) {
+            worker->failed = 1;
+            free(ptr);
+            return NULL;
+        }
+        free(ptr);
+    }
+
+    return NULL;
+}
+
+static int mode_uffd_pager_concurrent_stress(void) {
+    enum { thread_count = 4, iterations = 3 };
+    pthread_t threads[thread_count];
+    UffdStressArgs args[thread_count];
+    MaiStats before;
+    MaiStats after;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD concurrent stress");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for concurrent stress");
+    }
+
+    for (int i = 0; i < thread_count; i++) {
+        args[i].id = i;
+        args[i].iterations = iterations;
+        args[i].size = 12 * 1024 * 1024;
+        args[i].failed = 0;
+        if (pthread_create(&threads[i], NULL, uffd_stress_worker, &args[i]) != 0) {
+            return fail("UFFD concurrent stress thread creation failed");
+        }
+    }
+    for (int i = 0; i < thread_count; i++) {
+        if (pthread_join(threads[i], NULL) != 0) {
+            return fail("UFFD concurrent stress thread join failed");
+        }
+        if (args[i].failed) {
+            return fail("UFFD concurrent stress worker failed");
+        }
+    }
+
+    if (load_stats(&after) != 0) {
+        return fail("mai_get_stats failed after UFFD concurrent stress");
+    }
+    if (after.uffd_pager_allocations < before.uffd_pager_allocations +
+            (size_t)(thread_count * iterations) ||
+        after.uffd_faults <= before.uffd_faults ||
+        after.live_managed_bytes != before.live_managed_bytes) {
+        return fail("UFFD concurrent stress did not exercise or release pager allocations");
+    }
+    return 0;
+}
+
+static int mode_file_dedicated_segments(void) {
+    enum { count = 3 };
+    const size_t size = 8 * 1024 * 1024;
+    unsigned char* ptrs[count];
+    MaiStats before;
+    MaiStats after_alloc;
+    MaiStats after_free;
+
+    memset(ptrs, 0, sizeof(ptrs));
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before file dedicated segment test");
+    }
+
+    for (int i = 0; i < count; i++) {
+        ptrs[i] = malloc(size);
+        if (!ptrs[i]) {
+            for (int j = 0; j < i; j++) {
+                free(ptrs[j]);
+            }
+            return fail("file dedicated segment allocation failed");
+        }
+        ptrs[i][0] = (unsigned char)i;
+        ptrs[i][size - 1] = (unsigned char)(0xa0 + i);
+    }
+
+    if (load_stats(&after_alloc) != 0) {
+        for (int i = 0; i < count; i++) {
+            free(ptrs[i]);
+        }
+        return fail("mai_get_stats failed after file dedicated segment allocation");
+    }
+    if (!stats_show_managed_alloc(&before, &after_alloc, count * size) ||
+        after_alloc.file_allocations < before.file_allocations + count ||
+        after_alloc.arena_segments < before.arena_segments + count) {
+        for (int i = 0; i < count; i++) {
+            free(ptrs[i]);
+        }
+        return fail("large file-backed allocations were packed into shared arena segments");
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (ptrs[i][0] != (unsigned char)i ||
+            ptrs[i][size - 1] != (unsigned char)(0xa0 + i)) {
+            for (int j = 0; j < count; j++) {
+                free(ptrs[j]);
+            }
+            return fail("file dedicated segment allocation contents changed");
+        }
+        free(ptrs[i]);
+    }
+
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after file dedicated segment free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes) {
+        return fail("file dedicated segment allocation leaked managed bytes");
+    }
+
     return 0;
 }
 
@@ -1246,6 +2378,13 @@ static int mode_dlopen_exclusions(void) {
     if (!reclaim_all) {
         return fail("mai_reclaim_all is unavailable");
     }
+    trace_access_fn trace_access =
+        (trace_access_fn)dlsym(RTLD_DEFAULT, "mai_trace_access");
+    get_access_trace_fn get_trace =
+        (get_access_trace_fn)dlsym(RTLD_DEFAULT, "mai_get_access_trace");
+    if (!trace_access || !get_trace) {
+        return fail("access trace symbols are unavailable");
+    }
 
     void* handle = dlopen(plugin_path, RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
@@ -1367,11 +2506,39 @@ static int mode_dlopen_exclusions(void) {
         return fail("exclusion test allocation was not MAI-managed");
     }
 
+    MaiAccessTraceOptions trace_opts;
+    memset(&trace_opts, 0, sizeof(trace_opts));
+    trace_opts.size = sizeof(trace_opts);
+    trace_opts.max_pages = 2;
+    if (trace_access(ptr, size, &trace_opts) != 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("exclusion test trace setup failed");
+    }
+    MaiAccessTraceSnapshot trace_before_exclusion;
+    if (get_trace(ptr, &trace_before_exclusion) != 0 ||
+        trace_before_exclusion.armed_pages == 0) {
+        free(ptr);
+        dlclose(handle);
+        return fail("exclusion test trace did not arm");
+    }
+
     if (cuda_register(ptr, size) != 0) {
         free(ptr);
         dlclose(handle);
         return fail("plugin cudaHostRegister failed");
     }
+    MaiAccessTraceSnapshot trace_after_exclusion;
+    if (get_trace(ptr, &trace_after_exclusion) != 0 ||
+        trace_after_exclusion.armed_pages != 0 ||
+        trace_after_exclusion.touched_pages != 0) {
+        cuda_unregister(ptr);
+        free(ptr);
+        dlclose(handle);
+        return fail("CUDA register did not disarm overlapping trace");
+    }
+    ptr[0] = 0x56;
+    ptr[size - 1] = 0x57;
     if (load_stats(&after_cuda_register) != 0) {
         cuda_unregister(ptr);
         free(ptr);
@@ -1872,12 +3039,58 @@ int main(int argc, char** argv) {
     if (strcmp(argv[1], "thread") == 0) return mode_thread();
     if (strcmp(argv[1], "thread_small_stats") == 0) return mode_thread_small_stats();
     if (strcmp(argv[1], "reclaim") == 0) return mode_reclaim();
+    if (strcmp(argv[1], "sufficient_memory_fast_path") == 0) {
+        return mode_sufficient_memory_fast_path();
+    }
+    if (strcmp(argv[1], "predictive_range_api") == 0) {
+        return mode_predictive_range_api();
+    }
+    if (strcmp(argv[1], "access_trace") == 0) return mode_access_trace();
+    if (strcmp(argv[1], "adaptive_heartbeat") == 0) {
+        return mode_adaptive_heartbeat();
+    }
+    if (strcmp(argv[1], "heartbeat_busy_no_migration") == 0) {
+        return mode_heartbeat_busy_no_migration();
+    }
+    if (strcmp(argv[1], "heartbeat_chunk_sensitivity") == 0) {
+        return mode_heartbeat_chunk_sensitivity();
+    }
+    if (strcmp(argv[1], "access_trace_concurrent_stress") == 0) {
+        return mode_access_trace_concurrent_stress();
+    }
+    if (strcmp(argv[1], "heartbeat_round_robin_fairness") == 0) {
+        return mode_heartbeat_round_robin_fairness();
+    }
     if (strcmp(argv[1], "mlock_exclusion") == 0) return mode_mlock_exclusion();
     if (strcmp(argv[1], "target_rss") == 0) return mode_target_rss();
     if (strcmp(argv[1], "memory_cap_auto") == 0) return mode_memory_cap_auto();
     if (strcmp(argv[1], "memory_cap_off") == 0) return mode_memory_cap_off();
     if (strcmp(argv[1], "memory_cap_chunked_calloc") == 0) {
         return mode_memory_cap_chunked_calloc();
+    }
+    if (strcmp(argv[1], "backend_auto_pressure_file") == 0) {
+        return mode_backend_auto_pressure_file();
+    }
+    if (strcmp(argv[1], "legacy_stats_abi") == 0) {
+        return mode_legacy_stats_abi();
+    }
+    if (strcmp(argv[1], "file_dedicated_segments") == 0) {
+        return mode_file_dedicated_segments();
+    }
+    if (strcmp(argv[1], "uffd_pager_probe") == 0) {
+        return mode_uffd_pager_probe();
+    }
+    if (strcmp(argv[1], "uffd_pager_auto_register_fallback") == 0) {
+        return mode_uffd_pager_auto_register_fallback();
+    }
+    if (strcmp(argv[1], "uffd_pager_faults") == 0) {
+        return mode_uffd_pager_faults();
+    }
+    if (strcmp(argv[1], "uffd_pager_spatial_prefetch") == 0) {
+        return mode_uffd_pager_spatial_prefetch();
+    }
+    if (strcmp(argv[1], "uffd_pager_concurrent_stress") == 0) {
+        return mode_uffd_pager_concurrent_stress();
     }
     if (strcmp(argv[1], "profile") == 0) return mode_profile();
     if (strcmp(argv[1], "hotness") == 0) return mode_hotness();

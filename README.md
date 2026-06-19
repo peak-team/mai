@@ -1,31 +1,45 @@
 # MAI
 
-MAI is a user-space, privilege-free, storage-backed large-allocation tiering
-runtime for HPC workloads. It is intended for programs whose large heap
+MAI is a user-space, privilege-free, anonymous-first large-allocation tiering
+runtime for HPC workloads. It tracks large heap allocations while memory is
+sufficient, then can demote cold chunks to storage-backed mappings when reclaim
+policy or pressure requires it. It is intended for programs whose large heap
 allocations can exceed physical memory but are accessed sparsely or
 infrequently.
 
-MAI does not rely on Linux swap, kernel modules, DAMON, cgroup privileges,
-userfaultfd paging, or site-wide installation. It is used with `LD_PRELOAD`
-for dynamically linked applications. Normal allocator interception uses direct
-`LD_PRELOAD` symbols; Frida/Gum remains available internally for diagnostics
-and best-effort patching of allocator entry points that appear outside normal
-preload resolution.
+MAI's default path does not rely on Linux swap, kernel modules, DAMON, cgroup
+privileges, userfaultfd paging, or site-wide installation. It is used with
+`LD_PRELOAD` for dynamically linked applications. An optional experimental
+`userfaultfd` pager can be enabled for fault-driven migration experiments on
+hosts that allow unprivileged userfaultfd. Normal allocator interception uses
+direct `LD_PRELOAD` symbols; Frida/Gum remains available internally for
+diagnostics and best-effort patching of allocator entry points that appear
+outside normal preload resolution.
 
 ## Current Scope
 
-This version focuses on a correct storage-backed allocator with reclaim,
-diagnostics, profiling, and sampled hotness support:
+This version focuses on a correct managed allocator with reclaim, diagnostics,
+profiling, sampled hotness support, and storage demotion:
 
 - `MAI_ENABLE=1` opt-in runtime activation.
 - Small heap allocations pass through to the original allocator.
-- Allocations at or above `MAI_THRESHOLD` are routed to MAI-managed
-  file-backed `MAP_SHARED` arena segments.
-- Managed allocations are page-isolated inside arenas so page-granular reclaim
-  does not discard data from unrelated live allocations.
+- Allocations at or above `MAI_THRESHOLD` are routed to MAI-managed anonymous
+  mappings by default. This keeps sufficient-memory bandwidth close to normal
+  anonymous memory.
+- Cold managed chunks can be demoted to unlinked storage-backed `MAP_SHARED`
+  mappings during explicit or policy reclaim, and `mai_prefetch()` can promote
+  those chunks back to anonymous mappings at the same virtual addresses.
+- `MAI_UFFD_PAGER=auto|required` enables the experimental userfaultfd pager for
+  pressure-selected allocations. Missing faults populate anonymous chunks
+  directly, and a bounded adjacent-chunk prefetch window reduces repeated
+  fault overhead for spatial scans.
+- `MAI_BACKEND=file` keeps the legacy direct file-backed arena mode available
+  for experiments and storage-pressure comparisons.
 - Arena metadata is stored outside the managed arena and does not use the
   MAI-managed allocator.
-- One large backing file is used per arena segment, not per allocation.
+- Legacy file-backed mode uses one large backing file per arena segment.
+  Anonymous-first mode creates a backing file only for allocations that are
+  actually demoted.
 - Backing files are unlinked immediately after mapping to avoid stale files.
 - Basic stats, diagnostics counters, manual reclaim, and target-driven reclaim
   are available.
@@ -95,8 +109,7 @@ newly loaded DSOs that define their own exported runtime entry points:
 
 These hooks are conservative. MAI marks ranges only after the underlying API
 reports success. If a driver, MPI implementation, or RDMA stack rejects a
-MAI-managed file-backed buffer, MAI cannot force that registration to succeed
-or migrate the existing allocation into libc heap memory. Once a range is
+MAI-managed buffer, MAI cannot force that registration to succeed. Once a range is
 marked excluded, MAI will skip it during manual and target-RSS reclaim.
 Successful `mlockall(MCL_FUTURE)` also prevents future large allocations from
 being routed into MAI arenas until `munlockall()` succeeds.
@@ -132,6 +145,12 @@ MAI_TARGET_RSS=0
 MAI_MAX_RSS=auto
 MAI_RECLAIM_POLICY=none
 MAI_RECLAIM_SELECTION=oldest
+MAI_BACKEND=auto
+MAI_MIGRATION_CHUNK=2M
+MAI_UFFD_PAGER=off
+MAI_UFFD_RESIDENT_LIMIT=auto
+MAI_UFFD_RESIDENT_LOW_LIMIT=auto
+MAI_UFFD_PREFETCH_CHUNKS=4
 MAI_PROFILE=1
 MAI_HOTNESS=1
 MAI_HOTNESS_SAMPLE_PAGES=64
@@ -147,8 +166,28 @@ path from HPC-like environment variables such as `SLURM_TMPDIR`, `PBS_JOBFS`,
 default to the current working directory. If an explicit `MAI_PATH` is invalid,
 MAI disables itself.
 
-Supported size suffixes for `MAI_THRESHOLD` and `MAI_ARENA_SIZE` are `K`, `M`,
-`G`, and `T`.
+Supported size suffixes for `MAI_THRESHOLD`, `MAI_ARENA_SIZE`,
+`MAI_FILE_DEDICATED_MIN`, `MAI_MIGRATION_CHUNK`,
+`MAI_UFFD_RESIDENT_LIMIT`, and `MAI_UFFD_RESIDENT_LOW_LIMIT` are `K`, `M`, `G`,
+and `T`.
+
+`MAI_BACKEND=anon` forces anonymous-first managed allocations.
+`MAI_BACKEND=file` uses the legacy direct file-backed arena path.
+`MAI_BACKEND=auto` uses anonymous memory while the projected live managed
+footprint fits comfortably inside `MAI_MAX_RSS`; when a large allocation or the
+projected footprint approaches that cap, MAI demotes the new allocation to
+storage before returning the pointer so first-touch application code does not
+outrun the allocator-time RSS check. `MAI_AUTO_LARGE_ALLOC_CAP_PERCENT` controls
+the large-allocation cutoff as a percentage of the detected RSS cap;
+`MAI_FILE_DEDICATED_MIN` controls when direct file-backed allocations receive
+dedicated segments instead of sharing an arena.
+`MAI_MIGRATION_CHUNK` controls the demotion/promotion unit for anonymous-first
+allocations and defaults to 2 MiB for huge-page-friendly placement.
+`MAI_UFFD_PAGER=auto` tries the experimental userfaultfd pager for allocations
+that `MAI_BACKEND=auto` would otherwise demote under pressure; `required`
+turns an unavailable pager into a configuration error. `MAI_UFFD_PREFETCH_CHUNKS`
+is the total number of adjacent chunks to populate per missing fault, including
+the faulting chunk. Set it to `1` to disable spatial prefetch.
 
 `MAI_ALLOCATOR_HOOKS` controls whether MAI also patches libc allocator entry
 points with Frida/Gum:
@@ -225,6 +264,34 @@ This is a low-overhead residency proxy, not precise page access-frequency
 tracking. `mai_sample_hotness()` can be called by tests or tools to trigger a
 manual sample before shutdown.
 
+### Experimental predictive migration APIs
+
+MAI includes an experimental performance-oriented substrate for predictive
+migration policies:
+
+- `mai_hint_range(ptr, len, kind, opts)` records advisory application intent,
+  such as sequential, sparse, random hotset, or cold/reclaim-preferred ranges.
+- `mai_reclaim_range(ptr, len)` explicitly demotes a page-aligned subrange of a
+  managed allocation with the configured reclaim policy.
+- `mai_prefetch(ptr, len)` issues a bounded `MADV_WILLNEED` hint for a managed
+  range.
+- `mai_prepare_write(ptr, len)` promotes cold chunks to anonymous memory
+  without copying stale storage contents when the caller will overwrite the
+  whole range before reading it.
+- `mai_trace_access(ptr, len, opts)` intrusively samples first touches by
+  protecting a bounded number of full pages or chunk heads and handling the
+  resulting `SIGSEGV` faults. This can provide stronger access evidence for
+  performance-tuning runs, but it is intentionally intrusive and should not be
+  treated as transparent allocator behavior.
+- `mai_heartbeat(opts, snapshot)` advances one adaptive observation epoch. It
+  reduces observation and skips migration when sampled accesses are busy, then
+  demotes untouched sampled chunks within a caller-supplied migration budget
+  during quiet epochs.
+
+These APIs are best-effort, never bypass safety exclusions, and do not make
+performance guarantees. The strategy is documented in
+`docs/predictive_migration.md`.
+
 ## Build
 
 ```
@@ -255,8 +322,9 @@ GitHub Actions separates correctness from performance:
 
 - `.github/workflows/ci.yml` runs the correctness suite on pushes, pull
   requests, and manual dispatch.
-- `.github/workflows/benchmarks.yml` runs Docker access-pattern benchmarks on a
-  weekly schedule or manual dispatch and uploads the measurements as artifacts.
+- `.github/workflows/benchmarks.yml` runs non-gating overhead and pressure
+  benchmark matrices on a weekly schedule or manual dispatch and uploads the
+  measurements as artifacts.
 
 See `benchmarks/README.md` for the benchmark design and tuning knobs.
 

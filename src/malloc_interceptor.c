@@ -4,15 +4,25 @@
 
 #include <ctype.h>
 #include <dlfcn.h>
+#include <linux/userfaultfd.h>
 #include <malloc.h>
+#include <poll.h>
+#include <signal.h>
+#include <sched.h>
+#include <sys/ioctl.h>
 #include <stddef.h>
 #include <stdatomic.h>
 #include <sys/syscall.h>
+#include <time.h>
 
 #include "frida-gum.h"
 
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
+#endif
+
+#ifndef UFFD_USER_MODE_ONLY
+#define UFFD_USER_MODE_ONLY 1
 #endif
 
 #define MAI_DEFAULT_THRESHOLD (64ULL * 1024ULL * 1024ULL)
@@ -31,6 +41,22 @@
 #define MAI_ZERO_FILL_CHUNK (1024ULL * 1024ULL)
 #define MAI_MEMORY_CAP_CHECK_INTERVAL 1024
 #define MAI_MEMORY_CAP_REFRESH_INTERVAL 1024
+#define MAI_AUTO_ANON_LIMIT_PERCENT 85
+#define MAI_AUTO_LARGE_ALLOC_CAP_PERCENT 12
+#define MAI_ACCESS_TRACE_MAX_PAGES 64
+#define MAI_DEFAULT_ACCESS_TRACE_PAGES 16
+#define MAI_DEFAULT_HEARTBEAT_OBSERVE_PAGES 16
+#define MAI_DEFAULT_HEARTBEAT_CHUNK_BYTES (64ULL * 1024ULL * 1024ULL)
+#define MAI_DEFAULT_HEARTBEAT_MIN_QUIET_EPOCHS 3
+#define MAI_DEFAULT_BACKGROUND_HEARTBEAT_INTERVAL_US 1000
+#define MAI_DEFAULT_BACKGROUND_HEARTBEAT_MIGRATE_BYTES 0
+#define MAI_DEFAULT_FILE_DEDICATED_MIN_BYTES (64ULL * 1024ULL * 1024ULL)
+#define MAI_HEARTBEAT_BUSY_SCORE_CAP 1024
+#define MAI_DEFAULT_MIGRATION_CHUNK_BYTES (2ULL * 1024ULL * 1024ULL)
+#define MAI_DEFAULT_UFFD_PREFETCH_CHUNKS 4
+#define MAI_MAX_UFFD_PREFETCH_CHUNKS 16
+#define MAI_HUGEPAGE_SIZE (2ULL * 1024ULL * 1024ULL)
+#define MAI_ACCESS_TRACE_RETIRED_GRACE_NS (10ULL * 1000ULL * 1000ULL)
 
 #if defined(__GNUC__) || defined(__clang__)
 #define MAI_LIKELY(value) __builtin_expect(!!(value), 1)
@@ -56,8 +82,27 @@ typedef enum {
 } ReclaimSelection;
 
 typedef enum {
-    BACKEND_ARENA = 0
+    BACKEND_ARENA = 0,
+    BACKEND_ANON = 1,
+    BACKEND_UFFD_PAGER = 2
 } BackendType;
+
+typedef enum {
+    BACKEND_MODE_AUTO = 0,
+    BACKEND_MODE_ANON,
+    BACKEND_MODE_FILE
+} BackendMode;
+
+typedef enum {
+    UFFD_PAGER_OFF = 0,
+    UFFD_PAGER_AUTO,
+    UFFD_PAGER_REQUIRED
+} UffdPagerMode;
+
+typedef enum {
+    CHUNK_ANON_HOT = 0,
+    CHUNK_FILE_COLD = 1
+} ChunkState;
 
 typedef enum {
     EXCLUSION_MLOCK = 0,
@@ -69,6 +114,14 @@ typedef enum {
     EXCLUSION_MPI,
     EXCLUSION_RDMA
 } ExclusionKind;
+
+typedef enum {
+    ACCESS_TRACE_FREE = 0,
+    ACCESS_TRACE_ARMED = 1,
+    ACCESS_TRACE_TOUCHED = 2,
+    ACCESS_TRACE_TOUCHING = 3,
+    ACCESS_TRACE_STOPPING = 4
+} AccessTraceState;
 
 typedef enum {
     HOOK_MALLOC = 0,
@@ -120,6 +173,7 @@ typedef struct DynamicReplacement DynamicReplacement;
 typedef struct DynamicHandleRecord DynamicHandleRecord;
 typedef struct ExclusionRange ExclusionRange;
 typedef struct RegistrationRecord RegistrationRecord;
+typedef struct AccessTracePage AccessTracePage;
 
 struct ArenaBlock {
     size_t offset;
@@ -148,14 +202,41 @@ struct AllocationRecord {
     void* call_site;
     size_t allocation_seq;
     size_t reclaim_epoch;
+    uint32_t hint_kind;
+    uint32_t hint_flags;
+    size_t hint_offset;
+    size_t hint_length;
+    size_t hint_hotset_bytes;
+    size_t hint_window_bytes;
+    size_t hint_epoch;
+    size_t access_trace_id;
+    uintptr_t access_trace_start;
+    size_t access_trace_length;
+    size_t access_trace_total_pages;
+    size_t access_trace_armed_pages;
+    size_t heartbeat_last_touch_epoch;
+    size_t heartbeat_quiet_epochs;
+    size_t heartbeat_busy_score;
     size_t hotness_samples;
     size_t hotness_sampled_pages;
     size_t hotness_resident_pages;
+    int storage_fd;
+    size_t storage_length;
+    size_t chunk_bytes;
+    size_t chunk_count;
+    unsigned char* chunk_states;
+    unsigned char* chunk_has_storage;
+    size_t* chunk_touch_epochs;
+    size_t resident_bytes;
+    int uffd_registered;
+    int uffd_closing;
     ArenaSegment* segment;
     ArenaBlock* block;
     AllocationRecord* hash_next;
     AllocationRecord* live_prev;
     AllocationRecord* live_next;
+    AllocationRecord* uffd_prev;
+    AllocationRecord* uffd_next;
 };
 
 typedef struct {
@@ -213,8 +294,20 @@ struct RegistrationRecord {
     RegistrationRecord* next;
 };
 
+struct AccessTracePage {
+    atomic_int state;
+    atomic_uintptr_t page;
+    atomic_uintptr_t retired_page;
+    _Atomic(uint64_t) retired_deadline_ns;
+    _Atomic(AllocationRecord*) record;
+    atomic_size_t trace_id;
+    atomic_size_t sample_index;
+    atomic_size_t touch_sequence;
+};
+
 static GumInterceptor* malloc_interceptor = NULL;
 static pthread_mutex_t runtime_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t uffd_fault_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread int in_mai_hook MAI_TLS_INITIAL_EXEC = 0;
 static __thread PassThroughCounter* tls_pass_through_counter MAI_TLS_INITIAL_EXEC = NULL;
@@ -238,10 +331,28 @@ static size_t target_rss_bytes = 0;
 static size_t max_rss_bytes = 0;
 static int max_rss_auto = 1;
 static int max_rss_enabled = 1;
+static size_t auto_large_alloc_cap_percent = MAI_AUTO_LARGE_ALLOC_CAP_PERCENT;
 static size_t memory_cap_check_counter = 0;
 static size_t memory_cap_refresh_counter = 0;
 static ReclaimPolicy reclaim_policy = RECLAIM_NONE;
 static ReclaimSelection reclaim_selection = RECLAIM_SELECT_OLDEST;
+static BackendMode backend_mode = BACKEND_MODE_AUTO;
+static UffdPagerMode uffd_pager_mode = UFFD_PAGER_OFF;
+static int uffd_pager_available = 0;
+static int uffd_fd = -1;
+static pthread_t uffd_thread;
+static int uffd_thread_started = 0;
+static atomic_int uffd_thread_stop;
+static size_t uffd_resident_limit_bytes = 0;
+static size_t uffd_resident_low_limit_bytes = 0;
+static int uffd_resident_limit_explicit = 0;
+static size_t uffd_resident_bytes = 0;
+static size_t uffd_touch_epoch = 0;
+static void* uffd_scratch_buffer = NULL;
+static size_t uffd_scratch_length = 0;
+static size_t migration_chunk_bytes = MAI_DEFAULT_MIGRATION_CHUNK_BYTES;
+static size_t uffd_prefetch_chunks = MAI_DEFAULT_UFFD_PREFETCH_CHUNKS;
+static size_t file_dedicated_min_bytes = MAI_DEFAULT_FILE_DEDICATED_MIN_BYTES;
 static int profile_enabled = 0;
 static int hotness_enabled = 0;
 static size_t hotness_sample_pages = MAI_DEFAULT_HOTNESS_SAMPLE_PAGES;
@@ -250,14 +361,36 @@ static ArenaSegment* arena_segments = NULL;
 static size_t next_segment_id = 0;
 static AllocationRecord* allocation_buckets[MAI_TRACK_BUCKETS];
 static AllocationRecord* live_head = NULL;
+static AllocationRecord* uffd_head = NULL;
 static ProfileRecord* profile_buckets[MAI_PROFILE_BUCKETS];
 static DynamicReplacement* dynamic_replacements = NULL;
 static atomic_int dynamic_replacements_active;
 static DynamicHandleRecord* dynamic_handles = NULL;
 static ExclusionRange* exclusion_ranges = NULL;
 static RegistrationRecord* registration_records = NULL;
+static AccessTracePage access_trace_pages[MAI_ACCESS_TRACE_MAX_PAGES];
+static struct sigaction previous_sigsegv_action;
+static int access_trace_handler_installed = 0;
+static atomic_size_t access_trace_sequence;
+static size_t access_trace_id_sequence = 0;
 static size_t allocation_sequence = 0;
 static size_t reclaim_epoch = 0;
+static size_t heartbeat_epoch = 0;
+static AllocationRecord* heartbeat_cursor = NULL;
+static size_t heartbeat_min_quiet_epochs = MAI_DEFAULT_HEARTBEAT_MIN_QUIET_EPOCHS;
+static int background_heartbeat_enabled = 0;
+static size_t background_heartbeat_interval_us =
+    MAI_DEFAULT_BACKGROUND_HEARTBEAT_INTERVAL_US;
+static size_t background_heartbeat_observe_pages =
+    MAI_DEFAULT_HEARTBEAT_OBSERVE_PAGES;
+static size_t background_heartbeat_chunk_bytes =
+    MAI_DEFAULT_HEARTBEAT_CHUNK_BYTES;
+static size_t background_heartbeat_migrate_bytes =
+    MAI_DEFAULT_BACKGROUND_HEARTBEAT_MIGRATE_BYTES;
+static pthread_t background_heartbeat_thread;
+static int background_heartbeat_started = 0;
+static atomic_int background_heartbeat_stop;
+static size_t hint_epoch_sequence = 0;
 static int mlockall_future_active = 0;
 static _Atomic(uintptr_t) managed_range_low;
 static _Atomic(uintptr_t) managed_range_high;
@@ -441,6 +574,7 @@ static int custom_mlock2(const void* addr, size_t len, unsigned int flags);
 static int custom_mlockall(int flags);
 static int custom_munlock(const void* addr, size_t len);
 static int custom_munlockall(void);
+static int auto_backend_should_prefer_file_locked(size_t incoming_managed_bytes);
 static int custom_cudaHostAlloc(void** ptr, size_t size, unsigned int flags);
 static int custom_cudaMallocHost(void** ptr, size_t size);
 static int custom_cudaHostRegister(void* ptr, size_t size, unsigned int flags);
@@ -506,6 +640,25 @@ __attribute__((visibility("default"))) void* rdma_reg_write(void* id, void* addr
                                                             size_t length);
 __attribute__((visibility("default"))) int rdma_dereg_mr(void* mr);
 static size_t record_page_range(AllocationRecord* record, void** range_start);
+static int reclaim_record_range_locked(AllocationRecord* record,
+                                       void* range_start,
+                                       size_t range_length,
+                                       ReclaimPolicy policy,
+                                       size_t account_bytes);
+static AllocationRecord* free_managed_pointer_locked(void* ptr);
+static size_t effective_max_rss_locked(size_t current_rss);
+static size_t percent_of_size(size_t bytes, size_t percent);
+static int ensure_uffd_pager_started_locked(void);
+static void remove_uffd_record_locked(AllocationRecord* record);
+static int evict_uffd_chunks_locked(size_t target_bytes,
+                                   AllocationRecord* protected_record,
+                                   size_t protected_start_index,
+                                   size_t protected_end_index,
+                                   int runtime_lock_held);
+static void stop_uffd_pager(void);
+static void access_trace_sigsegv_handler(int signo, siginfo_t* info, void* context);
+static void stop_record_access_trace_locked(AllocationRecord* record);
+static void stop_all_access_traces_locked(void);
 
 static size_t max_size(size_t a, size_t b) {
     return a > b ? a : b;
@@ -1032,6 +1185,656 @@ static int ranges_overlap(uintptr_t a_start, uintptr_t a_end,
     return a_start < b_end && b_start < a_end;
 }
 
+static int hint_kind_valid(uint32_t kind) {
+    return kind == MAI_HINT_UNKNOWN ||
+           kind == MAI_HINT_NONE ||
+           kind == MAI_HINT_SEQUENTIAL ||
+           kind == MAI_HINT_SPARSE ||
+           kind == MAI_HINT_RANDOM_HOTSET ||
+           kind == MAI_HINT_COLD_RECLAIM;
+}
+
+static int hint_options_valid(const MaiHintOptions* opts) {
+    if (!opts) {
+        return 1;
+    }
+
+    return opts->size >= offsetof(MaiHintOptions, reserved);
+}
+
+static void clear_record_hint_locked(AllocationRecord* record) {
+    record->hint_kind = MAI_HINT_UNKNOWN;
+    record->hint_flags = 0;
+    record->hint_offset = 0;
+    record->hint_length = 0;
+    record->hint_hotset_bytes = 0;
+    record->hint_window_bytes = 0;
+    record->hint_epoch = 0;
+}
+
+static int range_overlaps_exclusion_locked(uintptr_t start, uintptr_t end) {
+    for (ExclusionRange* range = exclusion_ranges; range; range = range->next) {
+        if (ranges_overlap(start, end, range->start, range->end)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int record_user_range_locked(AllocationRecord* record,
+                                    uintptr_t* start,
+                                    uintptr_t* end) {
+    return make_range(record->user_ptr, record->user_size, start, end);
+}
+
+static AllocationRecord* find_record_containing_range_locked(uintptr_t start,
+                                                             uintptr_t end,
+                                                             int* partial_overlap) {
+    *partial_overlap = 0;
+
+    for (AllocationRecord* record = live_head; record; record = record->live_next) {
+        uintptr_t record_start;
+        uintptr_t record_end;
+        if (record_user_range_locked(record, &record_start, &record_end) != 0) {
+            continue;
+        }
+
+        if (!record->uffd_closing && start >= record_start && end <= record_end) {
+            return record;
+        }
+        if (ranges_overlap(start, end, record_start, record_end)) {
+            *partial_overlap = 1;
+        }
+    }
+
+    return NULL;
+}
+
+static int clamp_range_to_record_pages_locked(AllocationRecord* record,
+                                              uintptr_t start,
+                                              uintptr_t end,
+                                              void** page_start_out,
+                                              size_t* page_length_out) {
+    void* record_page_start_ptr = NULL;
+    size_t record_page_length = record_page_range(record, &record_page_start_ptr);
+    if (record_page_length == 0) {
+        *page_start_out = NULL;
+        *page_length_out = 0;
+        return 0;
+    }
+
+    uintptr_t page_mask = (uintptr_t)page_size - 1;
+    uintptr_t record_page_start = (uintptr_t)record_page_start_ptr;
+    uintptr_t record_page_end = record_page_start + record_page_length;
+    uintptr_t page_start = start & ~page_mask;
+    uintptr_t page_end;
+
+    if (end > UINTPTR_MAX - page_mask) {
+        page_end = UINTPTR_MAX & ~page_mask;
+    } else {
+        page_end = (end + page_mask) & ~page_mask;
+    }
+
+    if (page_start < record_page_start) {
+        page_start = record_page_start;
+    }
+    if (page_end > record_page_end) {
+        page_end = record_page_end;
+    }
+
+    if (page_end <= page_start) {
+        *page_start_out = NULL;
+        *page_length_out = 0;
+        return 0;
+    }
+
+    *page_start_out = (void*)page_start;
+    *page_length_out = (size_t)(page_end - page_start);
+    return 0;
+}
+
+static int full_user_page_range(uintptr_t start,
+                                uintptr_t end,
+                                uintptr_t* page_start_out,
+                                size_t* total_pages_out) {
+    uintptr_t page_start = align_up_uintptr(start, page_size);
+    uintptr_t page_end = end & ~((uintptr_t)page_size - 1);
+
+    if (page_end <= page_start) {
+        *page_start_out = 0;
+        *total_pages_out = 0;
+        return 0;
+    }
+
+    *page_start_out = page_start;
+    *total_pages_out = (size_t)((page_end - page_start) / page_size);
+    return 0;
+}
+
+static int access_trace_options_valid(const MaiAccessTraceOptions* opts) {
+    if (!opts) {
+        return 1;
+    }
+
+    return opts->size >= offsetof(MaiAccessTraceOptions, reserved);
+}
+
+static int heartbeat_options_valid(const MaiHeartbeatOptions* opts) {
+    if (!opts) {
+        return 1;
+    }
+
+    return opts->size >= offsetof(MaiHeartbeatOptions, reserved);
+}
+
+static size_t access_trace_chunk_pages(size_t chunk_bytes) {
+    if (chunk_bytes == 0) {
+        return 0;
+    }
+
+    size_t aligned = align_up_size(chunk_bytes, page_size);
+    if (aligned == 0) {
+        return SIZE_MAX / page_size;
+    }
+    if (aligned < page_size) {
+        return 1;
+    }
+    return aligned / page_size;
+}
+
+static size_t access_trace_requested_pages_from_values(size_t max_pages,
+                                                       size_t chunk_pages,
+                                                       size_t total_pages) {
+    size_t requested = max_pages == 0 ? MAI_DEFAULT_ACCESS_TRACE_PAGES : max_pages;
+
+    if (requested > MAI_ACCESS_TRACE_MAX_PAGES) {
+        requested = MAI_ACCESS_TRACE_MAX_PAGES;
+    }
+    if (requested > total_pages) {
+        requested = total_pages;
+    }
+    if (chunk_pages != 0 && requested != 0) {
+        size_t chunk_samples =
+            total_pages / chunk_pages + (total_pages % chunk_pages != 0);
+        if (requested > chunk_samples) {
+            requested = chunk_samples;
+        }
+    }
+    return requested;
+}
+
+static size_t access_trace_sample_page_index(size_t sample_index,
+                                             size_t requested_pages,
+                                             size_t total_pages,
+                                             size_t chunk_pages,
+                                             size_t chunk_phase_pages) {
+    if (chunk_pages != 0) {
+        size_t page_index = sample_index * chunk_pages;
+        size_t phase = chunk_phase_pages < chunk_pages ?
+            chunk_phase_pages : chunk_pages - 1;
+        if (page_index <= SIZE_MAX - phase) {
+            page_index += phase;
+        } else {
+            page_index = total_pages - 1;
+        }
+        return page_index < total_pages ? page_index : total_pages - 1;
+    }
+
+    return (sample_index * total_pages) / requested_pages;
+}
+
+static size_t heartbeat_chunk_phase_pages(size_t chunk_pages, size_t epoch) {
+    if (chunk_pages <= 1) {
+        return 0;
+    }
+
+    switch ((epoch == 0 ? 0 : epoch - 1) % 3) {
+    case 0:
+        return 0;
+    case 1:
+        return chunk_pages / 2;
+    default:
+        return chunk_pages - 1;
+    }
+}
+
+static void clear_record_access_trace_locked(AllocationRecord* record) {
+    record->access_trace_id = 0;
+    record->access_trace_start = 0;
+    record->access_trace_length = 0;
+    record->access_trace_total_pages = 0;
+    record->access_trace_armed_pages = 0;
+}
+
+static void dispatch_previous_sigsegv(int signo, siginfo_t* info, void* context) {
+    if ((previous_sigsegv_action.sa_flags & SA_SIGINFO) &&
+        previous_sigsegv_action.sa_sigaction) {
+        previous_sigsegv_action.sa_sigaction(signo, info, context);
+        return;
+    }
+
+    if (previous_sigsegv_action.sa_handler == SIG_IGN) {
+        return;
+    }
+    if (previous_sigsegv_action.sa_handler &&
+        previous_sigsegv_action.sa_handler != SIG_DFL) {
+        previous_sigsegv_action.sa_handler(signo);
+        return;
+    }
+
+    (void)sigaction(SIGSEGV, &previous_sigsegv_action, NULL);
+    (void)raise(SIGSEGV);
+}
+
+static uint64_t monotonic_time_ns_signal_safe(void) {
+    struct timespec ts;
+    if (syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void access_trace_sigsegv_handler(int signo, siginfo_t* info, void* context) {
+    int saved_errno = errno;
+    uintptr_t fault = (uintptr_t)info->si_addr;
+    uintptr_t page = fault & ~((uintptr_t)page_size - 1);
+
+    for (size_t i = 0; i < MAI_ACCESS_TRACE_MAX_PAGES; i++) {
+        AccessTracePage* trace_page = &access_trace_pages[i];
+        uintptr_t trace_page_addr =
+            atomic_load_explicit(&trace_page->page, memory_order_acquire);
+        if (trace_page_addr != page) {
+            continue;
+        }
+
+        int state = atomic_load_explicit(&trace_page->state, memory_order_acquire);
+        if (state == ACCESS_TRACE_STOPPING ||
+            state == ACCESS_TRACE_TOUCHING ||
+            state == ACCESS_TRACE_TOUCHED) {
+            if (syscall(SYS_mprotect, (void*)trace_page_addr, page_size,
+                        PROT_READ | PROT_WRITE) == 0) {
+                errno = saved_errno;
+                return;
+            }
+            break;
+        }
+
+        if (state != ACCESS_TRACE_ARMED) {
+            continue;
+        }
+
+        int expected = ACCESS_TRACE_ARMED;
+        if (!atomic_compare_exchange_strong_explicit(&trace_page->state,
+                                                     &expected,
+                                                     ACCESS_TRACE_TOUCHING,
+                                                     memory_order_acq_rel,
+                                                     memory_order_acquire)) {
+            if (expected == ACCESS_TRACE_STOPPING ||
+                expected == ACCESS_TRACE_TOUCHING ||
+                expected == ACCESS_TRACE_TOUCHED) {
+                if (syscall(SYS_mprotect, (void*)trace_page_addr, page_size,
+                            PROT_READ | PROT_WRITE) == 0) {
+                    errno = saved_errno;
+                    return;
+                }
+                break;
+            }
+            continue;
+        }
+
+        if (syscall(SYS_mprotect, (void*)trace_page_addr, page_size,
+                    PROT_READ | PROT_WRITE) == 0) {
+            size_t sequence = atomic_fetch_add_explicit(&access_trace_sequence, 1,
+                                                        memory_order_relaxed) + 1;
+            atomic_store_explicit(&trace_page->touch_sequence, sequence,
+                                  memory_order_release);
+            atomic_store_explicit(&trace_page->state, ACCESS_TRACE_TOUCHED,
+                                  memory_order_release);
+            errno = saved_errno;
+            return;
+        }
+        atomic_store_explicit(&trace_page->state, ACCESS_TRACE_ARMED,
+                              memory_order_release);
+        break;
+    }
+
+    for (size_t i = 0; i < MAI_ACCESS_TRACE_MAX_PAGES; i++) {
+        AccessTracePage* trace_page = &access_trace_pages[i];
+        uintptr_t retired_page =
+            atomic_load_explicit(&trace_page->retired_page, memory_order_acquire);
+        if (retired_page != page) {
+            continue;
+        }
+
+        uint64_t deadline =
+            atomic_load_explicit(&trace_page->retired_deadline_ns,
+                                 memory_order_acquire);
+        uint64_t now = monotonic_time_ns_signal_safe();
+        if (deadline == 0 || now == 0 || now > deadline) {
+            uintptr_t expected = retired_page;
+            (void)atomic_compare_exchange_strong_explicit(
+                &trace_page->retired_page, &expected, 0,
+                memory_order_acq_rel, memory_order_acquire);
+            break;
+        }
+
+        uintptr_t expected = retired_page;
+        if (atomic_compare_exchange_strong_explicit(&trace_page->retired_page,
+                                                    &expected, 0,
+                                                    memory_order_acq_rel,
+                                                    memory_order_acquire) &&
+            syscall(SYS_mprotect, (void*)retired_page, page_size,
+                    PROT_READ | PROT_WRITE) == 0) {
+            atomic_store_explicit(&trace_page->retired_deadline_ns, 0,
+                                  memory_order_release);
+            errno = saved_errno;
+            return;
+        }
+        break;
+    }
+
+    errno = saved_errno;
+    dispatch_previous_sigsegv(signo, info, context);
+}
+
+static int install_access_trace_handler_locked(void) {
+    if (access_trace_handler_installed) {
+        return 0;
+    }
+
+    struct sigaction current;
+    memset(&current, 0, sizeof(current));
+    if (sigaction(SIGSEGV, NULL, &current) != 0) {
+        return -1;
+    }
+
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    sigemptyset(&action.sa_mask);
+    action.sa_sigaction = access_trace_sigsegv_handler;
+    action.sa_flags = SA_SIGINFO;
+#ifdef SA_ONSTACK
+    action.sa_flags |= current.sa_flags & SA_ONSTACK;
+#endif
+
+    if (sigaction(SIGSEGV, &action, &previous_sigsegv_action) != 0) {
+        return -1;
+    }
+
+    access_trace_handler_installed = 1;
+    return 0;
+}
+
+static void restore_access_trace_handler(void) {
+    if (!access_trace_handler_installed) {
+        return;
+    }
+
+    struct sigaction current;
+    memset(&current, 0, sizeof(current));
+    if (sigaction(SIGSEGV, NULL, &current) == 0 &&
+        (current.sa_flags & SA_SIGINFO) &&
+        current.sa_sigaction == access_trace_sigsegv_handler) {
+        (void)sigaction(SIGSEGV, &previous_sigsegv_action, NULL);
+    }
+    memset(&previous_sigsegv_action, 0, sizeof(previous_sigsegv_action));
+    access_trace_handler_installed = 0;
+}
+
+static int access_trace_page_busy_locked(uintptr_t page) {
+    for (size_t i = 0; i < MAI_ACCESS_TRACE_MAX_PAGES; i++) {
+        AccessTracePage* trace_page = &access_trace_pages[i];
+        int state = atomic_load_explicit(&trace_page->state, memory_order_acquire);
+        uintptr_t trace_page_addr =
+            atomic_load_explicit(&trace_page->page, memory_order_acquire);
+        if (state != ACCESS_TRACE_FREE && trace_page_addr == page) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static AccessTracePage* find_free_access_trace_page_locked(void) {
+    for (size_t i = 0; i < MAI_ACCESS_TRACE_MAX_PAGES; i++) {
+        AccessTracePage* trace_page = &access_trace_pages[i];
+        if (atomic_load_explicit(&trace_page->state, memory_order_acquire) ==
+            ACCESS_TRACE_FREE) {
+            return trace_page;
+        }
+    }
+
+    return NULL;
+}
+
+static void reset_trace_page(AccessTracePage* trace_page) {
+    uintptr_t page = atomic_load_explicit(&trace_page->page, memory_order_acquire);
+    uint64_t now = monotonic_time_ns_signal_safe();
+    if (page != 0 && now != 0) {
+        atomic_store_explicit(&trace_page->retired_deadline_ns,
+                              now + MAI_ACCESS_TRACE_RETIRED_GRACE_NS,
+                              memory_order_release);
+        atomic_store_explicit(&trace_page->retired_page, page,
+                              memory_order_release);
+    } else {
+        atomic_store_explicit(&trace_page->retired_deadline_ns, 0,
+                              memory_order_release);
+        atomic_store_explicit(&trace_page->retired_page, 0,
+                              memory_order_release);
+    }
+    atomic_store_explicit(&trace_page->page, 0, memory_order_release);
+    atomic_store_explicit(&trace_page->record, NULL, memory_order_release);
+    atomic_store_explicit(&trace_page->trace_id, 0, memory_order_relaxed);
+    atomic_store_explicit(&trace_page->sample_index, 0, memory_order_relaxed);
+    atomic_store_explicit(&trace_page->touch_sequence, 0, memory_order_relaxed);
+    atomic_store_explicit(&trace_page->state, ACCESS_TRACE_FREE,
+                          memory_order_release);
+}
+
+static void stop_trace_page_locked(AccessTracePage* trace_page) {
+    for (;;) {
+        int state = atomic_load_explicit(&trace_page->state, memory_order_acquire);
+        if (state == ACCESS_TRACE_FREE) {
+            return;
+        }
+
+        uintptr_t page =
+            atomic_load_explicit(&trace_page->page, memory_order_acquire);
+        if (state == ACCESS_TRACE_ARMED) {
+            int expected = ACCESS_TRACE_ARMED;
+            if (!atomic_compare_exchange_strong_explicit(&trace_page->state,
+                                                         &expected,
+                                                         ACCESS_TRACE_STOPPING,
+                                                         memory_order_acq_rel,
+                                                         memory_order_acquire)) {
+                continue;
+            }
+            (void)mprotect((void*)page, page_size, PROT_READ | PROT_WRITE);
+            reset_trace_page(trace_page);
+            return;
+        }
+
+        if (state == ACCESS_TRACE_TOUCHING) {
+            sched_yield();
+            continue;
+        }
+
+        if (state == ACCESS_TRACE_STOPPING) {
+            (void)mprotect((void*)page, page_size, PROT_READ | PROT_WRITE);
+        }
+        reset_trace_page(trace_page);
+        return;
+    }
+}
+
+static void stop_record_access_trace_locked(AllocationRecord* record) {
+    if (!record || record->access_trace_id == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < MAI_ACCESS_TRACE_MAX_PAGES; i++) {
+        AccessTracePage* trace_page = &access_trace_pages[i];
+        int state = atomic_load_explicit(&trace_page->state, memory_order_acquire);
+        AllocationRecord* trace_record =
+            atomic_load_explicit(&trace_page->record, memory_order_acquire);
+        size_t trace_id =
+            atomic_load_explicit(&trace_page->trace_id, memory_order_acquire);
+        if (state == ACCESS_TRACE_FREE ||
+            trace_record != record ||
+            trace_id != record->access_trace_id) {
+            continue;
+        }
+
+        stop_trace_page_locked(trace_page);
+    }
+
+    clear_record_access_trace_locked(record);
+}
+
+static void stop_all_access_traces_locked(void) {
+    for (AllocationRecord* record = live_head; record; record = record->live_next) {
+        stop_record_access_trace_locked(record);
+    }
+
+    for (size_t i = 0; i < MAI_ACCESS_TRACE_MAX_PAGES; i++) {
+        AccessTracePage* trace_page = &access_trace_pages[i];
+        int state = atomic_load_explicit(&trace_page->state, memory_order_acquire);
+        if (state != ACCESS_TRACE_FREE) {
+            stop_trace_page_locked(trace_page);
+        }
+    }
+}
+
+static int arm_record_access_trace_locked(AllocationRecord* record,
+                                          uintptr_t start,
+                                          uintptr_t end,
+                                          size_t max_pages,
+                                          size_t chunk_bytes,
+                                          size_t chunk_phase_pages,
+                                          size_t* armed_pages_out) {
+    if (armed_pages_out) {
+        *armed_pages_out = 0;
+    }
+    if (range_overlaps_exclusion_locked(start, end)) {
+        return 0;
+    }
+
+    if (install_access_trace_handler_locked() != 0) {
+        return -1;
+    }
+
+    stop_record_access_trace_locked(record);
+
+    uintptr_t page_start = 0;
+    size_t total_pages = 0;
+    (void)full_user_page_range(start, end, &page_start, &total_pages);
+    if (total_pages == 0) {
+        return 0;
+    }
+
+    size_t chunk_pages = access_trace_chunk_pages(chunk_bytes);
+    size_t requested_pages =
+        access_trace_requested_pages_from_values(max_pages, chunk_pages,
+                                                 total_pages);
+    if (requested_pages == 0) {
+        return 0;
+    }
+
+    size_t trace_id = ++access_trace_id_sequence;
+    size_t armed_pages = 0;
+    int rc = 0;
+    for (size_t i = 0; i < requested_pages; i++) {
+        size_t page_index =
+            access_trace_sample_page_index(i, requested_pages, total_pages,
+                                           chunk_pages, chunk_phase_pages);
+        uintptr_t page = page_start + page_index * page_size;
+        if (access_trace_page_busy_locked(page)) {
+            errno = EBUSY;
+            rc = -1;
+            break;
+        }
+
+        AccessTracePage* trace_page = find_free_access_trace_page_locked();
+        if (!trace_page) {
+            errno = ENOMEM;
+            rc = -1;
+            break;
+        }
+
+        atomic_store_explicit(&trace_page->page, page, memory_order_release);
+        atomic_store_explicit(&trace_page->record, record, memory_order_release);
+        atomic_store_explicit(&trace_page->trace_id, trace_id,
+                              memory_order_release);
+        atomic_store_explicit(&trace_page->sample_index, i,
+                              memory_order_release);
+        atomic_store_explicit(&trace_page->touch_sequence, 0, memory_order_relaxed);
+        atomic_store_explicit(&trace_page->state, ACCESS_TRACE_ARMED,
+                              memory_order_release);
+
+        if (mprotect((void*)page, page_size, PROT_NONE) != 0) {
+            reset_trace_page(trace_page);
+            rc = -1;
+            break;
+        }
+        armed_pages++;
+    }
+
+    if (rc == 0) {
+        record->access_trace_id = trace_id;
+        record->access_trace_start = page_start;
+        record->access_trace_length = total_pages * page_size;
+        record->access_trace_total_pages = total_pages;
+        record->access_trace_armed_pages = armed_pages;
+        if (armed_pages_out) {
+            *armed_pages_out = armed_pages;
+        }
+    } else {
+        record->access_trace_id = trace_id;
+        stop_record_access_trace_locked(record);
+    }
+
+    return rc;
+}
+
+static void record_access_trace_counts_locked(AllocationRecord* record,
+                                              size_t* armed_pages_out,
+                                              size_t* touched_pages_out) {
+    size_t armed_pages = 0;
+    size_t touched_pages = 0;
+
+    if (record && record->access_trace_id != 0) {
+        for (size_t i = 0; i < MAI_ACCESS_TRACE_MAX_PAGES; i++) {
+            AccessTracePage* trace_page = &access_trace_pages[i];
+            int state = atomic_load_explicit(&trace_page->state,
+                                             memory_order_acquire);
+            AllocationRecord* trace_record =
+                atomic_load_explicit(&trace_page->record, memory_order_acquire);
+            size_t trace_id =
+                atomic_load_explicit(&trace_page->trace_id, memory_order_acquire);
+            if (state == ACCESS_TRACE_FREE ||
+                trace_record != record ||
+                trace_id != record->access_trace_id) {
+                continue;
+            }
+
+            armed_pages++;
+            size_t sequence = atomic_load_explicit(&trace_page->touch_sequence,
+                                                   memory_order_acquire);
+            if (state == ACCESS_TRACE_TOUCHED || sequence != 0) {
+                touched_pages++;
+            }
+        }
+    }
+
+    if (armed_pages_out) {
+        *armed_pages_out = armed_pages;
+    }
+    if (touched_pages_out) {
+        *touched_pages_out = touched_pages;
+    }
+}
+
 static int add_exclusion_range_locked(void* ptr, size_t length, ExclusionKind kind,
                                       void* token) {
     uintptr_t start;
@@ -1051,6 +1854,18 @@ static int add_exclusion_range_locked(void* ptr, size_t length, ExclusionKind ki
     range->token = token;
     range->next = exclusion_ranges;
     exclusion_ranges = range;
+
+    for (AllocationRecord* record = live_head; record; record = record->live_next) {
+        uintptr_t record_start;
+        uintptr_t record_end;
+        if (record->access_trace_id == 0 ||
+            record_user_range_locked(record, &record_start, &record_end) != 0) {
+            continue;
+        }
+        if (ranges_overlap(start, end, record_start, record_end)) {
+            stop_record_access_trace_locked(record);
+        }
+    }
 
     stats_snapshot.excluded_ranges++;
     stats_snapshot.excluded_bytes += length;
@@ -1182,17 +1997,11 @@ static void remove_exclusion_token_locked(void* token, ExclusionKind kind) {
 static int record_overlaps_exclusion_locked(AllocationRecord* record) {
     uintptr_t start;
     uintptr_t end;
-    if (make_range(record->user_ptr, record->user_size, &start, &end) != 0) {
+    if (record_user_range_locked(record, &start, &end) != 0) {
         return 0;
     }
 
-    for (ExclusionRange* range = exclusion_ranges; range; range = range->next) {
-        if (ranges_overlap(start, end, range->start, range->end)) {
-            return 1;
-        }
-    }
-
-    return 0;
+    return range_overlaps_exclusion_locked(start, end);
 }
 
 static void mark_all_live_excluded_locked(ExclusionKind kind) {
@@ -2018,6 +2827,9 @@ static void insert_record_locked(AllocationRecord* record) {
         live_head->live_prev = record;
     }
     live_head = record;
+    if (!heartbeat_cursor) {
+        heartbeat_cursor = record;
+    }
 }
 
 static AllocationRecord* find_record_locked(void* ptr) {
@@ -2042,6 +2854,11 @@ static AllocationRecord* take_record_locked(void* ptr) {
         if (record->user_ptr != ptr) {
             previous = record;
             continue;
+        }
+
+        if (heartbeat_cursor == record) {
+            heartbeat_cursor = record->live_next ? record->live_next :
+                (record->live_prev ? live_head : NULL);
         }
 
         if (previous) {
@@ -2114,11 +2931,96 @@ static int build_arena_template(char* buffer, size_t buffer_size) {
     return 0;
 }
 
+static int create_unlinked_backing_file(size_t length) {
+    char filename[PATH_MAX];
+    int fd;
+    int saved_errno;
+
+    if (length == 0 || build_arena_template(filename, sizeof(filename)) != 0) {
+        return -1;
+    }
+
+    fd = mkstemp(filename);
+    if (fd == -1) {
+        return -1;
+    }
+    if (unlink(filename) != 0) {
+        saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (ftruncate(fd, (off_t)length) != 0) {
+        saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    return fd;
+}
+
+static int write_all_at(int fd, const void* buffer, size_t length, off_t offset) {
+    const unsigned char* cursor = (const unsigned char*)buffer;
+    size_t written_total = 0;
+
+    while (written_total < length) {
+        ssize_t written = pwrite(fd, cursor + written_total,
+                                 length - written_total,
+                                 offset + (off_t)written_total);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (written == 0) {
+            errno = ENOSPC;
+            return -1;
+        }
+        written_total += (size_t)written;
+    }
+
+    return 0;
+}
+
+static size_t file_segment_length_for_request(size_t minimum_size) {
+    if (file_dedicated_min_bytes != 0 &&
+        minimum_size >= file_dedicated_min_bytes) {
+        return minimum_size;
+    }
+    return max_size(arena_size_bytes, minimum_size);
+}
+
+static int read_all_at(int fd, void* buffer, size_t length, off_t offset) {
+    unsigned char* cursor = (unsigned char*)buffer;
+    size_t read_total = 0;
+
+    while (read_total < length) {
+        ssize_t nread = pread(fd, cursor + read_total,
+                              length - read_total,
+                              offset + (off_t)read_total);
+        if (nread < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (nread == 0) {
+            memset(cursor + read_total, 0, length - read_total);
+            break;
+        }
+        read_total += (size_t)nread;
+    }
+
+    return 0;
+}
+
 static ArenaSegment* create_segment_locked(size_t minimum_size) {
     char filename[PATH_MAX];
     int fd = -1;
     int saved_errno;
-    size_t length = max_size(arena_size_bytes, minimum_size);
+    size_t length = file_segment_length_for_request(minimum_size);
     ArenaSegment* segment = NULL;
     ArenaBlock* block = NULL;
     void* base;
@@ -2274,20 +3176,288 @@ static AllocationRecord* carve_block_locked(ArenaBlock* block, size_t user_size,
     record->call_site = call_site;
     record->allocation_seq = ++allocation_sequence;
     record->reclaim_epoch = 0;
+    record->hint_kind = MAI_HINT_UNKNOWN;
+    record->hint_flags = 0;
+    record->hint_offset = 0;
+    record->hint_length = 0;
+    record->hint_hotset_bytes = 0;
+    record->hint_window_bytes = 0;
+    record->hint_epoch = 0;
+    record->access_trace_id = 0;
+    record->access_trace_start = 0;
+    record->access_trace_length = 0;
+    record->access_trace_total_pages = 0;
+    record->access_trace_armed_pages = 0;
+    record->heartbeat_last_touch_epoch = 0;
+    record->heartbeat_quiet_epochs = 0;
+    record->heartbeat_busy_score = 0;
     record->hotness_samples = 0;
     record->hotness_sampled_pages = 0;
     record->hotness_resident_pages = 0;
+    record->storage_fd = -1;
+    record->storage_length = 0;
+    record->chunk_bytes = migration_chunk_bytes;
+    record->chunk_count = 0;
+    record->chunk_states = NULL;
+    record->chunk_has_storage = NULL;
+    record->chunk_touch_epochs = NULL;
+    record->resident_bytes = 0;
+    record->uffd_registered = 0;
     record->segment = block->segment;
     record->block = block;
     record->hash_next = NULL;
     record->live_prev = NULL;
     record->live_next = NULL;
+    record->uffd_prev = NULL;
+    record->uffd_next = NULL;
 
     insert_record_locked(record);
     stats_note_managed_alloc(user_size);
+    stats_snapshot.file_allocations++;
     note_profile_locked(call_site, user_size);
 
     return record;
+}
+
+static size_t managed_chunk_count(size_t mapped_length, size_t chunk_bytes) {
+    if (chunk_bytes == 0) {
+        return 0;
+    }
+    return mapped_length / chunk_bytes + (mapped_length % chunk_bytes != 0);
+}
+
+static AllocationRecord* managed_anon_alloc_locked(size_t size, size_t alignment,
+                                                   void* call_site) {
+    size_t user_size = align_up_size(size, page_size);
+    size_t effective_alignment = alignment;
+    size_t mapped_length;
+    void* base;
+    uintptr_t aligned_start;
+    AllocationRecord* record = NULL;
+
+    if (size == 0 || user_size == 0 || !is_power_of_two(alignment)) {
+        return NULL;
+    }
+    if (effective_alignment < default_alignment()) {
+        effective_alignment = default_alignment();
+    }
+    if (effective_alignment < page_size) {
+        effective_alignment = page_size;
+    }
+    if (size >= MAI_HUGEPAGE_SIZE && effective_alignment < MAI_HUGEPAGE_SIZE) {
+        effective_alignment = MAI_HUGEPAGE_SIZE;
+    }
+    if (add_overflow(user_size, effective_alignment, &mapped_length) != 0) {
+        return NULL;
+    }
+    mapped_length = align_up_size(mapped_length, page_size);
+    if (mapped_length == 0) {
+        return NULL;
+    }
+
+    base = mmap(NULL, mapped_length, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        return NULL;
+    }
+
+    aligned_start = align_up_uintptr((uintptr_t)base, effective_alignment);
+    if (aligned_start < (uintptr_t)base ||
+        aligned_start + user_size > (uintptr_t)base + mapped_length) {
+        munmap(base, mapped_length);
+        errno = ENOMEM;
+        return NULL;
+    }
+
+#ifdef MADV_HUGEPAGE
+    (void)madvise((void*)aligned_start, user_size, MADV_HUGEPAGE);
+#endif
+
+    record = meta_alloc(sizeof(*record));
+    if (!record) {
+        munmap(base, mapped_length);
+        errno = ENOMEM;
+        return NULL;
+    }
+    memset(record, 0, sizeof(*record));
+
+    record->user_ptr = (void*)aligned_start;
+    record->base_ptr = base;
+    record->user_size = size;
+    record->mapped_length = mapped_length;
+    record->alignment = effective_alignment;
+    record->backend = BACKEND_ANON;
+    record->call_site = call_site;
+    record->allocation_seq = ++allocation_sequence;
+    record->hint_kind = MAI_HINT_UNKNOWN;
+    record->storage_fd = -1;
+    record->chunk_bytes = migration_chunk_bytes;
+    record->chunk_count = managed_chunk_count(user_size, record->chunk_bytes);
+    if (record->chunk_count != 0) {
+        record->chunk_states = meta_alloc(record->chunk_count);
+        if (!record->chunk_states) {
+            meta_free(record);
+            munmap(base, mapped_length);
+            errno = ENOMEM;
+            return NULL;
+        }
+        memset(record->chunk_states, CHUNK_ANON_HOT, record->chunk_count);
+    }
+
+    insert_record_locked(record);
+    stats_note_managed_alloc(size);
+    stats_snapshot.anon_allocations++;
+    note_profile_locked(call_site, size);
+    update_managed_range(base, mapped_length);
+
+    return record;
+}
+
+static AllocationRecord* managed_uffd_alloc_locked(size_t size, size_t alignment,
+                                                   void* call_site) {
+    size_t user_size = align_up_size(size, page_size);
+    size_t effective_alignment = alignment;
+    size_t mapped_length;
+    void* base;
+    uintptr_t aligned_start;
+    AllocationRecord* record = NULL;
+
+    if (size == 0 || user_size == 0 || !is_power_of_two(alignment)) {
+        return NULL;
+    }
+    if (ensure_uffd_pager_started_locked() != 0) {
+        return NULL;
+    }
+    if (effective_alignment < default_alignment()) {
+        effective_alignment = default_alignment();
+    }
+    if (effective_alignment < page_size) {
+        effective_alignment = page_size;
+    }
+    if (size >= MAI_HUGEPAGE_SIZE && effective_alignment < MAI_HUGEPAGE_SIZE) {
+        effective_alignment = MAI_HUGEPAGE_SIZE;
+    }
+    if (add_overflow(user_size, effective_alignment, &mapped_length) != 0) {
+        return NULL;
+    }
+    mapped_length = align_up_size(mapped_length, page_size);
+    if (mapped_length == 0) {
+        return NULL;
+    }
+
+    base = mmap(NULL, mapped_length, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        return NULL;
+    }
+
+    aligned_start = align_up_uintptr((uintptr_t)base, effective_alignment);
+    if (aligned_start < (uintptr_t)base ||
+        aligned_start + user_size > (uintptr_t)base + mapped_length) {
+        munmap(base, mapped_length);
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    record = meta_alloc(sizeof(*record));
+    if (!record) {
+        munmap(base, mapped_length);
+        errno = ENOMEM;
+        return NULL;
+    }
+    memset(record, 0, sizeof(*record));
+
+    record->user_ptr = (void*)aligned_start;
+    record->base_ptr = base;
+    record->user_size = size;
+    record->mapped_length = mapped_length;
+    record->alignment = effective_alignment;
+    record->backend = BACKEND_UFFD_PAGER;
+    record->call_site = call_site;
+    record->allocation_seq = ++allocation_sequence;
+    record->hint_kind = MAI_HINT_UNKNOWN;
+    record->storage_fd = -1;
+    record->chunk_bytes = migration_chunk_bytes;
+    record->chunk_count = managed_chunk_count(user_size, record->chunk_bytes);
+    if (record->chunk_count == 0) {
+        meta_free(record);
+        munmap(base, mapped_length);
+        errno = ENOMEM;
+        return NULL;
+    }
+    record->chunk_states = meta_alloc(record->chunk_count);
+    record->chunk_has_storage = meta_alloc(record->chunk_count);
+    record->chunk_touch_epochs = meta_alloc(record->chunk_count * sizeof(size_t));
+    if (!record->chunk_states || !record->chunk_has_storage ||
+        !record->chunk_touch_epochs) {
+        meta_free(record->chunk_states);
+        meta_free(record->chunk_has_storage);
+        meta_free(record->chunk_touch_epochs);
+        meta_free(record);
+        munmap(base, mapped_length);
+        errno = ENOMEM;
+        return NULL;
+    }
+    memset(record->chunk_states, CHUNK_FILE_COLD, record->chunk_count);
+    memset(record->chunk_has_storage, 0, record->chunk_count);
+    memset(record->chunk_touch_epochs, 0, record->chunk_count * sizeof(size_t));
+
+    void* page_start = NULL;
+    size_t page_length = record_page_range(record, &page_start);
+    if (page_length == 0) {
+        meta_free(record->chunk_states);
+        meta_free(record->chunk_has_storage);
+        meta_free(record->chunk_touch_epochs);
+        meta_free(record);
+        munmap(base, mapped_length);
+        errno = EINVAL;
+        return NULL;
+    }
+    record->storage_fd = create_unlinked_backing_file(page_length);
+    if (record->storage_fd < 0) {
+        meta_free(record->chunk_states);
+        meta_free(record->chunk_has_storage);
+        meta_free(record->chunk_touch_epochs);
+        meta_free(record);
+        munmap(base, mapped_length);
+        return NULL;
+    }
+    record->storage_length = page_length;
+
+    insert_record_locked(record);
+    stats_note_managed_alloc(size);
+    stats_snapshot.uffd_pager_allocations++;
+    note_profile_locked(call_site, size);
+    update_managed_range(base, mapped_length);
+
+    return record;
+}
+
+static AllocationRecord* managed_auto_pressure_fallback_locked(size_t size,
+                                                               size_t alignment,
+                                                               void* call_site) {
+    size_t block_size = align_up_size(size, page_size);
+    if (block_size == 0) {
+        return NULL;
+    }
+
+    AllocationRecord* anon_record =
+        managed_anon_alloc_locked(size, alignment, call_site);
+    if (!anon_record) {
+        return NULL;
+    }
+
+    ReclaimPolicy cap_policy =
+        reclaim_policy == RECLAIM_NONE ? RECLAIM_DONTNEED : reclaim_policy;
+    if (reclaim_record_range_locked(anon_record, anon_record->user_ptr,
+                                    block_size, cap_policy,
+                                    block_size) != 0) {
+        AllocationRecord* old_record =
+            free_managed_pointer_locked(anon_record->user_ptr);
+        meta_free(old_record);
+        return NULL;
+    }
+    return anon_record;
 }
 
 static AllocationRecord* managed_alloc_locked(size_t size, size_t alignment, void* call_site) {
@@ -2312,6 +3482,33 @@ static AllocationRecord* managed_alloc_locked(size_t size, size_t alignment, voi
 
     if (add_overflow(block_size, alignment - 1, &needed) != 0) {
         return NULL;
+    }
+
+    int prefer_file_backend = auto_backend_should_prefer_file_locked(block_size);
+    if (backend_mode == BACKEND_MODE_AUTO && prefer_file_backend) {
+        if (uffd_pager_mode != UFFD_PAGER_OFF && uffd_pager_available) {
+            AllocationRecord* uffd_record =
+                managed_uffd_alloc_locked(size, alignment, call_site);
+            if (uffd_record) {
+                return uffd_record;
+            }
+            pthread_mutex_lock(&uffd_fault_lock);
+            stats_snapshot.uffd_fallbacks++;
+            pthread_mutex_unlock(&uffd_fault_lock);
+            if (uffd_pager_mode == UFFD_PAGER_REQUIRED) {
+                return NULL;
+            }
+        }
+
+        return managed_auto_pressure_fallback_locked(size, alignment, call_site);
+    }
+
+    if (backend_mode != BACKEND_MODE_FILE && !prefer_file_backend) {
+        AllocationRecord* anon_record =
+            managed_anon_alloc_locked(size, alignment, call_site);
+        if (anon_record || backend_mode == BACKEND_MODE_ANON) {
+            return anon_record;
+        }
     }
 
     for (;;) {
@@ -2362,9 +3559,60 @@ static void coalesce_block_locked(ArenaBlock* block) {
 }
 
 static void managed_free_record_locked(AllocationRecord* record) {
+    stop_record_access_trace_locked(record);
+    clear_record_hint_locked(record);
+    stats_note_managed_free(record->user_size);
+
+    if (record->backend == BACKEND_ANON || record->backend == BACKEND_UFFD_PAGER) {
+        if (record->backend == BACKEND_UFFD_PAGER) {
+            pthread_mutex_lock(&uffd_fault_lock);
+            record->uffd_closing = 1;
+            remove_uffd_record_locked(record);
+            pthread_mutex_unlock(&uffd_fault_lock);
+        }
+        if (record->backend == BACKEND_UFFD_PAGER && record->uffd_registered &&
+            uffd_fd >= 0) {
+            struct uffdio_range range;
+            void* page_start = NULL;
+            size_t page_length = record_page_range(record, &page_start);
+            if (page_length != 0) {
+                memset(&range, 0, sizeof(range));
+                range.start = (unsigned long)page_start;
+                range.len = (unsigned long)page_length;
+                (void)ioctl(uffd_fd, UFFDIO_UNREGISTER, &range);
+            }
+        }
+        if (record->backend == BACKEND_UFFD_PAGER) {
+            pthread_mutex_lock(&uffd_fault_lock);
+            record->uffd_registered = 0;
+            if (record->resident_bytes != 0) {
+                if (uffd_resident_bytes >= record->resident_bytes) {
+                    uffd_resident_bytes -= record->resident_bytes;
+                } else {
+                    uffd_resident_bytes = 0;
+                }
+                stats_snapshot.uffd_resident_bytes = uffd_resident_bytes;
+            }
+            pthread_mutex_unlock(&uffd_fault_lock);
+        }
+        if (record->storage_fd >= 0) {
+            close(record->storage_fd);
+            record->storage_fd = -1;
+        }
+        meta_free(record->chunk_states);
+        record->chunk_states = NULL;
+        meta_free(record->chunk_has_storage);
+        record->chunk_has_storage = NULL;
+        meta_free(record->chunk_touch_epochs);
+        record->chunk_touch_epochs = NULL;
+        if (record->base_ptr && record->mapped_length != 0) {
+            munmap(record->base_ptr, record->mapped_length);
+        }
+        return;
+    }
+
     ArenaBlock* block = record->block;
     block->free = 1;
-    stats_note_managed_free(record->user_size);
     coalesce_block_locked(block);
 }
 
@@ -2381,19 +3629,882 @@ static int should_manage(size_t size) {
            size >= threshold_bytes && size > 0;
 }
 
-static int reclaim_record_locked(AllocationRecord* record, ReclaimPolicy policy) {
-    void* range_start = NULL;
-    size_t range_length = record_page_range(record, &range_start);
-    int rc = 0;
-
-    if (record_overlaps_exclusion_locked(record)) {
-        stats_snapshot.reclaim_skipped_excluded++;
-        stats_snapshot.reclaim_skipped_excluded_bytes += record->user_size;
+static int ensure_record_storage_locked(AllocationRecord* record) {
+    if (record->backend != BACKEND_ANON) {
+        return 0;
+    }
+    if (record->storage_fd >= 0) {
         return 0;
     }
 
-    if (range_length == 0) {
+    void* page_start = NULL;
+    size_t page_length = record_page_range(record, &page_start);
+    if (page_length == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int fd = create_unlinked_backing_file(page_length);
+    if (fd < 0) {
+        return -1;
+    }
+    record->storage_fd = fd;
+    record->storage_length = page_length;
+    return 0;
+}
+
+static int record_chunk_bounds_locked(AllocationRecord* record, void* range_start,
+                                      size_t range_length, uintptr_t* first_start,
+                                      uintptr_t* final_end, size_t* first_index,
+                                      size_t* end_index) {
+    void* record_page_start_ptr = NULL;
+    size_t record_page_length = record_page_range(record, &record_page_start_ptr);
+    if (record_page_length == 0 || record->chunk_bytes == 0 ||
+        record->chunk_count == 0 || range_length == 0) {
+        return -1;
+    }
+
+    uintptr_t record_start = (uintptr_t)record_page_start_ptr;
+    uintptr_t record_end = record_start + record_page_length;
+    uintptr_t start = (uintptr_t)range_start;
+    uintptr_t end = start + range_length;
+    if (end < start) {
+        return -1;
+    }
+    if (start < record_start) {
+        start = record_start;
+    }
+    if (end > record_end) {
+        end = record_end;
+    }
+    if (end <= start) {
+        return -1;
+    }
+
+    size_t first = (size_t)((start - record_start) / record->chunk_bytes);
+    size_t last_exclusive =
+        (size_t)((end - record_start + record->chunk_bytes - 1) /
+                 record->chunk_bytes);
+    if (last_exclusive > record->chunk_count) {
+        last_exclusive = record->chunk_count;
+    }
+    if (first >= last_exclusive) {
+        return -1;
+    }
+
+    uintptr_t chunk_start = record_start + first * record->chunk_bytes;
+    uintptr_t chunk_end = record_start + last_exclusive * record->chunk_bytes;
+    if (chunk_end > record_end) {
+        chunk_end = record_end;
+    }
+
+    *first_start = chunk_start;
+    *final_end = chunk_end;
+    *first_index = first;
+    *end_index = last_exclusive;
+    return 0;
+}
+
+static size_t uffd_record_chunk_length_locked(AllocationRecord* record,
+                                             size_t index,
+                                             uintptr_t* chunk_start_out) {
+    void* page_start_ptr = NULL;
+    size_t page_length = record_page_range(record, &page_start_ptr);
+    if (page_length == 0 || index >= record->chunk_count) {
         return 0;
+    }
+
+    uintptr_t page_start = (uintptr_t)page_start_ptr;
+    uintptr_t chunk_start = page_start + index * record->chunk_bytes;
+    uintptr_t chunk_end = chunk_start + record->chunk_bytes;
+    uintptr_t page_end = page_start + page_length;
+    if (chunk_start >= page_end) {
+        return 0;
+    }
+    if (chunk_end > page_end) {
+        chunk_end = page_end;
+    }
+    *chunk_start_out = chunk_start;
+    return (size_t)(chunk_end - chunk_start);
+}
+
+static int uffd_writeprotect_range(uintptr_t start, size_t length, int protect) {
+    if (uffd_fd < 0 || length == 0) {
+        return -1;
+    }
+
+    struct uffdio_writeprotect wp;
+    memset(&wp, 0, sizeof(wp));
+    wp.range.start = (unsigned long)start;
+    wp.range.len = (unsigned long)length;
+    wp.mode = protect ? UFFDIO_WRITEPROTECT_MODE_WP : 0;
+    return ioctl(uffd_fd, UFFDIO_WRITEPROTECT, &wp);
+}
+
+static void insert_uffd_record_locked(AllocationRecord* record) {
+    if (!record || record->uffd_prev || record->uffd_next ||
+        uffd_head == record) {
+        return;
+    }
+    record->uffd_prev = NULL;
+    record->uffd_next = uffd_head;
+    if (uffd_head) {
+        uffd_head->uffd_prev = record;
+    }
+    uffd_head = record;
+}
+
+static void remove_uffd_record_locked(AllocationRecord* record) {
+    if (!record || (!record->uffd_prev && !record->uffd_next &&
+                    uffd_head != record)) {
+        return;
+    }
+    if (record->uffd_prev) {
+        record->uffd_prev->uffd_next = record->uffd_next;
+    } else {
+        uffd_head = record->uffd_next;
+    }
+    if (record->uffd_next) {
+        record->uffd_next->uffd_prev = record->uffd_prev;
+    }
+    record->uffd_prev = NULL;
+    record->uffd_next = NULL;
+}
+
+static AllocationRecord* find_uffd_record_containing_locked(uintptr_t start,
+                                                            uintptr_t end) {
+    for (AllocationRecord* record = uffd_head; record; record = record->uffd_next) {
+        uintptr_t record_start;
+        uintptr_t record_end;
+        if (record_user_range_locked(record, &record_start, &record_end) != 0) {
+            continue;
+        }
+        if (start >= record_start && end <= record_end) {
+            return record;
+        }
+    }
+    return NULL;
+}
+
+static int register_uffd_record(AllocationRecord* record) {
+    if (!record || record->backend != BACKEND_UFFD_PAGER) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (record->uffd_registered) {
+        return 0;
+    }
+    if (uffd_fd < 0) {
+        errno = ENOSYS;
+        return -1;
+    }
+    if (parse_bool_env(getenv("MAI_UFFD_TEST_REGISTER_FAIL"))) {
+        errno = EIO;
+        return -1;
+    }
+
+    void* page_start = NULL;
+    size_t page_length = record_page_range(record, &page_start);
+    if (page_length == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    struct uffdio_register reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.range.start = (unsigned long)page_start;
+    reg.range.len = (unsigned long)page_length;
+    reg.mode = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP;
+    if (ioctl(uffd_fd, UFFDIO_REGISTER, &reg) != 0) {
+        return -1;
+    }
+    pthread_mutex_lock(&uffd_fault_lock);
+    record->uffd_registered = 1;
+    insert_uffd_record_locked(record);
+    pthread_mutex_unlock(&uffd_fault_lock);
+    return 0;
+}
+
+static int evict_uffd_chunk_locked(AllocationRecord* record, size_t index,
+                                   int runtime_lock_held) {
+    uintptr_t start = 0;
+    size_t length = uffd_record_chunk_length_locked(record, index, &start);
+    if (length == 0 || !record->chunk_states ||
+        record->chunk_states[index] == CHUNK_FILE_COLD) {
+        return 0;
+    }
+    if (runtime_lock_held && range_overlaps_exclusion_locked(start, start + length)) {
+        return 0;
+    }
+    if (ensure_record_storage_locked(record) != 0) {
+        return -1;
+    }
+
+    if (uffd_writeprotect_range(start, length, 1) != 0) {
+        return -1;
+    }
+
+    void* page_start_ptr = NULL;
+    size_t page_length = record_page_range(record, &page_start_ptr);
+    if (page_length == 0) {
+        (void)uffd_writeprotect_range(start, length, 0);
+        return -1;
+    }
+    off_t offset = (off_t)(start - (uintptr_t)page_start_ptr);
+    int rc = write_all_at(record->storage_fd, (void*)start, length, offset);
+    if (rc == 0 && madvise((void*)start, length, MADV_DONTNEED) != 0) {
+        rc = -1;
+    }
+    (void)uffd_writeprotect_range(start, length, 0);
+    if (rc != 0) {
+        return -1;
+    }
+
+    record->chunk_states[index] = CHUNK_FILE_COLD;
+    if (record->chunk_has_storage) {
+        record->chunk_has_storage[index] = 1;
+    }
+    if (record->resident_bytes >= length) {
+        record->resident_bytes -= length;
+    } else {
+        record->resident_bytes = 0;
+    }
+    if (uffd_resident_bytes >= length) {
+        uffd_resident_bytes -= length;
+    } else {
+        uffd_resident_bytes = 0;
+    }
+    stats_snapshot.uffd_evictions++;
+    stats_snapshot.uffd_resident_bytes = uffd_resident_bytes;
+    return 0;
+}
+
+static int evict_uffd_chunks_locked(size_t target_bytes,
+                                    AllocationRecord* protected_record,
+                                    size_t protected_start_index,
+                                    size_t protected_end_index,
+                                    int runtime_lock_held) {
+    while (uffd_resident_bytes > target_bytes) {
+        AllocationRecord* best_record = NULL;
+        size_t best_index = 0;
+        size_t best_epoch = SIZE_MAX;
+
+        for (AllocationRecord* record = uffd_head; record; record = record->uffd_next) {
+            if (record->backend != BACKEND_UFFD_PAGER || record->uffd_closing ||
+                !record->chunk_states ||
+                !record->chunk_touch_epochs || !record->uffd_registered) {
+                continue;
+            }
+            for (size_t i = 0; i < record->chunk_count; i++) {
+                if (record == protected_record &&
+                    i >= protected_start_index && i <= protected_end_index) {
+                    continue;
+                }
+                if (record->chunk_states[i] != CHUNK_ANON_HOT) {
+                    continue;
+                }
+                size_t epoch = record->chunk_touch_epochs[i];
+                if (epoch < best_epoch) {
+                    best_epoch = epoch;
+                    best_record = record;
+                    best_index = i;
+                }
+            }
+        }
+
+        if (!best_record) {
+            break;
+        }
+        if (evict_uffd_chunk_locked(best_record, best_index,
+                                    runtime_lock_held) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int ensure_uffd_scratch_locked(size_t length, void** out) {
+    if (length == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (uffd_scratch_buffer && uffd_scratch_length >= length) {
+        *out = uffd_scratch_buffer;
+        return 0;
+    }
+    if (uffd_scratch_buffer) {
+        munmap(uffd_scratch_buffer, uffd_scratch_length);
+        uffd_scratch_buffer = NULL;
+        uffd_scratch_length = 0;
+    }
+    void* scratch = mmap(NULL, length, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (scratch == MAP_FAILED) {
+        return -1;
+    }
+    uffd_scratch_buffer = scratch;
+    uffd_scratch_length = length;
+    *out = scratch;
+    return 0;
+}
+
+static void release_uffd_scratch_locked(void) {
+    if (uffd_scratch_buffer) {
+        munmap(uffd_scratch_buffer, uffd_scratch_length);
+        uffd_scratch_buffer = NULL;
+        uffd_scratch_length = 0;
+    }
+}
+
+static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
+                                      int count_fault_event,
+                                      size_t* populated_bytes) {
+    if (!record || record->backend != BACKEND_UFFD_PAGER ||
+        !record->chunk_states || index >= record->chunk_count) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uintptr_t chunk_start = 0;
+    size_t length = uffd_record_chunk_length_locked(record, index, &chunk_start);
+    if (length == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (record->chunk_states[index] == CHUNK_ANON_HOT) {
+        if (count_fault_event) {
+            record->chunk_touch_epochs[index] = ++uffd_touch_epoch;
+            stats_snapshot.uffd_faults++;
+        }
+        return 0;
+    }
+
+    int has_storage = record->chunk_states[index] == CHUNK_FILE_COLD &&
+        record->chunk_has_storage && record->chunk_has_storage[index];
+    if (has_storage) {
+        void* temp = NULL;
+        if (ensure_uffd_scratch_locked(length, &temp) != 0) {
+            return -1;
+        }
+
+        void* page_start_ptr = NULL;
+        size_t page_length = record_page_range(record, &page_start_ptr);
+        if (page_length == 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        off_t offset = (off_t)(chunk_start - (uintptr_t)page_start_ptr);
+        if (read_all_at(record->storage_fd, temp, length, offset) != 0) {
+            return -1;
+        }
+
+        struct uffdio_copy copy;
+        memset(&copy, 0, sizeof(copy));
+        copy.dst = (unsigned long)chunk_start;
+        copy.src = (unsigned long)temp;
+        copy.len = (unsigned long)length;
+        if (ioctl(uffd_fd, UFFDIO_COPY, &copy) != 0) {
+            return -1;
+        }
+    } else {
+        struct uffdio_zeropage zero;
+        memset(&zero, 0, sizeof(zero));
+        zero.range.start = (unsigned long)chunk_start;
+        zero.range.len = (unsigned long)length;
+        if (ioctl(uffd_fd, UFFDIO_ZEROPAGE, &zero) != 0) {
+            return -1;
+        }
+    }
+
+    if (record->chunk_states[index] == CHUNK_FILE_COLD) {
+        record->chunk_states[index] = CHUNK_ANON_HOT;
+        record->resident_bytes += length;
+        uffd_resident_bytes += length;
+        if (populated_bytes) {
+            *populated_bytes += length;
+        }
+    }
+    record->chunk_touch_epochs[index] = ++uffd_touch_epoch;
+    if (count_fault_event) {
+        stats_snapshot.uffd_faults++;
+    }
+    stats_snapshot.uffd_resident_bytes = uffd_resident_bytes;
+    return 0;
+}
+
+static int resolve_uffd_fault_locked(uintptr_t fault_address,
+                                     unsigned long long flags,
+                                     int runtime_lock_held) {
+    uintptr_t page = fault_address & ~((uintptr_t)page_size - 1);
+    AllocationRecord* record =
+        find_uffd_record_containing_locked(page, page + 1);
+    if (!record || record->backend != BACKEND_UFFD_PAGER) {
+        struct uffdio_zeropage zero;
+        memset(&zero, 0, sizeof(zero));
+        zero.range.start = (unsigned long)page;
+        zero.range.len = (unsigned long)page_size;
+        if (ioctl(uffd_fd, UFFDIO_ZEROPAGE, &zero) == 0) {
+            return 0;
+        }
+        if (errno == EINVAL || errno == ENOENT || errno == ESRCH) {
+            return 0;
+        }
+        return -1;
+    }
+
+    uintptr_t chunk_start = 0;
+    uintptr_t chunk_end = 0;
+    size_t index = 0;
+    size_t end_index = 0;
+    if (record_chunk_bounds_locked(record, (void*)page, page_size,
+                                   &chunk_start, &chunk_end,
+                                   &index, &end_index) != 0 ||
+        index >= record->chunk_count) {
+        return -1;
+    }
+    size_t length = (size_t)(chunk_end - chunk_start);
+    if (length == 0) {
+        return -1;
+    }
+    if (flags & UFFD_PAGEFAULT_FLAG_WP) {
+        if (uffd_writeprotect_range(chunk_start, length, 0) != 0) {
+            return -1;
+        }
+        record->chunk_touch_epochs[index] = ++uffd_touch_epoch;
+        stats_snapshot.uffd_faults++;
+        return 0;
+    }
+    if (populate_uffd_chunk_locked(record, index, 1, NULL) != 0) {
+        return -1;
+    }
+
+    size_t protected_end_index = index;
+    size_t prefetch_window = uffd_prefetch_chunks == 0 ? 1 : uffd_prefetch_chunks;
+    if (record->chunk_bytes != 0 && uffd_resident_limit_bytes != 0) {
+        size_t cap_window = (uffd_resident_limit_bytes / 2) / record->chunk_bytes;
+        if (cap_window == 0) {
+            cap_window = 1;
+        }
+        if (prefetch_window > cap_window) {
+            prefetch_window = cap_window;
+        }
+    }
+    for (size_t offset = 1;
+         offset < prefetch_window && index + offset < record->chunk_count;
+         offset++) {
+        size_t prefetch_index = index + offset;
+        if (record->chunk_states[prefetch_index] == CHUNK_ANON_HOT) {
+            protected_end_index = prefetch_index;
+            continue;
+        }
+        if (populate_uffd_chunk_locked(record, prefetch_index, 0, NULL) != 0) {
+            break;
+        }
+        protected_end_index = prefetch_index;
+    }
+
+    int explicit_resident_limit = uffd_resident_limit_bytes != 0;
+    size_t target = uffd_resident_limit_bytes;
+    if (target == 0 && runtime_lock_held) {
+        size_t cap = effective_max_rss_locked(stats_snapshot.current_rss_bytes);
+        target = cap == 0 ? SIZE_MAX : percent_of_size(cap, MAI_AUTO_ANON_LIMIT_PERCENT);
+    } else if (target == 0) {
+        target = SIZE_MAX;
+    }
+    if ((explicit_resident_limit || runtime_lock_held) &&
+        target != SIZE_MAX && uffd_resident_bytes > target) {
+        size_t low_target = uffd_resident_low_limit_bytes;
+        if (low_target == 0) {
+            low_target = target;
+        }
+        if (low_target > target) {
+            low_target = target;
+        }
+        if (evict_uffd_chunks_locked(low_target, record, index,
+                                     protected_end_index,
+                                     runtime_lock_held) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void fail_uffd_pager_locked(void) {
+    stats_snapshot.uffd_fallbacks++;
+    atomic_store_explicit(&uffd_thread_stop, 1, memory_order_release);
+    if (uffd_fd >= 0) {
+        int fd = uffd_fd;
+        uffd_fd = -1;
+        close(fd);
+    }
+}
+
+static void* uffd_pager_main(void* arg) {
+    (void)arg;
+    for (;;) {
+        if (atomic_load_explicit(&uffd_thread_stop, memory_order_acquire) != 0) {
+            return NULL;
+        }
+        struct pollfd pfd;
+        memset(&pfd, 0, sizeof(pfd));
+        pfd.fd = uffd_fd;
+        pfd.events = POLLIN;
+        int prc = poll(&pfd, 1, 100);
+        if (prc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return NULL;
+        }
+        if (prc == 0 || !(pfd.revents & POLLIN)) {
+            continue;
+        }
+
+        for (;;) {
+            struct uffd_msg msg;
+            ssize_t nread = read(uffd_fd, &msg, sizeof(msg));
+            if (nread < 0) {
+                if (errno == EAGAIN || errno == EINTR) {
+                    break;
+                }
+                return NULL;
+            }
+            if (nread == 0) {
+                return NULL;
+            }
+            if ((size_t)nread != sizeof(msg) || msg.event != UFFD_EVENT_PAGEFAULT) {
+                continue;
+            }
+            int runtime_lock_held = 0;
+            pthread_mutex_lock(&uffd_fault_lock);
+            int rc = resolve_uffd_fault_locked(
+                (uintptr_t)msg.arg.pagefault.address,
+                msg.arg.pagefault.flags,
+                runtime_lock_held);
+            if (rc != 0) {
+                fail_uffd_pager_locked();
+            }
+            pthread_mutex_unlock(&uffd_fault_lock);
+            if (rc != 0) {
+                kill(getpid(), SIGBUS);
+                return NULL;
+            }
+        }
+    }
+}
+
+static int open_uffd_pager_fd(void) {
+    int fd = (int)syscall(SYS_userfaultfd,
+                          O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+    if (fd < 0) {
+        return -1;
+    }
+    struct uffdio_api api;
+    memset(&api, 0, sizeof(api));
+    api.api = UFFD_API;
+    api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
+    if (ioctl(fd, UFFDIO_API, &api) != 0 ||
+        !(api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return fd;
+}
+
+static int ensure_uffd_pager_started_locked(void) {
+    if (uffd_fd >= 0 && uffd_thread_started) {
+        return 0;
+    }
+    if (!uffd_pager_available) {
+        errno = ENOSYS;
+        return -1;
+    }
+    uffd_fd = open_uffd_pager_fd();
+    if (uffd_fd < 0) {
+        uffd_pager_available = 0;
+        stats_snapshot.uffd_pager_available = 0;
+        pthread_mutex_lock(&uffd_fault_lock);
+        stats_snapshot.uffd_fallbacks++;
+        pthread_mutex_unlock(&uffd_fault_lock);
+        return -1;
+    }
+    atomic_store_explicit(&uffd_thread_stop, 0, memory_order_release);
+    if (pthread_create(&uffd_thread, NULL, uffd_pager_main, NULL) != 0) {
+        close(uffd_fd);
+        uffd_fd = -1;
+        pthread_mutex_lock(&uffd_fault_lock);
+        stats_snapshot.uffd_fallbacks++;
+        pthread_mutex_unlock(&uffd_fault_lock);
+        return -1;
+    }
+    uffd_thread_started = 1;
+    return 0;
+}
+
+static void stop_uffd_pager(void) {
+    if (!uffd_thread_started) {
+        if (uffd_fd >= 0) {
+            close(uffd_fd);
+            uffd_fd = -1;
+        }
+        return;
+    }
+    atomic_store_explicit(&uffd_thread_stop, 1, memory_order_release);
+    (void)pthread_join(uffd_thread, NULL);
+    uffd_thread_started = 0;
+    if (uffd_fd >= 0) {
+        close(uffd_fd);
+        uffd_fd = -1;
+    }
+    pthread_mutex_lock(&uffd_fault_lock);
+    uffd_head = NULL;
+    release_uffd_scratch_locked();
+    pthread_mutex_unlock(&uffd_fault_lock);
+}
+
+static int migrate_anon_range_to_file_locked(AllocationRecord* record,
+                                             void* range_start,
+                                             size_t range_length,
+                                             ReclaimPolicy policy,
+                                             size_t account_bytes) {
+    uintptr_t chunk_start;
+    uintptr_t chunk_end;
+    size_t first_index;
+    size_t end_index;
+    void* record_page_start_ptr = NULL;
+    size_t record_page_length;
+
+    if (record->backend != BACKEND_ANON) {
+        return 0;
+    }
+    if (record_chunk_bounds_locked(record, range_start, range_length,
+                                   &chunk_start, &chunk_end, &first_index,
+                                   &end_index) != 0) {
+        return 0;
+    }
+    if (ensure_record_storage_locked(record) != 0) {
+        return -1;
+    }
+
+    record_page_length = record_page_range(record, &record_page_start_ptr);
+    if (record_page_length == 0) {
+        return -1;
+    }
+    uintptr_t record_start = (uintptr_t)record_page_start_ptr;
+
+    stop_record_access_trace_locked(record);
+
+    size_t migrated = 0;
+    for (size_t i = first_index; i < end_index; i++) {
+        if (record->chunk_states && record->chunk_states[i] == CHUNK_FILE_COLD) {
+            continue;
+        }
+
+        uintptr_t start = record_start + i * record->chunk_bytes;
+        uintptr_t end = start + record->chunk_bytes;
+        if (end > record_start + record_page_length) {
+            end = record_start + record_page_length;
+        }
+        size_t length = (size_t)(end - start);
+        off_t offset = (off_t)(start - record_start);
+
+        if (write_all_at(record->storage_fd, (void*)start, length, offset) != 0) {
+            return -1;
+        }
+
+        void* mapped = mmap((void*)start, length, PROT_READ | PROT_WRITE,
+                            MAP_SHARED | MAP_FIXED, record->storage_fd, offset);
+        if (mapped == MAP_FAILED || mapped != (void*)start) {
+            return -1;
+        }
+
+        if (record->chunk_states) {
+            record->chunk_states[i] = CHUNK_FILE_COLD;
+        }
+        migrated += length;
+
+        int advice = MADV_DONTNEED;
+#ifdef MADV_PAGEOUT
+        if (policy == RECLAIM_PAGEOUT) {
+            advice = MADV_PAGEOUT;
+        }
+#else
+        (void)policy;
+#endif
+        if (madvise((void*)start, length, advice) != 0) {
+#ifdef MADV_PAGEOUT
+            if (advice == MADV_PAGEOUT) {
+                (void)madvise((void*)start, length, MADV_DONTNEED);
+            }
+#endif
+        }
+    }
+
+    record->reclaim_epoch = reclaim_epoch;
+    if (migrated != 0) {
+        stats_snapshot.migrated_to_file_bytes += migrated;
+        stats_snapshot.reclaimed_bytes += account_bytes;
+    }
+    return 0;
+}
+
+static int promote_record_range_to_anon_locked(AllocationRecord* record,
+                                               void* range_start,
+                                               size_t range_length) {
+    uintptr_t chunk_start;
+    uintptr_t chunk_end;
+    size_t first_index;
+    size_t end_index;
+    void* record_page_start_ptr = NULL;
+    size_t record_page_length;
+
+    if (record->backend != BACKEND_ANON || !record->chunk_states) {
+        return 0;
+    }
+    if (record_chunk_bounds_locked(record, range_start, range_length,
+                                   &chunk_start, &chunk_end, &first_index,
+                                   &end_index) != 0) {
+        return 0;
+    }
+
+    record_page_length = record_page_range(record, &record_page_start_ptr);
+    if (record_page_length == 0) {
+        return -1;
+    }
+    uintptr_t record_start = (uintptr_t)record_page_start_ptr;
+
+    stop_record_access_trace_locked(record);
+
+    size_t promoted = 0;
+    for (size_t i = first_index; i < end_index; i++) {
+        if (record->chunk_states[i] != CHUNK_FILE_COLD) {
+            continue;
+        }
+
+        uintptr_t start = record_start + i * record->chunk_bytes;
+        uintptr_t end = start + record->chunk_bytes;
+        if (end > record_start + record_page_length) {
+            end = record_start + record_page_length;
+        }
+        size_t length = (size_t)(end - start);
+        void* temp = mmap(NULL, length, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (temp == MAP_FAILED) {
+            return -1;
+        }
+        memcpy(temp, (void*)start, length);
+
+        void* mapped = mmap((void*)start, length, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (mapped == MAP_FAILED || mapped != (void*)start) {
+            int saved_errno = errno;
+            munmap(temp, length);
+            errno = saved_errno;
+            return -1;
+        }
+        memcpy((void*)start, temp, length);
+        munmap(temp, length);
+#ifdef MADV_HUGEPAGE
+        (void)madvise((void*)start, length, MADV_HUGEPAGE);
+#endif
+        record->chunk_states[i] = CHUNK_ANON_HOT;
+        promoted += length;
+    }
+
+    if (promoted != 0) {
+        stats_snapshot.promoted_to_anon_bytes += promoted;
+    }
+    return 0;
+}
+
+static int prepare_record_range_for_write_locked(AllocationRecord* record,
+                                                 void* range_start,
+                                                 size_t range_length) {
+    uintptr_t chunk_start;
+    uintptr_t chunk_end;
+    size_t first_index;
+    size_t end_index;
+    void* record_page_start_ptr = NULL;
+    size_t record_page_length;
+
+    if (record->backend != BACKEND_ANON || !record->chunk_states) {
+        return 0;
+    }
+    if (record_chunk_bounds_locked(record, range_start, range_length,
+                                   &chunk_start, &chunk_end, &first_index,
+                                   &end_index) != 0) {
+        return 0;
+    }
+
+    record_page_length = record_page_range(record, &record_page_start_ptr);
+    if (record_page_length == 0) {
+        return -1;
+    }
+    uintptr_t record_start = (uintptr_t)record_page_start_ptr;
+
+    stop_record_access_trace_locked(record);
+
+    size_t prepared = 0;
+    for (size_t i = first_index; i < end_index; i++) {
+        if (record->chunk_states[i] != CHUNK_FILE_COLD) {
+            continue;
+        }
+
+        uintptr_t start = record_start + i * record->chunk_bytes;
+        uintptr_t end = start + record->chunk_bytes;
+        if (end > record_start + record_page_length) {
+            end = record_start + record_page_length;
+        }
+        size_t length = (size_t)(end - start);
+
+        void* mapped = mmap((void*)start, length, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (mapped == MAP_FAILED || mapped != (void*)start) {
+            return -1;
+        }
+#ifdef MADV_HUGEPAGE
+        (void)madvise((void*)start, length, MADV_HUGEPAGE);
+#endif
+        record->chunk_states[i] = CHUNK_ANON_HOT;
+        prepared += length;
+    }
+
+    if (prepared != 0) {
+        stats_snapshot.promoted_to_anon_bytes += prepared;
+    }
+    return 0;
+}
+
+static int reclaim_record_range_locked(AllocationRecord* record,
+                                       void* range_start,
+                                       size_t range_length,
+                                       ReclaimPolicy policy,
+                                       size_t account_bytes) {
+    uintptr_t start = (uintptr_t)range_start;
+    uintptr_t end = start + range_length;
+    int rc = 0;
+
+    if (range_overlaps_exclusion_locked(start, end)) {
+        stats_snapshot.reclaim_skipped_excluded++;
+        stats_snapshot.reclaim_skipped_excluded_bytes += account_bytes;
+        return 0;
+    }
+
+    if (range_length == 0 || policy == RECLAIM_NONE) {
+        return 0;
+    }
+
+    if (record->backend == BACKEND_UFFD_PAGER) {
+        return 0;
+    }
+
+    if (record->backend == BACKEND_ANON) {
+        return migrate_anon_range_to_file_locked(record, range_start,
+                                                 range_length, policy,
+                                                 account_bytes);
     }
 
     if (msync(range_start, range_length, MS_SYNC) != 0) {
@@ -2411,7 +4522,7 @@ static int reclaim_record_locked(AllocationRecord* record, ReclaimPolicy policy)
         if (advice == MADV_PAGEOUT && errno == EINVAL &&
             madvise(range_start, range_length, MADV_DONTNEED) == 0) {
             record->reclaim_epoch = reclaim_epoch;
-            stats_snapshot.reclaimed_bytes += record->user_size;
+            stats_snapshot.reclaimed_bytes += account_bytes;
             return rc;
         }
 #endif
@@ -2423,8 +4534,16 @@ static int reclaim_record_locked(AllocationRecord* record, ReclaimPolicy policy)
     }
 
     record->reclaim_epoch = reclaim_epoch;
-    stats_snapshot.reclaimed_bytes += record->user_size;
+    stats_snapshot.reclaimed_bytes += account_bytes;
     return 0;
+}
+
+static int reclaim_record_locked(AllocationRecord* record, ReclaimPolicy policy) {
+    void* range_start = NULL;
+    size_t range_length = record_page_range(record, &range_start);
+
+    return reclaim_record_range_locked(record, range_start, range_length, policy,
+                                       record->user_size);
 }
 
 static size_t estimate_resident_bytes(size_t sampled_pages, size_t resident_pages,
@@ -2631,6 +4750,118 @@ static int rss_has_headroom(size_t current_rss, size_t cap, size_t incoming_resi
     return incoming_resident_bytes <= cap - current_rss;
 }
 
+static size_t percent_of_size(size_t bytes, size_t percent) {
+    if (bytes == 0) {
+        return 0;
+    }
+    if (percent >= 100) {
+        return bytes;
+    }
+    return (bytes / 100) * percent + ((bytes % 100) * percent) / 100;
+}
+
+static int probe_userfaultfd_pager(void) {
+    int fd = (int)syscall(SYS_userfaultfd,
+                          O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+    if (fd < 0) {
+        return 0;
+    }
+
+    struct uffdio_api api;
+    memset(&api, 0, sizeof(api));
+    api.api = UFFD_API;
+    api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
+    if (ioctl(fd, UFFDIO_API, &api) != 0 ||
+        !(api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP) ||
+        !(api.ioctls & ((__u64)1 << _UFFDIO_REGISTER))) {
+        close(fd);
+        return 0;
+    }
+
+    void* page = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        close(fd);
+        return 0;
+    }
+
+    struct uffdio_register reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.range.start = (unsigned long)page;
+    reg.range.len = (unsigned long)page_size;
+    reg.mode = UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP;
+    int registered = ioctl(fd, UFFDIO_REGISTER, &reg) == 0;
+    int ok = registered &&
+        (reg.ioctls & ((__u64)1 << _UFFDIO_COPY)) &&
+        (reg.ioctls & ((__u64)1 << _UFFDIO_ZEROPAGE)) &&
+        (reg.ioctls & ((__u64)1 << _UFFDIO_WRITEPROTECT));
+    if (ok) {
+        struct uffdio_zeropage zero;
+        memset(&zero, 0, sizeof(zero));
+        zero.range.start = (unsigned long)page;
+        zero.range.len = (unsigned long)page_size;
+        ok = ioctl(fd, UFFDIO_ZEROPAGE, &zero) == 0;
+    }
+    if (ok) {
+        struct uffdio_writeprotect wp;
+        memset(&wp, 0, sizeof(wp));
+        wp.range.start = (unsigned long)page;
+        wp.range.len = (unsigned long)page_size;
+        wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
+        ok = ioctl(fd, UFFDIO_WRITEPROTECT, &wp) == 0;
+        if (ok) {
+            wp.mode = 0;
+            ok = ioctl(fd, UFFDIO_WRITEPROTECT, &wp) == 0;
+        }
+    }
+    if (registered) {
+        struct uffdio_range range;
+        memset(&range, 0, sizeof(range));
+        range.start = (unsigned long)page;
+        range.len = (unsigned long)page_size;
+        (void)ioctl(fd, UFFDIO_UNREGISTER, &range);
+    }
+
+    munmap(page, page_size);
+    close(fd);
+    return ok;
+}
+
+static int auto_backend_should_prefer_file_locked(size_t incoming_managed_bytes) {
+    if (backend_mode != BACKEND_MODE_AUTO || !max_rss_enabled) {
+        return 0;
+    }
+
+    size_t cap = effective_max_rss_locked(stats_snapshot.current_rss_bytes);
+    if (cap == 0) {
+        return 0;
+    }
+
+    size_t large_alloc_cutoff =
+        percent_of_size(cap, auto_large_alloc_cap_percent);
+    if (auto_large_alloc_cap_percent != 0) {
+        if (large_alloc_cutoff < page_size && cap >= page_size) {
+            large_alloc_cutoff = page_size;
+        }
+        if (incoming_managed_bytes >= large_alloc_cutoff) {
+            return 1;
+        }
+    }
+
+    size_t anon_budget = percent_of_size(cap, MAI_AUTO_ANON_LIMIT_PERCENT);
+    if (anon_budget < page_size && cap >= page_size) {
+        anon_budget = page_size;
+    }
+
+    size_t projected = stats_snapshot.live_managed_bytes;
+    if (projected > SIZE_MAX - incoming_managed_bytes) {
+        projected = SIZE_MAX;
+    } else {
+        projected += incoming_managed_bytes;
+    }
+    return projected > anon_budget;
+}
+
 static void estimate_rss_growth_locked(size_t bytes) {
     if (bytes == 0 || stats_snapshot.current_rss_bytes == 0) {
         return;
@@ -2749,7 +4980,8 @@ static void* allocate_by_policy(size_t size, size_t alignment, int zero_fill, in
         pthread_mutex_unlock(&runtime_lock);
 
         if (ptr) {
-            if (zero_fill) {
+            int is_uffd = record && record->backend == BACKEND_UFFD_PAGER;
+            if (zero_fill && !is_uffd) {
                 if (zero_fill_managed_allocation(ptr, size) != 0) {
                     pthread_mutex_lock(&runtime_lock);
                     AllocationRecord* old_record = free_managed_pointer_locked(ptr);
@@ -2763,6 +4995,32 @@ static void* allocate_by_policy(size_t size, size_t alignment, int zero_fill, in
             maybe_policy_reclaim_locked();
             (void)ensure_memory_cap_headroom_locked(0);
             pthread_mutex_unlock(&runtime_lock);
+            if (is_uffd && register_uffd_record(record) != 0) {
+                int register_errno = errno;
+                pthread_mutex_lock(&runtime_lock);
+                AllocationRecord* old_record = free_managed_pointer_locked(ptr);
+                meta_free(old_record);
+                pthread_mutex_lock(&uffd_fault_lock);
+                stats_snapshot.uffd_fallbacks++;
+                pthread_mutex_unlock(&uffd_fault_lock);
+                if (uffd_pager_mode != UFFD_PAGER_REQUIRED &&
+                    backend_mode == BACKEND_MODE_AUTO) {
+                    AllocationRecord* fallback_record =
+                        managed_auto_pressure_fallback_locked(size, alignment,
+                                                              call_site);
+                    if (fallback_record) {
+                        ptr = fallback_record->user_ptr;
+                        record = fallback_record;
+                        *managed = 1;
+                        pthread_mutex_unlock(&runtime_lock);
+                        return ptr;
+                    }
+                }
+                pthread_mutex_unlock(&runtime_lock);
+                errno = uffd_pager_mode == UFFD_PAGER_REQUIRED ?
+                    ENOMEM : register_errno;
+                return NULL;
+            }
             return ptr;
         }
 
@@ -2804,18 +5062,22 @@ static size_t record_page_range(AllocationRecord* record, void** range_start) {
 
 int mai_reclaim_all(void) {
     int rc = 0;
+    int saved_hook_depth = in_mai_hook;
 
+    in_mai_hook++;
     pthread_mutex_lock(&runtime_lock);
 
     stats_snapshot.reclaim_calls++;
 
     if (reclaim_policy == RECLAIM_NONE) {
         pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_hook_depth;
         return 0;
     }
 
     rc = reclaim_all_candidates_locked(reclaim_policy);
     pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
     return rc;
 }
 
@@ -2832,16 +5094,7 @@ int mai_sample_hotness(void) {
     return rc;
 }
 
-int mai_get_stats(MaiStats* out) {
-    if (!out) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    flush_current_pass_through_counter();
-
-    pthread_mutex_lock(&runtime_lock);
-    update_observed_rss_locked();
+static void populate_stats_snapshot_locked(MaiStats* out) {
     *out = stats_snapshot;
     snapshot_pass_through_counters_locked(&out->pass_through_allocations,
                                           &out->pass_through_bytes_total,
@@ -2854,15 +5107,683 @@ int mai_get_stats(MaiStats* out) {
     out->arena_size = arena_size_bytes;
     out->target_rss = target_rss_bytes;
     out->max_rss = effective_max_rss_locked(stats_snapshot.current_rss_bytes);
+}
+
+int mai_get_stats_sized(MaiStats* out, size_t stats_size) {
+    if (!out || stats_size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    flush_current_pass_through_counter();
+
+    MaiStats snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    pthread_mutex_lock(&runtime_lock);
+    update_observed_rss_locked();
+    pthread_mutex_lock(&uffd_fault_lock);
+    populate_stats_snapshot_locked(&snapshot);
+    pthread_mutex_unlock(&uffd_fault_lock);
     pthread_mutex_unlock(&runtime_lock);
 
+    size_t copy_size = stats_size < sizeof(snapshot) ? stats_size : sizeof(snapshot);
+    memset(out, 0, stats_size);
+    memcpy(out, &snapshot, copy_size);
     return 0;
+}
+
+int mai_get_stats(MaiStats* out) {
+    return mai_get_stats_sized(out, offsetof(MaiStats, uffd_pager_available));
+}
+
+int mai_hint_range(void* ptr, size_t len, uint32_t kind,
+                   const MaiHintOptions* opts) {
+    uintptr_t start;
+    uintptr_t end;
+
+    if (len == 0) {
+        return 0;
+    }
+    if (!ptr || !hint_kind_valid(kind) || !hint_options_valid(opts) ||
+        make_range(ptr, len, &start, &end) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+
+    int partial_overlap = 0;
+    AllocationRecord* record =
+        find_record_containing_range_locked(start, end, &partial_overlap);
+    if (!record) {
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_hook_depth;
+        if (partial_overlap) {
+            errno = EINVAL;
+            return -1;
+        }
+        return 0;
+    }
+
+    uintptr_t record_start;
+    uintptr_t record_end;
+    if (record_user_range_locked(record, &record_start, &record_end) != 0) {
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_hook_depth;
+        errno = EINVAL;
+        return -1;
+    }
+
+    record->hint_kind = kind;
+    record->hint_flags = opts ? opts->flags : 0;
+    record->hint_offset = (size_t)(start - record_start);
+    record->hint_length = len;
+    record->hint_hotset_bytes = opts ? opts->hotset_bytes : 0;
+    record->hint_window_bytes = opts ? opts->window_bytes : 0;
+    record->hint_epoch = ++hint_epoch_sequence;
+
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+    return 0;
+}
+
+int mai_reclaim_range(void* ptr, size_t len) {
+    uintptr_t start;
+    uintptr_t end;
+    int rc = 0;
+
+    if (len == 0) {
+        return 0;
+    }
+    if (!ptr || make_range(ptr, len, &start, &end) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+
+    int partial_overlap = 0;
+    AllocationRecord* record =
+        find_record_containing_range_locked(start, end, &partial_overlap);
+    if (!record) {
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_hook_depth;
+        if (partial_overlap) {
+            errno = EINVAL;
+            return -1;
+        }
+        return 0;
+    }
+
+    stats_snapshot.reclaim_calls++;
+    if (reclaim_policy != RECLAIM_NONE) {
+        void* page_start = NULL;
+        size_t page_length = 0;
+        if (clamp_range_to_record_pages_locked(record, start, end,
+                                               &page_start, &page_length) != 0) {
+            rc = -1;
+        } else if (page_length != 0) {
+            reclaim_epoch++;
+            rc = reclaim_record_range_locked(record, page_start, page_length,
+                                             reclaim_policy, page_length);
+            update_observed_rss_locked();
+        }
+    }
+
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+    return rc;
+}
+
+int mai_prefetch(void* ptr, size_t len) {
+    uintptr_t start;
+    uintptr_t end;
+    int rc = 0;
+
+    if (len == 0) {
+        return 0;
+    }
+    if (!ptr || make_range(ptr, len, &start, &end) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+
+    int partial_overlap = 0;
+    AllocationRecord* record =
+        find_record_containing_range_locked(start, end, &partial_overlap);
+    if (!record) {
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_hook_depth;
+        if (partial_overlap) {
+            errno = EINVAL;
+            return -1;
+        }
+        return 0;
+    }
+
+    void* page_start = NULL;
+    size_t page_length = 0;
+    if (clamp_range_to_record_pages_locked(record, start, end, &page_start,
+                                           &page_length) != 0) {
+        rc = -1;
+    } else if (page_length != 0 &&
+               !range_overlaps_exclusion_locked((uintptr_t)page_start,
+                                                (uintptr_t)page_start + page_length)) {
+        if (promote_record_range_to_anon_locked(record, page_start, page_length) != 0) {
+            rc = -1;
+        }
+#ifdef MADV_WILLNEED
+        if (rc == 0) {
+            rc = madvise(page_start, page_length, MADV_WILLNEED);
+        }
+#else
+        rc = rc == 0 ? 0 : rc;
+#endif
+    }
+
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+    return rc;
+}
+
+int mai_prepare_write(void* ptr, size_t len) {
+    uintptr_t start;
+    uintptr_t end;
+    int rc = 0;
+
+    if (len == 0) {
+        return 0;
+    }
+    if (!ptr || make_range(ptr, len, &start, &end) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+
+    int partial_overlap = 0;
+    AllocationRecord* record =
+        find_record_containing_range_locked(start, end, &partial_overlap);
+    if (!record) {
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_hook_depth;
+        if (partial_overlap) {
+            errno = EINVAL;
+            return -1;
+        }
+        return 0;
+    }
+
+    void* page_start = NULL;
+    size_t page_length = 0;
+    if (clamp_range_to_record_pages_locked(record, start, end, &page_start,
+                                           &page_length) != 0) {
+        rc = -1;
+    } else if (page_length != 0 &&
+               !range_overlaps_exclusion_locked((uintptr_t)page_start,
+                                                (uintptr_t)page_start + page_length)) {
+        rc = prepare_record_range_for_write_locked(record, page_start, page_length);
+    }
+
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+    return rc;
+}
+
+int mai_trace_access(void* ptr, size_t len, const MaiAccessTraceOptions* opts) {
+    uintptr_t start;
+    uintptr_t end;
+
+    if (len == 0) {
+        return 0;
+    }
+    if (!ptr || !access_trace_options_valid(opts) ||
+        make_range(ptr, len, &start, &end) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+
+    int partial_overlap = 0;
+    AllocationRecord* record =
+        find_record_containing_range_locked(start, end, &partial_overlap);
+    if (!record) {
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_hook_depth;
+        if (partial_overlap) {
+            errno = EINVAL;
+            return -1;
+        }
+        return 0;
+    }
+
+    int rc = arm_record_access_trace_locked(record, start, end,
+                                            opts ? opts->max_pages : 0,
+                                            opts ? opts->chunk_bytes : 0,
+                                            0,
+                                            NULL);
+
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+    return rc;
+}
+
+int mai_get_access_trace(void* ptr, MaiAccessTraceSnapshot* snapshot) {
+    if (!snapshot) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->size = sizeof(*snapshot);
+
+    if (!ptr) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+
+    uintptr_t start = (uintptr_t)ptr;
+    int partial_overlap = 0;
+    AllocationRecord* record =
+        find_record_containing_range_locked(start, start + 1, &partial_overlap);
+    if (!record || record->access_trace_id == 0) {
+        snapshot->page_size = page_size;
+        pthread_mutex_unlock(&runtime_lock);
+        in_mai_hook = saved_hook_depth;
+        return 0;
+    }
+
+    snapshot->page_size = page_size;
+    snapshot->total_pages = record->access_trace_total_pages;
+    snapshot->armed_pages = record->access_trace_armed_pages;
+
+    uint64_t bitmap = 0;
+    uint64_t first_sequence = 0;
+    uint64_t last_sequence = 0;
+    size_t touched_pages = 0;
+
+    for (size_t i = 0; i < MAI_ACCESS_TRACE_MAX_PAGES; i++) {
+        AccessTracePage* trace_page = &access_trace_pages[i];
+        int state = atomic_load_explicit(&trace_page->state, memory_order_acquire);
+        AllocationRecord* trace_record =
+            atomic_load_explicit(&trace_page->record, memory_order_acquire);
+        size_t trace_id =
+            atomic_load_explicit(&trace_page->trace_id, memory_order_acquire);
+        if (state == ACCESS_TRACE_FREE ||
+            trace_record != record ||
+            trace_id != record->access_trace_id) {
+            continue;
+        }
+
+        size_t sequence = atomic_load_explicit(&trace_page->touch_sequence,
+                                               memory_order_acquire);
+        if (state == ACCESS_TRACE_TOUCHED || sequence != 0) {
+            touched_pages++;
+            size_t sample_index =
+                atomic_load_explicit(&trace_page->sample_index,
+                                     memory_order_acquire);
+            if (sample_index < 64) {
+                bitmap |= 1ULL << sample_index;
+            }
+            if (first_sequence == 0 || sequence < first_sequence) {
+                first_sequence = sequence;
+            }
+            if (sequence > last_sequence) {
+                last_sequence = sequence;
+            }
+        }
+    }
+
+    snapshot->touched_pages = touched_pages;
+    snapshot->touched_bitmap = bitmap;
+    snapshot->first_touch_sequence = first_sequence;
+    snapshot->last_touch_sequence = last_sequence;
+
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+    return 0;
+}
+
+int mai_stop_access_trace(void* ptr) {
+    if (!ptr) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+
+    uintptr_t start = (uintptr_t)ptr;
+    int partial_overlap = 0;
+    AllocationRecord* record =
+        find_record_containing_range_locked(start, start + 1, &partial_overlap);
+    if (record) {
+        stop_record_access_trace_locked(record);
+    }
+
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+    return 0;
+}
+
+int mai_heartbeat(const MaiHeartbeatOptions* opts, MaiHeartbeatSnapshot* snapshot) {
+    if (!snapshot || !heartbeat_options_valid(opts)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->size = sizeof(*snapshot);
+
+    size_t observe_pages =
+        opts && opts->observe_pages != 0 ? opts->observe_pages :
+        MAI_DEFAULT_HEARTBEAT_OBSERVE_PAGES;
+    if (observe_pages > MAI_ACCESS_TRACE_MAX_PAGES) {
+        observe_pages = MAI_ACCESS_TRACE_MAX_PAGES;
+    }
+
+    size_t chunk_bytes =
+        opts && opts->chunk_bytes != 0 ? opts->chunk_bytes :
+        MAI_DEFAULT_HEARTBEAT_CHUNK_BYTES;
+    size_t chunk_pages = access_trace_chunk_pages(chunk_bytes);
+    if (chunk_pages == 0) {
+        chunk_pages = 1;
+    }
+    size_t chunk_length =
+        chunk_pages > SIZE_MAX / page_size ? SIZE_MAX : chunk_pages * page_size;
+
+    size_t migrate_budget = opts ? opts->migrate_bytes : 0;
+    migrate_budget -= migrate_budget % page_size;
+
+    int saved_hook_depth = in_mai_hook;
+    in_mai_hook++;
+    pthread_mutex_lock(&runtime_lock);
+
+    snapshot->epoch = ++heartbeat_epoch;
+
+    size_t touched_pages = 0;
+    size_t busy_score = 0;
+    for (AllocationRecord* record = live_head; record; record = record->live_next) {
+        size_t armed = 0;
+        size_t touched = 0;
+        record_access_trace_counts_locked(record, &armed, &touched);
+        touched_pages += touched;
+
+        if (armed != 0) {
+            if (touched != 0) {
+                record->heartbeat_last_touch_epoch = heartbeat_epoch;
+                record->heartbeat_quiet_epochs = 0;
+                if (record->heartbeat_busy_score >
+                    MAI_HEARTBEAT_BUSY_SCORE_CAP - touched) {
+                    record->heartbeat_busy_score = MAI_HEARTBEAT_BUSY_SCORE_CAP;
+                } else {
+                    record->heartbeat_busy_score += touched;
+                }
+            } else {
+                record->heartbeat_quiet_epochs++;
+                if (record->heartbeat_busy_score != 0) {
+                    record->heartbeat_busy_score--;
+                }
+            }
+        } else if (record->heartbeat_busy_score != 0) {
+            record->heartbeat_busy_score--;
+        }
+
+        if (busy_score > SIZE_MAX - record->heartbeat_busy_score) {
+            busy_score = SIZE_MAX;
+        } else {
+            busy_score += record->heartbeat_busy_score;
+        }
+    }
+
+    int busy = touched_pages != 0;
+    size_t reclaimed_bytes = 0;
+    int rc = 0;
+
+    if (!busy && migrate_budget != 0) {
+        ReclaimPolicy policy =
+            reclaim_policy == RECLAIM_NONE ? RECLAIM_DONTNEED : reclaim_policy;
+        size_t remaining = migrate_budget;
+        AllocationRecord* reclaim_records[MAI_ACCESS_TRACE_MAX_PAGES];
+        uintptr_t reclaim_starts[MAI_ACCESS_TRACE_MAX_PAGES];
+        size_t reclaim_lengths[MAI_ACCESS_TRACE_MAX_PAGES];
+        size_t reclaim_count = 0;
+        reclaim_epoch++;
+
+        for (size_t i = 0; i < MAI_ACCESS_TRACE_MAX_PAGES && remaining >= page_size; i++) {
+            AccessTracePage* trace_page = &access_trace_pages[i];
+            int state = atomic_load_explicit(&trace_page->state,
+                                             memory_order_acquire);
+            size_t sequence = atomic_load_explicit(&trace_page->touch_sequence,
+                                                   memory_order_acquire);
+            AllocationRecord* record =
+                atomic_load_explicit(&trace_page->record, memory_order_acquire);
+            size_t trace_id =
+                atomic_load_explicit(&trace_page->trace_id, memory_order_acquire);
+            size_t sample_index =
+                atomic_load_explicit(&trace_page->sample_index,
+                                     memory_order_acquire);
+            if (state != ACCESS_TRACE_ARMED || sequence != 0 || !record ||
+                trace_id != record->access_trace_id) {
+                continue;
+            }
+            if (record->heartbeat_quiet_epochs < heartbeat_min_quiet_epochs) {
+                continue;
+            }
+
+            void* record_page_start_ptr = NULL;
+            size_t record_page_length =
+                record_page_range(record, &record_page_start_ptr);
+            if (record_page_length == 0) {
+                continue;
+            }
+
+            uintptr_t record_page_start = (uintptr_t)record_page_start_ptr;
+            uintptr_t record_page_end = record_page_start + record_page_length;
+            uintptr_t representative_page =
+                atomic_load_explicit(&trace_page->page, memory_order_acquire);
+            if (representative_page < record_page_start ||
+                representative_page >= record_page_end) {
+                continue;
+            }
+
+            uintptr_t trace_start = record->access_trace_start;
+            uintptr_t range_start = trace_start;
+            if (chunk_length > 0 && sample_index > 0) {
+                if (sample_index > (UINTPTR_MAX - trace_start) / chunk_length) {
+                    continue;
+                }
+                range_start = trace_start + sample_index * chunk_length;
+            }
+            if (range_start < record_page_start) {
+                range_start = record_page_start;
+            }
+            if (range_start >= record_page_end) {
+                continue;
+            }
+
+            uintptr_t range_end;
+            if (chunk_length > UINTPTR_MAX - range_start) {
+                range_end = UINTPTR_MAX;
+            } else {
+                range_end = range_start + chunk_length;
+            }
+            if (range_end > record_page_end) {
+                range_end = record_page_end;
+            }
+            size_t range_length = (size_t)(range_end - range_start);
+            if (range_length > remaining) {
+                range_length = remaining - (remaining % page_size);
+            }
+            if (range_length == 0) {
+                break;
+            }
+
+            reclaim_records[reclaim_count] = record;
+            reclaim_starts[reclaim_count] = range_start;
+            reclaim_lengths[reclaim_count] = range_length;
+            reclaim_count++;
+            remaining -= range_length;
+        }
+
+        for (size_t i = 0; rc == 0 && i < reclaim_count; i++) {
+            AllocationRecord* record = reclaim_records[i];
+            uintptr_t range_start = reclaim_starts[i];
+            size_t range_length = reclaim_lengths[i];
+
+            if (mprotect((void*)range_start, page_size,
+                         PROT_READ | PROT_WRITE) != 0) {
+                rc = -1;
+                break;
+            }
+
+            if (reclaim_record_range_locked(record, (void*)range_start,
+                                            range_length, policy,
+                                            range_length) != 0) {
+                rc = -1;
+                break;
+            }
+            reclaimed_bytes += range_length;
+        }
+
+        if (reclaimed_bytes != 0) {
+            update_observed_rss_locked();
+        }
+    }
+
+    stop_all_access_traces_locked();
+
+    size_t rearm_budget = busy && observe_pages > 1 ? observe_pages / 2 :
+        observe_pages;
+    size_t armed_pages = 0;
+    size_t observed_allocations = 0;
+
+    AllocationRecord* start_record = heartbeat_cursor ? heartbeat_cursor : live_head;
+    AllocationRecord* record = start_record;
+    while (rc == 0 && rearm_budget != 0 && record) {
+        AllocationRecord* next_record = record->live_next ? record->live_next :
+            live_head;
+        uintptr_t start;
+        uintptr_t end;
+        if (record_user_range_locked(record, &start, &end) != 0) {
+            if (next_record == start_record) {
+                heartbeat_cursor = next_record;
+                break;
+            }
+            record = next_record;
+            continue;
+        }
+
+        size_t armed_for_record = 0;
+        size_t chunk_phase =
+            heartbeat_chunk_phase_pages(chunk_pages, heartbeat_epoch);
+        rc = arm_record_access_trace_locked(record, start, end, rearm_budget,
+                                            chunk_bytes, chunk_phase,
+                                            &armed_for_record);
+        if (rc != 0) {
+            break;
+        }
+        if (armed_for_record != 0) {
+            observed_allocations++;
+            armed_pages += armed_for_record;
+            if (armed_for_record >= rearm_budget) {
+                rearm_budget = 0;
+            } else {
+                rearm_budget -= armed_for_record;
+            }
+        }
+        heartbeat_cursor = next_record;
+        if (next_record == start_record) {
+            break;
+        }
+        record = next_record;
+    }
+
+    snapshot->observed_allocations = observed_allocations;
+    snapshot->armed_pages = armed_pages;
+    snapshot->touched_pages = touched_pages;
+    snapshot->reclaimed_bytes = reclaimed_bytes;
+    snapshot->busy_score = busy_score;
+    snapshot->busy = busy;
+
+    pthread_mutex_unlock(&runtime_lock);
+    in_mai_hook = saved_hook_depth;
+    return rc;
+}
+
+static void background_heartbeat_sleep(size_t interval_us) {
+    struct timespec duration;
+    duration.tv_sec = (time_t)(interval_us / 1000000);
+    duration.tv_nsec = (long)((interval_us % 1000000) * 1000);
+    while (nanosleep(&duration, &duration) != 0 && errno == EINTR) {
+    }
+}
+
+static void* background_heartbeat_main(void* arg) {
+    (void)arg;
+
+    MaiHeartbeatOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.size = sizeof(opts);
+    opts.observe_pages = background_heartbeat_observe_pages;
+    opts.chunk_bytes = background_heartbeat_chunk_bytes;
+    opts.migrate_bytes = background_heartbeat_migrate_bytes;
+
+    while (atomic_load_explicit(&background_heartbeat_stop,
+                                memory_order_acquire) == 0) {
+        MaiHeartbeatSnapshot snapshot;
+        (void)mai_heartbeat(&opts, &snapshot);
+        background_heartbeat_sleep(background_heartbeat_interval_us);
+    }
+
+    return NULL;
+}
+
+static int start_background_heartbeat(void) {
+    if (!background_heartbeat_enabled || background_heartbeat_started) {
+        return 0;
+    }
+    atomic_store_explicit(&background_heartbeat_stop, 0, memory_order_release);
+    if (pthread_create(&background_heartbeat_thread, NULL,
+                       background_heartbeat_main, NULL) != 0) {
+        background_heartbeat_enabled = 0;
+        return -1;
+    }
+    background_heartbeat_started = 1;
+    return 0;
+}
+
+static void stop_background_heartbeat(void) {
+    if (!background_heartbeat_started) {
+        return;
+    }
+    atomic_store_explicit(&background_heartbeat_stop, 1, memory_order_release);
+    (void)pthread_join(background_heartbeat_thread, NULL);
+    background_heartbeat_started = 0;
 }
 
 static void print_stats(void) {
     MaiStats stats;
 
-    if (mai_get_stats(&stats) != 0) {
+    if (mai_get_stats_sized(&stats, sizeof(stats)) != 0) {
         return;
     }
 
@@ -2879,7 +5800,11 @@ static void print_stats(void) {
             "allocator_preload_calls=%zu allocator_frida_calls=%zu excluded_ranges=%zu "
             "excluded_bytes=%zu exclusion_events=%zu exclusion_release_events=%zu "
             "reclaim_skipped_excluded=%zu reclaim_skipped_excluded_bytes=%zu "
-            "safety_hook_patches=%zu\n",
+            "safety_hook_patches=%zu anon_allocations=%zu file_allocations=%zu "
+            "migrated_to_file_bytes=%zu promoted_to_anon_bytes=%zu "
+            "uffd_pager_available=%zu uffd_pager_allocations=%zu "
+            "uffd_faults=%zu uffd_evictions=%zu uffd_resident_bytes=%zu "
+            "uffd_fallbacks=%zu\n",
             stats.enabled, stats.configured, stats.config_error, stats.threshold,
             stats.arena_size, stats.target_rss, stats.max_rss,
             stats.current_rss_bytes, stats.high_water_rss_bytes,
@@ -2897,7 +5822,12 @@ static void print_stats(void) {
             stats.allocator_frida_calls, stats.excluded_ranges, stats.excluded_bytes,
             stats.exclusion_events, stats.exclusion_release_events,
             stats.reclaim_skipped_excluded, stats.reclaim_skipped_excluded_bytes,
-            stats.safety_hook_patches);
+            stats.safety_hook_patches, stats.anon_allocations,
+            stats.file_allocations, stats.migrated_to_file_bytes,
+            stats.promoted_to_anon_bytes, stats.uffd_pager_available,
+            stats.uffd_pager_allocations, stats.uffd_faults,
+            stats.uffd_evictions, stats.uffd_resident_bytes,
+            stats.uffd_fallbacks);
 }
 
 static void print_profile_report(void) {
@@ -3037,7 +5967,27 @@ static int configure_runtime(void) {
     const char* max_rss = getenv("MAI_MAX_RSS");
     const char* reclaim = getenv("MAI_RECLAIM_POLICY");
     const char* reclaim_select = getenv("MAI_RECLAIM_SELECTION");
+    const char* backend = getenv("MAI_BACKEND");
+    const char* uffd_pager = getenv("MAI_UFFD_PAGER");
+    const char* uffd_resident_limit = getenv("MAI_UFFD_RESIDENT_LIMIT");
+    const char* uffd_resident_low_limit =
+        getenv("MAI_UFFD_RESIDENT_LOW_LIMIT");
+    const char* uffd_prefetch = getenv("MAI_UFFD_PREFETCH_CHUNKS");
+    const char* migration_chunk = getenv("MAI_MIGRATION_CHUNK");
+    const char* file_dedicated_min = getenv("MAI_FILE_DEDICATED_MIN");
+    const char* auto_large_alloc_percent =
+        getenv("MAI_AUTO_LARGE_ALLOC_CAP_PERCENT");
     const char* hotness_sample = getenv("MAI_HOTNESS_SAMPLE_PAGES");
+    const char* heartbeat_quiet = getenv("MAI_HEARTBEAT_MIN_QUIET_EPOCHS");
+    const char* background_heartbeat = getenv("MAI_HEARTBEAT_BACKGROUND");
+    const char* background_interval =
+        getenv("MAI_HEARTBEAT_BACKGROUND_INTERVAL_US");
+    const char* background_observe =
+        getenv("MAI_HEARTBEAT_BACKGROUND_OBSERVE_PAGES");
+    const char* background_chunk =
+        getenv("MAI_HEARTBEAT_BACKGROUND_CHUNK");
+    const char* background_migrate =
+        getenv("MAI_HEARTBEAT_BACKGROUND_MIGRATE");
     const char* backing_path;
 
     runtime_enabled = parse_bool_env(enable);
@@ -3050,6 +6000,15 @@ static int configure_runtime(void) {
     hotness_enabled = parse_bool_env(getenv("MAI_HOTNESS"));
     reclaim_policy = RECLAIM_NONE;
     reclaim_selection = RECLAIM_SELECT_OLDEST;
+    backend_mode = BACKEND_MODE_AUTO;
+    uffd_pager_mode = UFFD_PAGER_OFF;
+    uffd_pager_available = 0;
+    uffd_resident_limit_bytes = 0;
+    uffd_resident_low_limit_bytes = 0;
+    uffd_resident_limit_explicit = 0;
+    uffd_resident_bytes = 0;
+    uffd_touch_epoch = 0;
+    uffd_head = NULL;
 
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     if (page_size == 0) {
@@ -3062,9 +6021,23 @@ static int configure_runtime(void) {
     max_rss_bytes = 0;
     max_rss_auto = 1;
     max_rss_enabled = 1;
+    auto_large_alloc_cap_percent = MAI_AUTO_LARGE_ALLOC_CAP_PERCENT;
     memory_cap_check_counter = 0;
     memory_cap_refresh_counter = 0;
     hotness_sample_pages = MAI_DEFAULT_HOTNESS_SAMPLE_PAGES;
+    heartbeat_min_quiet_epochs = MAI_DEFAULT_HEARTBEAT_MIN_QUIET_EPOCHS;
+    background_heartbeat_enabled = parse_bool_env(background_heartbeat);
+    background_heartbeat_interval_us =
+        MAI_DEFAULT_BACKGROUND_HEARTBEAT_INTERVAL_US;
+    background_heartbeat_observe_pages = MAI_DEFAULT_HEARTBEAT_OBSERVE_PAGES;
+    background_heartbeat_chunk_bytes = MAI_DEFAULT_HEARTBEAT_CHUNK_BYTES;
+    background_heartbeat_migrate_bytes =
+        MAI_DEFAULT_BACKGROUND_HEARTBEAT_MIGRATE_BYTES;
+    background_heartbeat_started = 0;
+    atomic_store_explicit(&background_heartbeat_stop, 0, memory_order_relaxed);
+    migration_chunk_bytes = MAI_DEFAULT_MIGRATION_CHUNK_BYTES;
+    uffd_prefetch_chunks = MAI_DEFAULT_UFFD_PREFETCH_CHUNKS;
+    file_dedicated_min_bytes = MAI_DEFAULT_FILE_DEDICATED_MIN_BYTES;
 
     memset(&stats_snapshot, 0, sizeof(stats_snapshot));
     pass_through_counter_generation++;
@@ -3082,6 +6055,7 @@ static int configure_runtime(void) {
     dynamic_replacements = NULL;
     exclusion_ranges = NULL;
     registration_records = NULL;
+    heartbeat_cursor = NULL;
     mlockall_future_active = 0;
     atomic_store_explicit(&dynamic_replacements_active, 0, memory_order_relaxed);
     atomic_store_explicit(&managed_range_low, 0, memory_order_relaxed);
@@ -3089,6 +6063,28 @@ static int configure_runtime(void) {
     next_segment_id = 0;
     allocation_sequence = 0;
     reclaim_epoch = 0;
+    heartbeat_epoch = 0;
+    hint_epoch_sequence = 0;
+    access_trace_id_sequence = 0;
+    atomic_store_explicit(&access_trace_sequence, 0, memory_order_relaxed);
+    for (size_t i = 0; i < MAI_ACCESS_TRACE_MAX_PAGES; i++) {
+        atomic_store_explicit(&access_trace_pages[i].state, ACCESS_TRACE_FREE,
+                              memory_order_relaxed);
+        atomic_store_explicit(&access_trace_pages[i].page, 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&access_trace_pages[i].retired_page, 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&access_trace_pages[i].retired_deadline_ns, 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&access_trace_pages[i].record, NULL,
+                              memory_order_relaxed);
+        atomic_store_explicit(&access_trace_pages[i].trace_id, 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&access_trace_pages[i].sample_index, 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&access_trace_pages[i].touch_sequence, 0,
+                              memory_order_relaxed);
+    }
 
     if (!runtime_enabled) {
         return 0;
@@ -3124,9 +6120,117 @@ static int configure_runtime(void) {
             max_rss_enabled = max_rss_bytes != 0;
         }
     }
+    if (auto_large_alloc_percent &&
+        parse_count_env(auto_large_alloc_percent,
+                        &auto_large_alloc_cap_percent) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
     if (hotness_sample && parse_count_env(hotness_sample, &hotness_sample_pages) != 0) {
         runtime_config_error = 1;
         return -1;
+    }
+    if (heartbeat_quiet &&
+        parse_count_env(heartbeat_quiet, &heartbeat_min_quiet_epochs) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (background_interval &&
+        parse_count_env(background_interval,
+                        &background_heartbeat_interval_us) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (background_observe &&
+        parse_count_env(background_observe,
+                        &background_heartbeat_observe_pages) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (background_chunk &&
+        parse_size_env(background_chunk,
+                       &background_heartbeat_chunk_bytes) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (background_migrate &&
+        parse_size_env(background_migrate,
+                       &background_heartbeat_migrate_bytes) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (uffd_resident_limit && uffd_resident_limit[0] != '\0' &&
+        strcmp(uffd_resident_limit, "auto") != 0) {
+        if (parse_size_env(uffd_resident_limit, &uffd_resident_limit_bytes) != 0) {
+            runtime_config_error = 1;
+            return -1;
+        }
+        uffd_resident_limit_explicit = 1;
+    }
+    if (uffd_resident_low_limit && uffd_resident_low_limit[0] != '\0' &&
+        strcmp(uffd_resident_low_limit, "auto") != 0 &&
+        parse_size_env(uffd_resident_low_limit,
+                       &uffd_resident_low_limit_bytes) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (uffd_prefetch &&
+        parse_count_env(uffd_prefetch, &uffd_prefetch_chunks) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (migration_chunk && parse_size_env(migration_chunk, &migration_chunk_bytes) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (file_dedicated_min &&
+        parse_size_env(file_dedicated_min, &file_dedicated_min_bytes) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    if (backend && backend[0] != '\0') {
+        if (strcmp(backend, "auto") == 0) {
+            backend_mode = BACKEND_MODE_AUTO;
+        } else if (strcmp(backend, "anon") == 0 ||
+                   strcmp(backend, "anonymous") == 0) {
+            backend_mode = BACKEND_MODE_ANON;
+        } else if (strcmp(backend, "file") == 0 ||
+                   strcmp(backend, "arena") == 0) {
+            backend_mode = BACKEND_MODE_FILE;
+        } else {
+            runtime_config_error = 1;
+            return -1;
+        }
+    }
+    if (uffd_pager && uffd_pager[0] != '\0') {
+        if (strcmp(uffd_pager, "off") == 0 ||
+            strcmp(uffd_pager, "0") == 0 ||
+            strcmp(uffd_pager, "false") == 0) {
+            uffd_pager_mode = UFFD_PAGER_OFF;
+        } else if (strcmp(uffd_pager, "auto") == 0 ||
+                   strcmp(uffd_pager, "1") == 0 ||
+                   strcmp(uffd_pager, "true") == 0) {
+            uffd_pager_mode = UFFD_PAGER_AUTO;
+        } else if (strcmp(uffd_pager, "required") == 0 ||
+                   strcmp(uffd_pager, "require") == 0) {
+            uffd_pager_mode = UFFD_PAGER_REQUIRED;
+        } else {
+            runtime_config_error = 1;
+            return -1;
+        }
+    }
+    if (uffd_pager_mode != UFFD_PAGER_OFF) {
+        uffd_pager_available = probe_userfaultfd_pager();
+        stats_snapshot.uffd_pager_available = (size_t)uffd_pager_available;
+        if (!uffd_pager_available) {
+            pthread_mutex_lock(&uffd_fault_lock);
+            stats_snapshot.uffd_fallbacks++;
+            pthread_mutex_unlock(&uffd_fault_lock);
+            if (uffd_pager_mode == UFFD_PAGER_REQUIRED) {
+                runtime_config_error = 1;
+                return -1;
+            }
+        }
     }
 
     if (threshold_bytes == 0) {
@@ -3135,11 +6239,79 @@ static int configure_runtime(void) {
     if (arena_size_bytes < MAI_MIN_ARENA_SIZE) {
         arena_size_bytes = MAI_MIN_ARENA_SIZE;
     }
+    if (file_dedicated_min_bytes != 0 && file_dedicated_min_bytes < page_size) {
+        file_dedicated_min_bytes = page_size;
+    }
+    if (auto_large_alloc_cap_percent > 100) {
+        runtime_config_error = 1;
+        return -1;
+    }
     if (hotness_sample_pages == 0) {
         hotness_sample_pages = 1;
     }
     if (hotness_sample_pages > MAI_MAX_HOTNESS_SAMPLE_PAGES) {
         hotness_sample_pages = MAI_MAX_HOTNESS_SAMPLE_PAGES;
+    }
+    if (heartbeat_min_quiet_epochs == 0) {
+        heartbeat_min_quiet_epochs = 1;
+    }
+    if (background_heartbeat_interval_us == 0) {
+        background_heartbeat_interval_us = 1;
+    }
+    if (background_heartbeat_observe_pages == 0) {
+        background_heartbeat_observe_pages = 1;
+    }
+    if (background_heartbeat_observe_pages > MAI_ACCESS_TRACE_MAX_PAGES) {
+        background_heartbeat_observe_pages = MAI_ACCESS_TRACE_MAX_PAGES;
+    }
+    if (background_heartbeat_chunk_bytes < page_size) {
+        background_heartbeat_chunk_bytes = page_size;
+    }
+    background_heartbeat_chunk_bytes =
+        align_up_size(background_heartbeat_chunk_bytes, page_size);
+    background_heartbeat_migrate_bytes -=
+        background_heartbeat_migrate_bytes % page_size;
+    if (uffd_prefetch_chunks == 0) {
+        uffd_prefetch_chunks = 1;
+    }
+    if (uffd_prefetch_chunks > MAI_MAX_UFFD_PREFETCH_CHUNKS) {
+        uffd_prefetch_chunks = MAI_MAX_UFFD_PREFETCH_CHUNKS;
+    }
+    if (uffd_pager_mode != UFFD_PAGER_OFF && !uffd_resident_limit_explicit) {
+        size_t cap = 0;
+        if (max_rss_enabled) {
+            cap = max_rss_auto ?
+                detect_auto_max_rss_bytes(sample_process_rss_bytes()) :
+                max_rss_bytes;
+        }
+        uffd_resident_limit_bytes = cap == 0 ? 0 :
+            percent_of_size(cap, MAI_AUTO_ANON_LIMIT_PERCENT);
+    }
+    if (uffd_resident_limit_bytes != 0) {
+        if (uffd_resident_limit_bytes < page_size) {
+            uffd_resident_limit_bytes = page_size;
+        }
+        uffd_resident_limit_bytes =
+            align_up_size(uffd_resident_limit_bytes, page_size);
+    }
+    if (uffd_resident_low_limit_bytes != 0) {
+        if (uffd_resident_low_limit_bytes < page_size) {
+            uffd_resident_low_limit_bytes = page_size;
+        }
+        uffd_resident_low_limit_bytes =
+            align_up_size(uffd_resident_low_limit_bytes, page_size);
+        if (uffd_resident_limit_bytes != 0 &&
+            uffd_resident_low_limit_bytes > uffd_resident_limit_bytes) {
+            uffd_resident_low_limit_bytes = uffd_resident_limit_bytes;
+        }
+    }
+    if (migration_chunk_bytes < page_size) {
+        migration_chunk_bytes = page_size;
+    }
+    migration_chunk_bytes = align_up_size(migration_chunk_bytes, page_size);
+    if (migration_chunk_bytes == 0) {
+        runtime_config_error = 1;
+        return -1;
     }
     if (max_rss_enabled && max_rss_auto) {
         max_rss_bytes = detect_auto_max_rss_bytes(sample_process_rss_bytes());
@@ -3317,6 +6489,10 @@ static void* custom_realloc_from_site(void* ptr, size_t size, void* call_site) {
     if (record) {
         size_t old_size = record->user_size;
         if (size <= old_size) {
+            if (size != old_size) {
+                stop_record_access_trace_locked(record);
+                clear_record_hint_locked(record);
+            }
             stats_reduce_live_managed(old_size - size);
             record->user_size = size;
             pthread_mutex_unlock(&runtime_lock);
@@ -5570,13 +8746,16 @@ int malloc_interceptor_attach(void) {
         (size_t)rdma_reg_read_replaced +
         (size_t)rdma_reg_write_replaced +
         (size_t)rdma_dereg_mr_replaced;
+    (void)start_background_heartbeat();
     if (verbose_logging) {
         fprintf(stderr,
                 "MAI: enabled path=%s threshold=%zu arena_size=%zu target_rss=%zu "
-                "max_rss=%zu reclaim=%d "
+                "max_rss=%zu reclaim=%d file_dedicated_min=%zu "
+                "auto_large_alloc_cap_percent=%zu "
                 "allocator_hooks=%s\n",
                 mai_path, threshold_bytes, arena_size_bytes, target_rss_bytes,
-                max_rss_bytes, reclaim_policy,
+                max_rss_bytes, reclaim_policy, file_dedicated_min_bytes,
+                auto_large_alloc_cap_percent,
                 patch_libc_allocators ? "frida" : "preload");
     }
 
@@ -5593,7 +8772,14 @@ void malloc_interceptor_detach(void) {
     }
 
     cleanup_in_progress = 1;
+    stop_background_heartbeat();
+    stop_uffd_pager();
     revert_replacements();
+
+    pthread_mutex_lock(&runtime_lock);
+    stop_all_access_traces_locked();
+    pthread_mutex_unlock(&runtime_lock);
+    restore_access_trace_handler();
 
     if (stats_logging || verbose_logging || profile_enabled || hotness_enabled) {
         print_stats();

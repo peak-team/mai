@@ -10,7 +10,7 @@ struct alignas(128) OverAlignedBlock {
 };
 
 static int load_stats(MaiStats* stats) {
-    return mai_get_stats(stats);
+    return mai_get_stats_sized(stats, sizeof(*stats));
 }
 
 static bool aligned_ptr(void* ptr, std::size_t alignment) {

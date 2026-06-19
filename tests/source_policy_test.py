@@ -6,8 +6,7 @@ import sys
 
 
 FORBIDDEN = {
-    "kernel pager or swap dependency": [
-        r"\buserfaultfd\b",
+    "swap dependency": [
         r"\bswapon\b",
         r"\bswapoff\b",
     ],
@@ -35,6 +34,10 @@ FORBIDDEN = {
         r"\buname\s*\(",
         r"\bLINUX_VERSION_CODE\b",
         r"\bKERNEL_VERSION\s*\(",
+    ],
+    "benchmark-oracle runtime dependency": [
+        r"MAI_BENCH_",
+        r"MAI_STREAM_",
     ],
 }
 

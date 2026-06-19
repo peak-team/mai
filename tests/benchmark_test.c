@@ -23,6 +23,7 @@ typedef void* (*bench_malloc_fn)(size_t);
 typedef void* (*bench_calloc_fn)(size_t, size_t);
 typedef void (*bench_free_fn)(void*);
 typedef int (*get_stats_fn)(MaiStats*);
+typedef int (*get_stats_sized_fn)(MaiStats*, size_t);
 
 static bench_malloc_fn benchmark_malloc = malloc;
 static bench_calloc_fn benchmark_calloc = calloc;
@@ -88,6 +89,11 @@ static int configure_allocator_source(void) {
 }
 
 static int load_stats(MaiStats* stats) {
+    get_stats_sized_fn get_stats_sized =
+        (get_stats_sized_fn)dlsym(RTLD_DEFAULT, "mai_get_stats_sized");
+    if (get_stats_sized) {
+        return get_stats_sized(stats, sizeof(*stats));
+    }
     get_stats_fn get_stats = (get_stats_fn)dlsym(RTLD_DEFAULT, "mai_get_stats");
     if (!get_stats) {
         return -1;
@@ -226,31 +232,38 @@ static int verify_expected_path(const char* expected_path, int stats_available,
     size_t preload_delta =
         after->allocator_preload_calls - before->allocator_preload_calls;
     size_t frida_delta = after->allocator_frida_calls - before->allocator_frida_calls;
+    size_t managed_delta = after->managed_allocations - before->managed_allocations;
 
     if (strcmp(expected_path, "preload") == 0) {
-        if (after->allocator_hook_mode != 1 || preload_delta == 0 || frida_delta != 0) {
+        if (after->allocator_hook_mode != 1 ||
+            (preload_delta == 0 && managed_delta == 0) ||
+            frida_delta != 0) {
             fprintf(stderr,
                     "expected preload path, got hook_mode=%zu preload_delta=%zu "
-                    "frida_delta=%zu\n",
-                    after->allocator_hook_mode, preload_delta, frida_delta);
+                    "frida_delta=%zu managed_delta=%zu\n",
+                    after->allocator_hook_mode, preload_delta, frida_delta,
+                    managed_delta);
             return 1;
         }
         return 0;
     }
 
     if (strcmp(expected_path, "frida") == 0) {
-        if (after->allocator_hook_mode != 2 || frida_delta == 0 || preload_delta != 0) {
+        if (after->allocator_hook_mode != 2 ||
+            (frida_delta == 0 && managed_delta == 0) ||
+            preload_delta != 0) {
             fprintf(stderr,
                     "expected Frida path, got hook_mode=%zu preload_delta=%zu "
-                    "frida_delta=%zu\n",
-                    after->allocator_hook_mode, preload_delta, frida_delta);
+                    "frida_delta=%zu managed_delta=%zu\n",
+                    after->allocator_hook_mode, preload_delta, frida_delta,
+                    managed_delta);
             return 1;
         }
         return 0;
     }
 
     if (strcmp(expected_path, "any") == 0) {
-        if (preload_delta == 0 && frida_delta == 0) {
+        if (preload_delta == 0 && frida_delta == 0 && managed_delta == 0) {
             fprintf(stderr, "expected any MAI allocator path, got no path calls\n");
             return 1;
         }
@@ -275,13 +288,16 @@ static void print_result(const char* mode, size_t iterations, size_t size,
            size, allocator_source, seconds, ns_per_op, (size_t)checksum);
 
     if (stats_available) {
-        printf(" hook_mode=%zu libc_patches=%zu preload_delta=%zu frida_delta=%zu",
+        printf(" hook_mode=%zu libc_patches=%zu preload_delta=%zu frida_delta=%zu "
+               "managed_delta=%zu",
                after->allocator_hook_mode,
                after->allocator_libc_patches,
                after->allocator_preload_calls - before->allocator_preload_calls,
-               after->allocator_frida_calls - before->allocator_frida_calls);
+               after->allocator_frida_calls - before->allocator_frida_calls,
+               after->managed_allocations - before->managed_allocations);
     } else {
-        printf(" hook_mode=unavailable preload_delta=unavailable frida_delta=unavailable");
+        printf(" hook_mode=unavailable preload_delta=unavailable frida_delta=unavailable "
+               "managed_delta=unavailable");
     }
     printf("\n");
 }
