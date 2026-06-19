@@ -160,6 +160,19 @@ typedef struct {
     size_t policy_successor_chain_candidates;
     size_t policy_successor_chain_rejected;
     size_t policy_successor_chain_depth;
+    size_t policy_signature_train_samples;
+    size_t policy_signature_train_hits;
+    size_t policy_signature_slots_created;
+    size_t policy_signature_score_decays;
+    size_t policy_signature_candidates;
+    size_t policy_signature_pressure_rejected;
+    size_t policy_signature_unused_penalties;
+    size_t policy_signature_chain_candidates;
+    size_t policy_signature_chain_rejected;
+    size_t policy_signature_chain_depth;
+    size_t policy_signature_top_delta_magnitude;
+    size_t policy_signature_top_delta_sign;
+    size_t policy_signature_top_score;
 } MaiStats;
 
 /**

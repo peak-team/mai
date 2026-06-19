@@ -163,6 +163,22 @@ if(BUILD_TESTING)
     )
 
     add_test(
+        NAME mai_policy_signature_context_cycle_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_POLICY_SIGNATURE_UNIT=2M"
+            "MAI_BENCH_POLICY_SIGNATURE_REGION_UNITS=8"
+            "MAI_BENCH_POLICY_SIGNATURE_PASSES=2"
+            "MAI_BENCH_POLICY_SIGNATURE_SEED=7"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            policy_signature_context_cycle
+            32M
+    )
+    set_tests_properties(mai_policy_signature_context_cycle_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=policy_signature_context_cycle .*logical_mib=80\\.000 .*stream_pipeline_group_visits=4 .*stream_pipeline_groups=2 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=signature_context_cycle .*stream_pipeline_seed=7 .*stream_pipeline_prediction=signature_history .*stream_pipeline_reclaim_horizon=8"
+    )
+
+    add_test(
         NAME mai_policy_spatial_region_mask_smoke
         COMMAND ${CMAKE_COMMAND} -E env
             "MAI_ACCESS_EXPECT_MANAGED=0"

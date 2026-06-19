@@ -167,14 +167,15 @@ Runtime policy knobs are intentionally separate from benchmark knobs:
 - `MAI_MIGRATION_POLICY` or `MAI_POLICY`: `legacy`, `lru`, `clock`, `fifo`,
   `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, or
   `lruk`/`lru-k`, `car`/`car-lite`, `markov`/`successor`, or
-  `spatial`/`spatial-mask`, `tinylfu`/`tiny-lfu`, or
-  `wtinylfu`/`window-tinylfu`
+  `spatial`/`spatial-mask`, `tinylfu`/`tiny-lfu`,
+  `wtinylfu`/`window-tinylfu`, or `signature`/`history-table`
 - `MAI_UFFD_PREFETCH_CHUNKS`: maximum UFFD prefetch lookahead
 - `MAI_UFFD_RESIDENT_LIMIT` and `MAI_UFFD_RESIDENT_LOW_LIMIT`: resident
   high/low watermarks for UFFD-managed chunks
 - `MAI_MIGRATION_CHUNK`: chunk size used for migration and policy metadata
-- `MAI_POLICY_SUCCESSOR_CHAIN_DEPTH`: opt-in successor-chain lookahead depth
-  for `markov` and `wtinylfu`; default 1 preserves one-successor behavior
+- `MAI_POLICY_SUCCESSOR_CHAIN_DEPTH`: opt-in chain lookahead depth for
+  `markov`, `wtinylfu`, and `signature`; default 1 preserves one-step
+  behavior
 - `MAI_SPATIAL_REGION_CHUNKS`: chunk count per spatial region-mask group
 - `MAI_SPATIAL_TABLE_SLOTS`: maximum active spatial region masks per
   allocation, default 64 and max 64
@@ -198,7 +199,8 @@ Policy pressure scenarios can use `mai_policy_pipeline` with
 `mai_policy_2q_pipeline`. The runtime accepts `legacy`, `lru`, `clock`,
 `fifo`, `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`,
 `lruk`/`lru-k`, `car`/`car-lite`, `markov`/`successor`,
-`spatial`/`spatial-mask`, `tinylfu`/`tiny-lfu`, and
+`spatial`/`spatial-mask`, `tinylfu`/`tiny-lfu`,
+`wtinylfu`/`window-tinylfu`, `signature`/`history-table`, and
 `best-offset`/`offset-prefetch`.
 
 `policy_multistream_stride` is a focused no-oracle workload for stride
@@ -293,6 +295,15 @@ On the local 64M allocation / 16M resident-limit smoke shape, `markov`
 reduced demand faults versus `stride` and modestly improved sampled-unit rate
 when write-protect observation was disabled. Enable observation only when you
 need useful-prefetch accounting, because it changes fault behavior.
+
+`policy_signature_context_cycle` is a no-oracle workload for history-table
+predictors. Each eight-chunk region alternates two short contexts that share a
+middle chunk but require different successors, so one-successor `markov` sees
+an ambiguous transition and constant-stride predictors see no stable stream.
+Control it with `MAI_BENCH_POLICY_SIGNATURE_UNIT`,
+`MAI_BENCH_POLICY_SIGNATURE_REGION_UNITS`,
+`MAI_BENCH_POLICY_SIGNATURE_PASSES`, and
+`MAI_BENCH_POLICY_SIGNATURE_SEED`.
 
 `policy_spatial_region_mask` is a policy-event workload for region-mask
 predictors. It divides one allocation into eight-unit regions and repeatedly

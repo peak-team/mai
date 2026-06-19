@@ -2070,6 +2070,99 @@ static int run_policy_successor_cycle(unsigned char* buffer, size_t size,
     return 0;
 }
 
+static int run_policy_signature_context_cycle(unsigned char* buffer,
+                                              size_t size,
+                                              uint64_t* checksum,
+                                              size_t* touches) {
+    static const size_t context_a[] = {0, 2, 3, 5, 7};
+    static const size_t context_b[] = {1, 4, 3, 6, 4};
+    const size_t context_len = sizeof(context_a) / sizeof(context_a[0]);
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_SIGNATURE_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t region_units =
+        env_count("MAI_BENCH_POLICY_SIGNATURE_REGION_UNITS", 8);
+    size_t passes =
+        env_count("MAI_BENCH_POLICY_SIGNATURE_PASSES", 4);
+    size_t seed = env_count("MAI_BENCH_POLICY_SIGNATURE_SEED", 7);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    if (region_units < 8) {
+        region_units = 8;
+    }
+    size_t units = size / unit_bytes;
+    if (units < region_units || units % region_units != 0) {
+        return -1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+    size_t regions = units / region_units;
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    size_t* order = calloc(regions, sizeof(*order));
+    if (!expected || !order) {
+        free(order);
+        free(expected);
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t pass = 0; pass < passes; pass++) {
+        shuffle_size_order(order, regions, (uint64_t)seed +
+                           pass * 2654435761ULL);
+        for (size_t order_index = 0; order_index < regions; order_index++) {
+            size_t region = order[order_index];
+            size_t region_base = region * region_units;
+            for (size_t context = 0; context < 2; context++) {
+                const size_t* pattern =
+                    ((pass + order_index + context) & 1u) == 0 ?
+                    context_a : context_b;
+                for (size_t pos = 0; pos < context_len; pos++) {
+                    size_t unit = region_base + pattern[pos];
+                    size_t offset = unit * unit_bytes;
+                    expected[unit]++;
+                    buffer[offset] = expected[unit];
+                    if (buffer[offset] != expected[unit]) {
+                        free(order);
+                        free(expected);
+                        return -1;
+                    }
+                    *checksum += buffer[offset];
+                    (*touches)++;
+                }
+            }
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(order);
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "signature_context_cycle";
+    stream_pipeline_prediction_recorded = "signature_history";
+    stream_pipeline_groups_recorded = regions;
+    stream_pipeline_group_visits_recorded = regions * passes;
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_horizon_recorded = region_units;
+    stream_pipeline_seed_recorded = seed;
+
+    free(order);
+    free(expected);
+    return 0;
+}
+
 static size_t spatial_region_units_env(void) {
     return env_count("MAI_BENCH_POLICY_SPATIAL_REGION_UNITS", 8);
 }
@@ -3948,7 +4041,8 @@ int main(int argc, char** argv) {
                 "policy_recency_frequency_pivot|"
                 "policy_long_tail_admission|"
                 "policy_best_offset_lag|"
-                "policy_successor_cycle|policy_spatial_region_mask|"
+                "policy_successor_cycle|policy_signature_context_cycle|"
+                "policy_spatial_region_mask|"
                 "policy_spatial_interleaved_mask|"
                 "stream_kernel_pipeline|"
                 "stream_kernel_pipeline_anon_mmap|"
@@ -4045,6 +4139,9 @@ int main(int argc, char** argv) {
         rc = run_policy_best_offset_lag(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_successor_cycle") == 0) {
         rc = run_policy_successor_cycle(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_signature_context_cycle") == 0) {
+        rc = run_policy_signature_context_cycle(buffer, size, &checksum,
+                                                &touches);
     } else if (strcmp(argv[1], "policy_spatial_region_mask") == 0) {
         rc = run_policy_spatial_region_mask(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_spatial_interleaved_mask") == 0) {
@@ -4264,6 +4361,41 @@ int main(int argc, char** argv) {
         before.policy_successor_chain_rejected : 0;
     size_t policy_successor_chain_depth = after_stats_available ?
         after.policy_successor_chain_depth : 0;
+    size_t policy_signature_train_samples = after_stats_available ?
+        after.policy_signature_train_samples -
+        before.policy_signature_train_samples : 0;
+    size_t policy_signature_train_hits = after_stats_available ?
+        after.policy_signature_train_hits -
+        before.policy_signature_train_hits : 0;
+    size_t policy_signature_slots_created = after_stats_available ?
+        after.policy_signature_slots_created -
+        before.policy_signature_slots_created : 0;
+    size_t policy_signature_score_decays = after_stats_available ?
+        after.policy_signature_score_decays -
+        before.policy_signature_score_decays : 0;
+    size_t policy_signature_candidates = after_stats_available ?
+        after.policy_signature_candidates -
+        before.policy_signature_candidates : 0;
+    size_t policy_signature_pressure_rejected = after_stats_available ?
+        after.policy_signature_pressure_rejected -
+        before.policy_signature_pressure_rejected : 0;
+    size_t policy_signature_unused_penalties = after_stats_available ?
+        after.policy_signature_unused_penalties -
+        before.policy_signature_unused_penalties : 0;
+    size_t policy_signature_chain_candidates = after_stats_available ?
+        after.policy_signature_chain_candidates -
+        before.policy_signature_chain_candidates : 0;
+    size_t policy_signature_chain_rejected = after_stats_available ?
+        after.policy_signature_chain_rejected -
+        before.policy_signature_chain_rejected : 0;
+    size_t policy_signature_chain_depth = after_stats_available ?
+        after.policy_signature_chain_depth : 0;
+    size_t policy_signature_top_delta_magnitude = after_stats_available ?
+        after.policy_signature_top_delta_magnitude : 0;
+    size_t policy_signature_top_delta_sign = after_stats_available ?
+        after.policy_signature_top_delta_sign : 0;
+    size_t policy_signature_top_score = after_stats_available ?
+        after.policy_signature_top_score : 0;
     const char* policy_prefetch_observation =
         after_stats_available && after.policy_prefetch_observation != 0 ?
         "write_protect" : "unobserved";
@@ -4374,6 +4506,19 @@ int main(int argc, char** argv) {
            "policy_successor_chain_candidates=%zu "
            "policy_successor_chain_rejected=%zu "
            "policy_successor_chain_depth=%zu "
+           "policy_signature_train_samples=%zu "
+           "policy_signature_train_hits=%zu "
+           "policy_signature_slots_created=%zu "
+           "policy_signature_score_decays=%zu "
+           "policy_signature_candidates=%zu "
+           "policy_signature_pressure_rejected=%zu "
+           "policy_signature_unused_penalties=%zu "
+           "policy_signature_chain_candidates=%zu "
+           "policy_signature_chain_rejected=%zu "
+           "policy_signature_chain_depth=%zu "
+           "policy_signature_top_delta_magnitude=%zu "
+           "policy_signature_top_delta_sign=%zu "
+           "policy_signature_top_score=%zu "
            "max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
@@ -4508,6 +4653,19 @@ int main(int argc, char** argv) {
            policy_successor_chain_candidates,
            policy_successor_chain_rejected,
            policy_successor_chain_depth,
+           policy_signature_train_samples,
+           policy_signature_train_hits,
+           policy_signature_slots_created,
+           policy_signature_score_decays,
+           policy_signature_candidates,
+           policy_signature_pressure_rejected,
+           policy_signature_unused_penalties,
+           policy_signature_chain_candidates,
+           policy_signature_chain_rejected,
+           policy_signature_chain_depth,
+           policy_signature_top_delta_magnitude,
+           policy_signature_top_delta_sign,
+           policy_signature_top_score,
            after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,

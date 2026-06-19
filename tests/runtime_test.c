@@ -3320,6 +3320,120 @@ static int mode_uffd_pager_successor_policy(void) {
     return 0;
 }
 
+static int mode_uffd_pager_signature_policy(void) {
+    static const size_t context_a[] = {0, 2, 3, 5, 7};
+    static const size_t context_b[] = {1, 4, 3, 6, 4};
+    const size_t context_len = sizeof(context_a) / sizeof(context_a[0]);
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t region_units = 8;
+    const size_t regions = size / unit / region_units;
+    const size_t passes = 6;
+    unsigned char expected[32] = {0};
+
+    if (regions * region_units > sizeof(expected)) {
+        return fail("signature policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD signature policy test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for signature policy test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD signature policy allocation failed");
+    }
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t region = 0; region < regions; region++) {
+            size_t base = region * region_units;
+            for (size_t context = 0; context < 2; context++) {
+                const size_t* pattern = ((pass + region + context) & 1u) == 0 ?
+                    context_a : context_b;
+                for (size_t pos = 0; pos < context_len; pos++) {
+                    size_t index = base + pattern[pos];
+                    expected[index]++;
+                    ptr[index * unit] = expected[index];
+                    if (ptr[index * unit] != expected[index]) {
+                        free(ptr);
+                        return fail("UFFD signature policy lost write data");
+                    }
+                }
+            }
+        }
+    }
+    for (size_t index = 0; index < regions * region_units; index++) {
+        if (ptr[index * unit] != expected[index]) {
+            free(ptr);
+            return fail("UFFD signature policy lost read data");
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD signature policy touches");
+    }
+    size_t train_samples =
+        after_touch.policy_signature_train_samples -
+        before.policy_signature_train_samples;
+    size_t train_hits =
+        after_touch.policy_signature_train_hits -
+        before.policy_signature_train_hits;
+    size_t slots_created =
+        after_touch.policy_signature_slots_created -
+        before.policy_signature_slots_created;
+    size_t candidates =
+        after_touch.policy_signature_candidates -
+        before.policy_signature_candidates;
+    size_t chain_candidates =
+        after_touch.policy_signature_chain_candidates -
+        before.policy_signature_chain_candidates;
+    size_t prefetch_completed =
+        after_touch.policy_prefetch_completed - before.policy_prefetch_completed;
+    size_t prefetch_useful =
+        after_touch.policy_prefetch_useful - before.policy_prefetch_useful;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD signature policy did not exercise pager pressure");
+    }
+    if (train_samples == 0 || train_hits == 0 || slots_created == 0 ||
+        candidates == 0 || chain_candidates == 0 ||
+        prefetch_completed == 0 || prefetch_useful == 0 ||
+        after_touch.policy_signature_chain_depth < 2 ||
+        after_touch.policy_signature_top_score == 0) {
+        fprintf(stderr,
+                "signature stats: train=%zu hits=%zu slots=%zu "
+                "candidates=%zu chain_candidates=%zu completed=%zu "
+                "useful=%zu depth=%zu top_score=%zu\n",
+                train_samples, train_hits, slots_created, candidates,
+                chain_candidates, prefetch_completed, prefetch_useful,
+                after_touch.policy_signature_chain_depth,
+                after_touch.policy_signature_top_score);
+        free(ptr);
+        return fail("UFFD signature policy did not exercise signature predictor");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD signature policy free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD signature policy allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
 static size_t runtime_spatial_offset(size_t position, size_t pass,
                                      size_t region, int mixed_masks) {
     static const size_t offsets_a[] = {0, 3, 5};
@@ -4664,6 +4778,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_successor_policy") == 0) {
         return mode_uffd_pager_successor_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_signature_policy") == 0) {
+        return mode_uffd_pager_signature_policy();
     }
     if (strcmp(argv[1], "uffd_pager_spatial_mask_policy") == 0) {
         return mode_uffd_pager_spatial_mask_policy();

@@ -116,6 +116,32 @@ successor training, not evidence that deeper chain lookahead is effective yet.
 The remaining timeliness problem is learning deeper successor confidence
 without depending on write-protect observation.
 
+### Signature Context-Cycle Probe
+
+`policy_signature_context_cycle` alternates two short contexts inside each
+eight-chunk region. Both contexts pass through the same middle chunk but need
+different successors, so a one-successor Markov table sees an ambiguous
+transition. The benchmark supplies no hints to MAI.
+
+The sufficient-memory unmanaged baseline for six seeds was about
+104376 MiB/s end-to-end over 320 logical MiB per run. The pressure rows below
+use a 64 MiB allocation, 2 MiB chunks, 16 MiB/12 MiB resident high/low
+watermarks, four passes, seeds `1,7,13,29,31,43`, and write-protect
+observation enabled so useful-prefetch accounting is visible.
+
+| Policy | End-to-end MiB/s | Demand faults | Prefetches | Useful | Late events | Unused evictions | Read MiB | Write MiB | Hot-evicted MiB | Signature train | Signature hits | Signature candidates | Signature chain candidates | Signature pressure rejects |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `stride` | 3158 | 123 | 48 | 11 | 112 | 37 | 255 | 306 | 232 | 0 | 0 | 0 | 0 | 0 |
+| `markov` | 4167 | 122 | 24 | 22 | 100 | 2 | 185 | 235 | 231 | 0 | 0 | 0 | 0 | 0 |
+| `wtinylfu` | 4116 | 123 | 13 | 12 | 110 | 1 | 183 | 233 | 232 | 0 | 0 | 0 | 0 | 0 |
+| `signature` | 3372 | 130 | 50 | 42 | 89 | 8 | 213 | 265 | 248 | 128 | 55 | 86 | 35 | 1 |
+
+The signature table learns the context-dependent transition and emits useful
+prefetches, including depth-greater-than-one chain candidates, but the current
+admission policy buys timeliness with extra migration traffic and hotter
+evictions. This is useful diagnostic progress, not yet a replacement for the
+more conservative W-TinyLFU row.
+
 ## 9-Matrix Pipeline Pressure
 
 These rows use `policy_stream_pipeline 16M`, random no-repeat group order,

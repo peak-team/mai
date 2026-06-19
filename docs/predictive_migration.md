@@ -152,14 +152,17 @@ runtime strategy:
   prefetch probation, and protected demand-confirmed chunks.
 - `best-offset`, `bestoffset`, `offset`, or `offset-prefetch`: demand-trained
   top-offset prefetcher for recurring non-adjacent chunk offsets.
+- `signature`, `delta-chain`, `history-table`, or `history`: rolling
+  two-delta signature table for context-dependent successor prediction.
 
 For `wtinylfu`, `MAI_POLICY_WTINYLFU_WINDOW_PERCENT=N` controls the target
 window share of resident capacity. The default is 25. Demand faults always
 populate; speculative prefetches must carry Markov/stream confidence and, under
 pressure, must beat the victim score unless the victim is unused/probationary.
-For `markov` and `wtinylfu`, `MAI_POLICY_SUCCESSOR_CHAIN_DEPTH=N` can follow
-high-confidence successor edges beyond the immediate next chunk. The default is
-1, preserving one-successor behavior.
+For `markov`, `wtinylfu`, and `signature`,
+`MAI_POLICY_SUCCESSOR_CHAIN_DEPTH=N` can follow high-confidence predicted edges
+beyond the immediate next chunk. The default is 1, preserving one-step
+behavior.
 For `best-offset`, `MAI_POLICY_BEST_OFFSET_MIN_CHUNKS=N` can exclude nearby
 offsets from training and candidate emission. The default `0` uses the current
 `MAI_UFFD_PREFETCH_CHUNKS` window as the floor, keeping adjacent chunks in the
@@ -196,6 +199,11 @@ Best-offset reports training samples, validated training hits, created offset
 slots, score decays, emitted candidates, rejected candidates,
 unused-prefetch penalties, and the top learned forward offset through
 `policy_bestoffset_*` counters.
+Signature/history-table reports training samples, validated hits, installed
+signature slots, score decays, emitted candidates, depth-greater-than-one
+chain candidates, pressure rejects, unused-prefetch penalties, rejected chain
+candidates, configured depth, and the top learned delta through
+`policy_signature_*` counters.
 `policy_throttle_slept_ns` is reserved for
 a future bandwidth/stall-budget throttle; current policies reject or shrink
 speculative work instead of sleeping in the fault handler.
@@ -274,7 +282,7 @@ default performance mode.
 | W-TinyLFU / prefetch-aware replacement | Combine a small recency window, sketch admission, probationary prefetches, protected demand-confirmed chunks, and throttle-raised admission margins. | Implemented as `wtinylfu`/`window-tinylfu`. Local guardrails show it sharply reduces unused prefetch evictions and lowers long-tail write traffic, but it raises demand events and hot-evicted bytes on current pressure probes; experimental only. |
 | Best-offset and multi-lookahead offset | Score candidate offsets by later demand hits. Prefetch the highest-confidence forward offset, not necessarily the next chunk. Penalize unused offset-prefetch evictions and apply pressure admission before displacing resident chunks. | Implemented as `best-offset`/`offset-prefetch`, an experimental top-1 offset predictor. Corrected local results show it can reduce worst-case speculative traffic versus legacy-style prefetch, but dense footprints can make it learn nearby incidental offsets instead of the intended lagged offset; it does not beat conservative stream/markov rows on throughput or migration volume. |
 | Markov and delta-correlation | Keep one bounded successor edge per chunk. Admit only repeated high-confidence successors, and require stronger confidence under resident pressure. Optional chain lookahead follows high-confidence successor edges for earlier timeliness. | Implemented as `markov`/`successor` plus opt-in `MAI_POLICY_SUCCESSOR_CHAIN_DEPTH`. Current local results show depth-2 is a no-op without write-protect observation and not yet promotable. |
-| Signature/history-table | Use rolling delta signatures to predict multi-step sequences. Confidence controls depth and admission. | Later; best paired with a global budget and quick decay. |
+| Signature/history-table | Use rolling two-delta signatures to predict context-dependent successors. Train only from observed demand/resident-demand transitions, decay a fixed-size table, penalize unused prefetched edges, and require stronger confidence under pressure before displacing a resident chunk. | Implemented as `signature`/`history-table`, experimental. Local context-cycle rows show more useful prefetches and lower late faults than one-successor `markov`, but higher migration traffic and lower throughput than W-TinyLFU; not a default performance win. |
 | Spatial region masks | Divide allocations into fixed chunk regions and learn stable touched masks. A small tagged region table lets interleaved regions keep separate masks. Under pressure, same-region transitions may prefetch a learned mask, while inter-region transitions prefetch conservatively to limit pollution. | Implemented as `spatial`/`spatial-mask`; tune width, table slots, and confidence with `MAI_SPATIAL_REGION_CHUNKS`, `MAI_SPATIAL_TABLE_SLOTS`, `MAI_SPATIAL_LEARN_THRESHOLD`, and `MAI_SPATIAL_ADMIT_THRESHOLD`. |
 | TinyLFU and frequency sketches | Use a compact approximate frequency sketch for admission. Train only on demand-confirmed touches, compare candidate score against victim score under pressure, and decay the sketch by halving counters after a fixed update window. TinyLFU gates candidates generated by other predictors; it is not itself a prefetcher. | Implemented as `tinylfu`/`tiny-lfu`, an experimental long-tail admission classifier with fixed global sketch state and no per-chunk allocation. |
 | TPP/AutoNUMA-style tiering | Maintain high/low DRAM watermarks. Proactively demote cold chunks during quiet epochs, promote on demand, and keep headroom for new hot allocations. | Core design principle for MAI pressure handling. |
