@@ -12,6 +12,7 @@
 #include <sys/ioctl.h>
 #include <stddef.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <sys/syscall.h>
 #include <time.h>
 
@@ -56,6 +57,7 @@
 #define MAI_DEFAULT_UFFD_PREFETCH_CHUNKS 4
 #define MAI_MAX_UFFD_PREFETCH_CHUNKS 16
 #define MAI_POLICY_STALL_HIST_BUCKETS 64
+#define MAI_POLICY_STREAM_SLOTS 4
 #define MAI_HUGEPAGE_SIZE (2ULL * 1024ULL * 1024ULL)
 #define MAI_ACCESS_TRACE_RETIRED_GRACE_NS (10ULL * 1000ULL * 1000ULL)
 
@@ -112,6 +114,7 @@ typedef enum {
     MIGRATION_POLICY_FIFO,
     MIGRATION_POLICY_RANDOM,
     MIGRATION_POLICY_STREAM,
+    MIGRATION_POLICY_STRIDE,
     MIGRATION_POLICY_2Q
 } MigrationPolicy;
 
@@ -206,6 +209,14 @@ typedef struct {
     ptrdiff_t last_delta;
 } MaiChunkPolicyMeta;
 
+typedef struct {
+    size_t last_index;
+    ptrdiff_t delta;
+    size_t confidence;
+    size_t last_epoch;
+    int active;
+} MaiStreamPolicySlot;
+
 struct ArenaBlock {
     size_t offset;
     size_t size;
@@ -266,6 +277,7 @@ struct AllocationRecord {
     ptrdiff_t policy_last_delta;
     size_t policy_run_length;
     size_t policy_prefetch_window;
+    MaiStreamPolicySlot policy_stream_slots[MAI_POLICY_STREAM_SLOTS];
     int uffd_registered;
     int uffd_closing;
     ArenaSegment* segment;
@@ -276,6 +288,12 @@ struct AllocationRecord {
     AllocationRecord* uffd_prev;
     AllocationRecord* uffd_next;
 };
+
+typedef struct {
+    AllocationRecord* record;
+    size_t indices[MAI_MAX_UFFD_PREFETCH_CHUNKS + 1];
+    size_t count;
+} MaiProtectedChunkSet;
 
 typedef struct {
     size_t length;
@@ -694,9 +712,7 @@ static size_t percent_of_size(size_t bytes, size_t percent);
 static int ensure_uffd_pager_started_locked(void);
 static void remove_uffd_record_locked(AllocationRecord* record);
 static int evict_uffd_chunks_locked(size_t target_bytes,
-                                   AllocationRecord* protected_record,
-                                   size_t protected_start_index,
-                                   size_t protected_end_index,
+                                   const MaiProtectedChunkSet* protected_set,
                                    int runtime_lock_held);
 static void stop_uffd_pager(void);
 static void access_trace_sigsegv_handler(int signo, siginfo_t* info, void* context);
@@ -911,6 +927,12 @@ static int parse_migration_policy_env(const char* value,
         strcmp(value, "adaptive-stream") == 0 ||
         strcmp(value, "sequential") == 0) {
         *out = MIGRATION_POLICY_STREAM;
+        return 0;
+    }
+    if (strcmp(value, "stride") == 0 ||
+        strcmp(value, "multi-stream") == 0 ||
+        strcmp(value, "multistream") == 0) {
+        *out = MIGRATION_POLICY_STRIDE;
         return 0;
     }
     if (strcmp(value, "2q") == 0 || strcmp(value, "twoq") == 0 ||
@@ -3957,12 +3979,39 @@ static uint64_t policy_next_random_locked(void) {
     return policy_random_state * 2685821657736338717ULL;
 }
 
+static void policy_protect_chunk_index(MaiProtectedChunkSet* set,
+                                       AllocationRecord* record,
+                                       size_t index) {
+    if (!set || !record) {
+        return;
+    }
+    if (!set->record) {
+        set->record = record;
+    }
+    if (set->record != record) {
+        return;
+    }
+    for (size_t i = 0; i < set->count; i++) {
+        if (set->indices[i] == index) {
+            return;
+        }
+    }
+    if (set->count < sizeof(set->indices) / sizeof(set->indices[0])) {
+        set->indices[set->count++] = index;
+    }
+}
+
 static int policy_chunk_is_protected(AllocationRecord* record, size_t index,
-                                     AllocationRecord* protected_record,
-                                     size_t protected_start_index,
-                                     size_t protected_end_index) {
-    return record == protected_record &&
-        index >= protected_start_index && index <= protected_end_index;
+                                     const MaiProtectedChunkSet* set) {
+    if (!set || record != set->record) {
+        return 0;
+    }
+    for (size_t i = 0; i < set->count; i++) {
+        if (set->indices[i] == index) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int policy_chunk_is_prefetched_unused(MaiChunkPolicyMeta* meta) {
@@ -3972,31 +4021,116 @@ static int policy_chunk_is_prefetched_unused(MaiChunkPolicyMeta* meta) {
         (meta->flags & MAI_CHUNK_POLICY_DEMANDED) == 0;
 }
 
-static void policy_note_demand_fault_locked(AllocationRecord* record,
-                                            size_t index) {
-    if (!record || index >= record->chunk_count ||
-        !record->chunk_policy_meta) {
+static int policy_index_add(size_t index, ptrdiff_t delta, size_t limit,
+                            size_t* out) {
+    if (delta >= 0) {
+        size_t step = (size_t)delta;
+        if (index > SIZE_MAX - step || index + step >= limit) {
+            return 0;
+        }
+        *out = index + step;
+        return 1;
+    }
+
+    if (delta == PTRDIFF_MIN) {
+        return 0;
+    }
+    size_t step = (size_t)(-delta);
+    if (index < step) {
+        return 0;
+    }
+    *out = index - step;
+    return 1;
+}
+
+static void policy_update_stream_slots_locked(AllocationRecord* record,
+                                              size_t index) {
+    if (!record) {
         return;
     }
 
-    MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
+    ptrdiff_t observed_delta = 0;
+    int has_delta = 0;
+    size_t epoch = uffd_touch_epoch + 1;
     if (record->policy_has_last_fault) {
-        ptrdiff_t delta =
+        observed_delta =
             (ptrdiff_t)index - (ptrdiff_t)record->policy_last_fault_index;
-        if (delta == record->policy_last_delta) {
+        has_delta = observed_delta != 0;
+    }
+
+    int matched = -1;
+    if (has_delta) {
+        for (size_t i = 0; i < MAI_POLICY_STREAM_SLOTS; i++) {
+            MaiStreamPolicySlot* slot = &record->policy_stream_slots[i];
+            size_t predicted = 0;
+            if (slot->active && slot->delta != 0 &&
+                policy_index_add(slot->last_index, slot->delta,
+                                 record->chunk_count, &predicted) &&
+                predicted == index) {
+                matched = (int)i;
+                break;
+            }
+        }
+    }
+
+    if (matched >= 0) {
+        MaiStreamPolicySlot* slot =
+            &record->policy_stream_slots[(size_t)matched];
+        slot->last_index = index;
+        if (slot->confidence < SIZE_MAX) {
+            slot->confidence++;
+        }
+        slot->last_epoch = epoch;
+    } else if (has_delta) {
+        size_t victim = 0;
+        for (size_t i = 0; i < MAI_POLICY_STREAM_SLOTS; i++) {
+            MaiStreamPolicySlot* slot = &record->policy_stream_slots[i];
+            if (!slot->active) {
+                victim = i;
+                break;
+            }
+            MaiStreamPolicySlot* current = &record->policy_stream_slots[victim];
+            if (slot->confidence < current->confidence ||
+                (slot->confidence == current->confidence &&
+                 slot->last_epoch < current->last_epoch)) {
+                victim = i;
+            }
+        }
+        MaiStreamPolicySlot* slot = &record->policy_stream_slots[victim];
+        slot->active = 1;
+        slot->last_index = index;
+        slot->delta = observed_delta;
+        slot->confidence = 1;
+        slot->last_epoch = epoch;
+    }
+
+    if (record->policy_has_last_fault) {
+        if (observed_delta == record->policy_last_delta) {
             record->policy_run_length++;
         } else {
             record->policy_run_length = 1;
         }
-        record->policy_last_delta = delta;
-        meta->last_delta = delta;
+        record->policy_last_delta = observed_delta;
     } else {
         record->policy_has_last_fault = 1;
         record->policy_run_length = 1;
         record->policy_last_delta = 0;
-        meta->last_delta = 0;
     }
     record->policy_last_fault_index = index;
+}
+
+static void policy_note_demand_fault_locked(AllocationRecord* record,
+                                            size_t index) {
+    if (!record || index >= record->chunk_count) {
+        return;
+    }
+
+    policy_update_stream_slots_locked(record, index);
+    if (!record->chunk_policy_meta) {
+        return;
+    }
+    MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
+    meta->last_delta = record->policy_last_delta;
     meta->flags |= MAI_CHUNK_POLICY_DEMANDED | MAI_CHUNK_POLICY_REFERENCED;
     meta->frequency++;
     meta->last_access_epoch = uffd_touch_epoch + 1;
@@ -4023,6 +4157,57 @@ static size_t policy_prefetch_window_locked(AllocationRecord* record,
     }
     record->policy_prefetch_window = adaptive;
     return adaptive;
+}
+
+static size_t policy_build_prefetch_indices_locked(AllocationRecord* record,
+                                                   size_t index,
+                                                   size_t prefetch_window,
+                                                   size_t* out,
+                                                   size_t out_cap) {
+    if (!record || !out || out_cap == 0 || prefetch_window <= 1) {
+        return 0;
+    }
+
+    size_t limit = prefetch_window - 1;
+    if (limit > out_cap) {
+        limit = out_cap;
+    }
+
+    if (migration_policy == MIGRATION_POLICY_STRIDE) {
+        MaiStreamPolicySlot* best = NULL;
+        for (size_t i = 0; i < MAI_POLICY_STREAM_SLOTS; i++) {
+            MaiStreamPolicySlot* slot = &record->policy_stream_slots[i];
+            if (!slot->active || slot->last_index != index ||
+                slot->delta == 0 || slot->confidence < 2) {
+                continue;
+            }
+            if (!best || slot->confidence > best->confidence ||
+                (slot->confidence == best->confidence &&
+                 slot->last_epoch > best->last_epoch)) {
+                best = slot;
+            }
+        }
+        if (!best) {
+            return 0;
+        }
+
+        size_t count = 0;
+        size_t current = index;
+        while (count < limit &&
+               policy_index_add(current, best->delta,
+                                record->chunk_count, &current)) {
+            out[count++] = current;
+        }
+        return count;
+    }
+
+    size_t count = 0;
+    for (size_t offset = 1;
+         count < limit && index + offset < record->chunk_count;
+         offset++) {
+        out[count++] = index + offset;
+    }
+    return count;
 }
 
 static int policy_admit_prefetch_locked(AllocationRecord* record, size_t index,
@@ -4104,8 +4289,12 @@ static void policy_note_populate_locked(AllocationRecord* record, size_t index,
 static void policy_note_resident_demand_locked(AllocationRecord* record,
                                                size_t index,
                                                size_t length) {
-    if (!record || index >= record->chunk_count ||
-        !record->chunk_policy_meta) {
+    if (!record || index >= record->chunk_count) {
+        stats_snapshot.policy_demand_faults++;
+        return;
+    }
+    policy_update_stream_slots_locked(record, index);
+    if (!record->chunk_policy_meta) {
         stats_snapshot.policy_demand_faults++;
         return;
     }
@@ -4219,9 +4408,7 @@ static void policy_note_fault_handler_stall_locked(size_t ns) {
 
 static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
                                             size_t* out_index,
-                                            AllocationRecord* protected_record,
-                                            size_t protected_start_index,
-                                            size_t protected_end_index) {
+                                            const MaiProtectedChunkSet* protected_set) {
     AllocationRecord* best_record = NULL;
     size_t best_index = 0;
     size_t best_epoch = SIZE_MAX;
@@ -4236,9 +4423,7 @@ static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
         }
 
         for (size_t i = 0; i < record->chunk_count; i++) {
-            if (policy_chunk_is_protected(record, i, protected_record,
-                                          protected_start_index,
-                                          protected_end_index) ||
+            if (policy_chunk_is_protected(record, i, protected_set) ||
                 record->chunk_states[i] != CHUNK_ANON_HOT) {
                 continue;
             }
@@ -4290,9 +4475,7 @@ static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
                 continue;
             }
             for (size_t i = 0; i < record->chunk_count; i++) {
-                if (policy_chunk_is_protected(record, i, protected_record,
-                                              protected_start_index,
-                                              protected_end_index) ||
+                if (policy_chunk_is_protected(record, i, protected_set) ||
                     record->chunk_states[i] != CHUNK_ANON_HOT) {
                     continue;
                 }
@@ -4370,17 +4553,13 @@ static int evict_uffd_chunk_locked(AllocationRecord* record, size_t index,
 }
 
 static int evict_uffd_chunks_locked(size_t target_bytes,
-                                    AllocationRecord* protected_record,
-                                    size_t protected_start_index,
-                                    size_t protected_end_index,
+                                    const MaiProtectedChunkSet* protected_set,
                                     int runtime_lock_held) {
     while (uffd_resident_bytes > target_bytes) {
         AllocationRecord* best_record = NULL;
         size_t best_index = 0;
         if (!policy_choose_uffd_victim_locked(&best_record, &best_index,
-                                              protected_record,
-                                              protected_start_index,
-                                              protected_end_index)) {
+                                              protected_set)) {
             break;
         }
         if (evict_uffd_chunk_locked(best_record, best_index,
@@ -4507,6 +4686,72 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
     return 0;
 }
 
+static int policy_prefetch_and_reclaim_after_access_locked(AllocationRecord* record,
+                                                           size_t index,
+                                                           int runtime_lock_held) {
+    MaiProtectedChunkSet protected_set = {0};
+    policy_protect_chunk_index(&protected_set, record, index);
+    size_t prefetch_window = policy_prefetch_window_locked(record, index);
+    if (record->chunk_bytes != 0 && uffd_resident_limit_bytes != 0) {
+        size_t cap_window = (uffd_resident_limit_bytes / 2) / record->chunk_bytes;
+        if (cap_window == 0) {
+            cap_window = 1;
+        }
+        if (prefetch_window > cap_window) {
+            prefetch_window = cap_window;
+        }
+    }
+    size_t prefetch_indices[MAI_MAX_UFFD_PREFETCH_CHUNKS];
+    size_t prefetch_count =
+        policy_build_prefetch_indices_locked(record, index, prefetch_window,
+                                             prefetch_indices,
+                                             MAI_MAX_UFFD_PREFETCH_CHUNKS);
+    for (size_t candidate = 0; candidate < prefetch_count; candidate++) {
+        size_t prefetch_index = prefetch_indices[candidate];
+        if (record->chunk_states[prefetch_index] == CHUNK_ANON_HOT) {
+            policy_protect_chunk_index(&protected_set, record, prefetch_index);
+            continue;
+        }
+        uintptr_t prefetch_start = 0;
+        size_t prefetch_length =
+            uffd_record_chunk_length_locked(record, prefetch_index,
+                                            &prefetch_start);
+        if (prefetch_length == 0 ||
+            !policy_admit_prefetch_locked(record, prefetch_index,
+                                          prefetch_length)) {
+            continue;
+        }
+        if (populate_uffd_chunk_locked(record, prefetch_index, 0, NULL) != 0) {
+            break;
+        }
+        policy_protect_chunk_index(&protected_set, record, prefetch_index);
+    }
+
+    int explicit_resident_limit = uffd_resident_limit_bytes != 0;
+    size_t target = uffd_resident_limit_bytes;
+    if (target == 0 && runtime_lock_held) {
+        size_t cap = effective_max_rss_locked(stats_snapshot.current_rss_bytes);
+        target = cap == 0 ? SIZE_MAX : percent_of_size(cap, MAI_AUTO_ANON_LIMIT_PERCENT);
+    } else if (target == 0) {
+        target = SIZE_MAX;
+    }
+    if ((explicit_resident_limit || runtime_lock_held) &&
+        target != SIZE_MAX && uffd_resident_bytes > target) {
+        size_t low_target = uffd_resident_low_limit_bytes;
+        if (low_target == 0) {
+            low_target = target;
+        }
+        if (low_target > target) {
+            low_target = target;
+        }
+        if (evict_uffd_chunks_locked(low_target, &protected_set,
+                                     runtime_lock_held) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int resolve_uffd_fault_locked(uintptr_t fault_address,
                                      unsigned long long flags,
                                      int runtime_lock_held) {
@@ -4548,71 +4793,15 @@ static int resolve_uffd_fault_locked(uintptr_t fault_address,
         policy_note_resident_demand_locked(record, index, length);
         record->chunk_touch_epochs[index] = ++uffd_touch_epoch;
         stats_snapshot.uffd_faults++;
-        return 0;
+        return policy_prefetch_and_reclaim_after_access_locked(
+            record, index, runtime_lock_held);
     }
     policy_note_demand_fault_locked(record, index);
     if (populate_uffd_chunk_locked(record, index, 1, NULL) != 0) {
         return -1;
     }
-
-    size_t protected_end_index = index;
-    size_t prefetch_window = policy_prefetch_window_locked(record, index);
-    if (record->chunk_bytes != 0 && uffd_resident_limit_bytes != 0) {
-        size_t cap_window = (uffd_resident_limit_bytes / 2) / record->chunk_bytes;
-        if (cap_window == 0) {
-            cap_window = 1;
-        }
-        if (prefetch_window > cap_window) {
-            prefetch_window = cap_window;
-        }
-    }
-    for (size_t offset = 1;
-         offset < prefetch_window && index + offset < record->chunk_count;
-         offset++) {
-        size_t prefetch_index = index + offset;
-        if (record->chunk_states[prefetch_index] == CHUNK_ANON_HOT) {
-            protected_end_index = prefetch_index;
-            continue;
-        }
-        uintptr_t prefetch_start = 0;
-        size_t prefetch_length =
-            uffd_record_chunk_length_locked(record, prefetch_index,
-                                            &prefetch_start);
-        if (prefetch_length == 0 ||
-            !policy_admit_prefetch_locked(record, prefetch_index,
-                                          prefetch_length)) {
-            continue;
-        }
-        if (populate_uffd_chunk_locked(record, prefetch_index, 0, NULL) != 0) {
-            break;
-        }
-        protected_end_index = prefetch_index;
-    }
-
-    int explicit_resident_limit = uffd_resident_limit_bytes != 0;
-    size_t target = uffd_resident_limit_bytes;
-    if (target == 0 && runtime_lock_held) {
-        size_t cap = effective_max_rss_locked(stats_snapshot.current_rss_bytes);
-        target = cap == 0 ? SIZE_MAX : percent_of_size(cap, MAI_AUTO_ANON_LIMIT_PERCENT);
-    } else if (target == 0) {
-        target = SIZE_MAX;
-    }
-    if ((explicit_resident_limit || runtime_lock_held) &&
-        target != SIZE_MAX && uffd_resident_bytes > target) {
-        size_t low_target = uffd_resident_low_limit_bytes;
-        if (low_target == 0) {
-            low_target = target;
-        }
-        if (low_target > target) {
-            low_target = target;
-        }
-        if (evict_uffd_chunks_locked(low_target, record, index,
-                                     protected_end_index,
-                                     runtime_lock_held) != 0) {
-            return -1;
-        }
-    }
-    return 0;
+    return policy_prefetch_and_reclaim_after_access_locked(
+        record, index, runtime_lock_held);
 }
 
 static void fail_uffd_pager_locked(void) {

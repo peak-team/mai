@@ -163,7 +163,7 @@ only for explicit quiescent-boundary or unsafe experimental runs.
 Runtime policy knobs are intentionally separate from benchmark knobs:
 
 - `MAI_MIGRATION_POLICY` or `MAI_POLICY`: `legacy`, `lru`, `clock`, `fifo`,
-  `random`, `stream`, or `2q`
+  `random`, `stream`, `stride`, or `2q`
 - `MAI_UFFD_PREFETCH_CHUNKS`: maximum UFFD prefetch lookahead
 - `MAI_UFFD_RESIDENT_LIMIT` and `MAI_UFFD_RESIDENT_LOW_LIMIT`: resident
   high/low watermarks for UFFD-managed chunks
@@ -176,6 +176,17 @@ Policy pressure scenarios can use `mai_policy_pipeline` with
 `mai_policy_stream_pipeline`, `mai_policy_clock_pipeline`, or
 `mai_policy_2q_pipeline`.
 
+`policy_multistream_stride` is a focused no-oracle workload for stride
+predictors. It walks fixed-size units inside one allocation as independent
+strided streams, controlled by `MAI_BENCH_POLICY_STREAMS`,
+`MAI_BENCH_POLICY_ACTIVE_STREAMS`, `MAI_BENCH_POLICY_PASSES`, and
+`MAI_BENCH_POLICY_STRIDE_UNIT`. Set `MAI_BENCH_POLICY_ACTIVE_STREAMS=1` to
+isolate non-unit stride prediction from adjacent forward prefetch. Its
+throughput is a policy-event score, not a STREAM bandwidth claim, because each
+unit touch samples the unit instead of sweeping every byte. Use
+`policy_sampled_units_per_sec` and policy counters as the primary metrics for
+this workload.
+
 Benchmark-only knobs keep the `MAI_BENCH_` prefix. Source policy tests reject
 `MAI_BENCH_*` and `MAI_STREAM_*` references from runtime source files so MAI
 cannot learn benchmark oracle variables.
@@ -187,7 +198,8 @@ Policy rows include mechanism-derived counters such as
 `policy_read_amplification`, `policy_write_amplification`,
 `policy_demand_fault_stall_ns`, `policy_demand_fault_stall_p50_ns`,
 `policy_demand_fault_stall_p90_ns`, `policy_demand_fault_stall_p99_ns`, and
-unused-prefetch eviction bytes. Compare these against sufficient-memory rows
+unused-prefetch eviction bytes. Policy probe rows also include
+`policy_sampled_units_per_sec`. Compare these against sufficient-memory rows
 from the same host, seed, binary, and workload before making performance
 claims. The observed prefetch metrics are lower bounds unless
 `policy_prefetch_observation=write_protect`; Linux mmap and swap baselines do

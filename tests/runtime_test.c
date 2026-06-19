@@ -1924,6 +1924,115 @@ static int mode_uffd_pager_spatial_prefetch(void) {
     return 0;
 }
 
+static int mode_uffd_pager_stride_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t streams = 4;
+    const size_t passes = 3;
+    const size_t units = size / unit;
+    size_t active_streams = streams;
+    const char* active_streams_env = getenv("MAI_UFFD_STRIDE_ACTIVE_STREAMS");
+    if (active_streams_env && active_streams_env[0] != '\0') {
+        char* end = NULL;
+        unsigned long long parsed = strtoull(active_streams_env, &end, 10);
+        if (end && *end == '\0' && parsed > 0 && parsed <= streams) {
+            active_streams = (size_t)parsed;
+        }
+    }
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD stride policy test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for stride policy test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD stride policy allocation failed");
+    }
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t stream = 0; stream < active_streams; stream++) {
+            for (size_t step = 0; step < units; step++) {
+                size_t chunk = stream + step * streams;
+                if (chunk >= units) {
+                    continue;
+                }
+                ptr[chunk * unit] = (unsigned char)(0x20 + pass + chunk);
+            }
+        }
+        for (size_t stream = 0; stream < active_streams; stream++) {
+            for (size_t step = 0; step < units; step++) {
+                size_t chunk = stream + step * streams;
+                if (chunk >= units) {
+                    continue;
+                }
+                unsigned char expected = (unsigned char)(0x20 + pass + chunk);
+                if (ptr[chunk * unit] != expected) {
+                    free(ptr);
+                    return fail("UFFD stride policy lost chunk data");
+                }
+            }
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD stride policy touches");
+    }
+    size_t prefetch_completed =
+        after_touch.policy_prefetch_completed - before.policy_prefetch_completed;
+    size_t prefetch_useful =
+        after_touch.policy_prefetch_useful - before.policy_prefetch_useful;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        fprintf(stderr,
+                "stride policy stats: managed before=%zu after=%zu "
+                "uffd_alloc before=%zu after=%zu faults before=%zu after=%zu "
+                "evictions before=%zu after=%zu\n",
+                before.managed_allocations, after_touch.managed_allocations,
+                before.uffd_pager_allocations, after_touch.uffd_pager_allocations,
+                before.uffd_faults, after_touch.uffd_faults,
+                before.uffd_evictions, after_touch.uffd_evictions);
+        free(ptr);
+        return fail("UFFD stride policy did not exercise pager pressure");
+    }
+    if (getenv("MAI_UFFD_EXPECT_NO_USEFUL_PREFETCH")) {
+        if (prefetch_completed == 0 || prefetch_useful != 0) {
+            fprintf(stderr,
+                    "stride negative-control stats: completed=%zu useful=%zu\n",
+                    prefetch_completed, prefetch_useful);
+            free(ptr);
+            return fail("UFFD forward prefetch was useful in isolated stride test");
+        }
+    } else if (prefetch_completed == 0 || prefetch_useful == 0) {
+        fprintf(stderr,
+                "stride policy prefetch stats: completed=%zu useful=%zu\n",
+                prefetch_completed, prefetch_useful);
+        free(ptr);
+        return fail("UFFD stride policy did not produce useful prefetches");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD stride policy free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD stride policy allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
 typedef struct {
     int id;
     int iterations;
@@ -3100,6 +3209,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_spatial_prefetch") == 0) {
         return mode_uffd_pager_spatial_prefetch();
+    }
+    if (strcmp(argv[1], "uffd_pager_stride_policy") == 0) {
+        return mode_uffd_pager_stride_policy();
     }
     if (strcmp(argv[1], "uffd_pager_concurrent_stress") == 0) {
         return mode_uffd_pager_concurrent_stress();

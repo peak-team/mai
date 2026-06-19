@@ -130,6 +130,8 @@ runtime strategy:
 - `random`: baseline random victim selection.
 - `stream`: adaptive sequential prefetch; it grows the window only after
   repeated positive chunk deltas.
+- `stride`: multi-stream stride prefetch; it tracks repeated per-allocation
+  chunk deltas and prefetches along the highest-confidence stream.
 - `2q`: first prefetch-aware admission baseline; prefetched chunks enter
   probation and are rejected when admitting them would exceed the resident
   limit.
@@ -163,7 +165,7 @@ observed lower bounds unless the row says
 | ARC, CAR, CART | Maintain recent and frequent resident sets plus ghost histories. Ghost hits tune the split between recency and frequency. Prefetched chunks never enter the frequent set until a demand touch confirms them. | Design target; CAR/CLOCK-style approximations are preferred before exact ARC. |
 | LIRS, LRU-K | Protect chunks with low inter-reference recency or repeated Kth references. Demote high inter-reference recency chunks even if they were touched recently by a scan. | Simulator/reference first; exact LIRS metadata is too heavy for the initial C runtime. |
 | Sequential readahead | Detect monotonic chunk faults and adapt the forward window with additive increase and multiplicative decrease from accuracy feedback. Admit only while headroom and budget permit. | Implemented as `stream` in first form. |
-| Stride and multi-stream | Track several `{last, delta, confidence, window}` streams per allocation. Admit only after repeated deltas. Evict chunks far behind active streams. | Next autonomous predictor for interleaved arrays. |
+| Stride and multi-stream | Track several `{last, delta, confidence, window}` streams per allocation. Admit only after repeated deltas. Evict chunks far behind active streams. | Implemented as `stride` in first form. |
 | Best-offset and multi-lookahead offset | Score candidate offsets by later demand hits. Prefetch the highest-confidence offsets, not necessarily the next chunk. | Useful for blocked and stencil-like patterns after stream baselines. |
 | Markov and delta-correlation | Keep bounded successor tables keyed by previous chunk or delta signature. Admit only high-confidence successors and decay tables quickly under phase changes. | Later; metadata and pollution risk are higher. |
 | Signature/history-table | Use rolling delta signatures to predict multi-step sequences. Confidence controls depth and admission. | Later; best paired with a global budget and quick decay. |
@@ -225,6 +227,14 @@ call MAI range APIs or expose future group order to the runtime. Docker
 scenarios named `mai_policy_<policy>_pipeline`, such as
 `mai_policy_stream_pipeline` or `mai_policy_clock_pipeline`, run this workload
 with the corresponding runtime `MAI_MIGRATION_POLICY`.
+`policy_multistream_stride` is a focused no-oracle predictor workload that
+walks several fixed-size streams inside one allocation with non-unit deltas; use
+it to compare `legacy`, `stream`, and `stride` without giving future ranges to
+MAI. Its throughput is a policy-event metric, not a DRAM bandwidth metric,
+because each unit touch samples one byte rather than sweeping complete arrays.
+Use `policy_sampled_units_per_sec` and migration counters for this workload.
+Set `MAI_BENCH_POLICY_ACTIVE_STREAMS=1` when you need a negative control where
+adjacent forward prefetches are never consumed.
 
 ## Benchmarks
 

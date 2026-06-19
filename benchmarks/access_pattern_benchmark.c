@@ -2380,6 +2380,93 @@ static int stream_pipeline_check_index(double** matrices, size_t group,
     return 0;
 }
 
+static int run_policy_multistream_stride(unsigned char* buffer, size_t size,
+                                         uint64_t* checksum,
+                                         size_t* touches) {
+    size_t streams = env_count("MAI_BENCH_POLICY_STREAMS", 4);
+    size_t active_streams =
+        env_count("MAI_BENCH_POLICY_ACTIVE_STREAMS", streams);
+    size_t passes = env_count_compat("MAI_BENCH_POLICY_PASSES",
+                                     "MAI_BENCH_STREAM_PASSES", 3);
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_STRIDE_UNIT", 2ULL * 1024ULL * 1024ULL);
+
+    if (streams == 0) {
+        streams = 1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+
+    size_t units = size / unit_bytes;
+    if (units == 0) {
+        return -1;
+    }
+    if (streams > units) {
+        streams = units;
+    }
+    if (active_streams == 0 || active_streams > streams) {
+        active_streams = streams;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t stream = 0; stream < active_streams; stream++) {
+            for (size_t step = 0; step < units; step++) {
+                size_t unit = stream + step * streams;
+                if (unit >= units) {
+                    continue;
+                }
+                size_t offset = unit * unit_bytes;
+                unsigned char value = expected_byte(unit, pass);
+                buffer[offset] = value;
+                *checksum += value;
+                (*touches)++;
+            }
+        }
+        for (size_t stream = 0; stream < active_streams; stream++) {
+            for (size_t step = 0; step < units; step++) {
+                size_t unit = stream + step * streams;
+                if (unit >= units) {
+                    continue;
+                }
+                size_t offset = unit * unit_bytes;
+                unsigned char expected = expected_byte(unit, pass);
+                if (buffer[offset] != expected) {
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        return -1;
+    }
+    stream_pipeline_prediction_recorded = "stride";
+    stream_pipeline_groups_recorded = streams;
+    stream_pipeline_group_visits_recorded = active_streams;
+    stream_pipeline_order_recorded = "strided_streams";
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    return 0;
+}
+
 static int run_stream_kernel_pipeline(const char* mode, unsigned char* buffer,
                                       size_t size, uint64_t* checksum,
                                       size_t* touches) {
@@ -2655,6 +2742,7 @@ int main(int argc, char** argv) {
                 "heartbeat_concurrent|stream_bandwidth|stream_anon_mmap|"
                 "stream_shared_file|stream_private_file|"
                 "stream_tiled_bandwidth|policy_stream_pipeline|"
+                "policy_multistream_stride|"
                 "stream_kernel_pipeline|"
                 "stream_kernel_pipeline_anon_mmap|"
                 "stream_kernel_pipeline_shared_file|"
@@ -2734,6 +2822,8 @@ int main(int argc, char** argv) {
     } else if (mode_uses_stream_pipeline(argv[1])) {
         rc = run_stream_kernel_pipeline(argv[1], buffer, size, &checksum,
                                         &touches);
+    } else if (strcmp(argv[1], "policy_multistream_stride") == 0) {
+        rc = run_policy_multistream_stride(buffer, size, &checksum, &touches);
     } else if (mode_uses_stream_kernel(argv[1])) {
         rc = run_stream_bandwidth(argv[1], buffer, size, &checksum, &touches);
     } else {
@@ -2837,6 +2927,8 @@ int main(int argc, char** argv) {
         logical_mib / measured_access_seconds : 0.0;
     double end_to_end_logical_mib_per_sec = seconds > 0.0 ?
         logical_mib / seconds : 0.0;
+    double policy_sampled_units_per_sec = seconds > 0.0 ?
+        (double)touches / seconds : 0.0;
     double policy_prefetch_accuracy_observed = policy_prefetch_completed != 0 ?
         (double)policy_prefetch_useful / (double)policy_prefetch_completed : 0.0;
     double policy_prefetch_coverage_observed = policy_demand_faults != 0 ?
@@ -2893,6 +2985,8 @@ int main(int argc, char** argv) {
            "heartbeat_migrate_bytes=%zu heartbeat_reclaimed_bytes=%zu "
            "trace_setup_calls=%zu trace_stop_calls=%zu "
            "trace_faulted_pages=%zu latency_ops=%zu logical_mib=%.3f "
+           "policy_sampled_units=%zu "
+           "policy_sampled_units_per_sec=%.3f "
            "logical_mib_per_sec=%.3f "
            "kernel_logical_mib_per_sec=%.3f "
            "end_to_end_logical_mib_per_sec=%.3f "
@@ -2972,7 +3066,8 @@ int main(int argc, char** argv) {
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,
            heartbeat_reclaimed_bytes, trace_setup_calls, trace_stop_calls,
-           trace_faulted_pages, latency_ops, logical_mib, logical_mib_per_sec,
+           trace_faulted_pages, latency_ops, logical_mib, touches,
+           policy_sampled_units_per_sec, logical_mib_per_sec,
            logical_mib_per_sec, end_to_end_logical_mib_per_sec,
            mprotect_mechanism_label, mprotect_chunk_bytes, mprotect_sample_pages,
            (unsigned long long)mprotect_warmup_ns,

@@ -41,4 +41,19 @@ if(BUILD_TESTING)
     set_tests_properties(mai_stream_kernel_pipeline_random_smoke PROPERTIES
         PASS_REGULAR_EXPRESSION "mode=stream_kernel_pipeline .*logical_mib=1600\\.000 .*stream_pipeline_order=random_no_repeat .*stream_pipeline_seed=7 .*stream_pipeline_prediction=none"
     )
+
+    add_test(
+        NAME mai_policy_multistream_stride_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_POLICY_STREAMS=4"
+            "MAI_BENCH_POLICY_PASSES=2"
+            "MAI_BENCH_POLICY_STRIDE_UNIT=2M"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            policy_multistream_stride
+            32M
+    )
+    set_tests_properties(mai_policy_multistream_stride_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=policy_multistream_stride .*logical_mib=128\\.000 .*stream_pipeline_groups=4 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=strided_streams .*stream_pipeline_prediction=stride"
+    )
 endif()
