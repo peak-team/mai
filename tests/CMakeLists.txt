@@ -971,6 +971,30 @@ set_tests_properties(mai_uffd_pager_lruk_hotset_scan
     PROPERTIES SKIP_RETURN_CODE 77)
 
 add_test(
+    NAME mai_uffd_pager_car_hotset_scan
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=128M"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=16M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "MAI_UFFD_RESIDENT_LIMIT=8M"
+        "MAI_UFFD_RESIDENT_LOW_LIMIT=6M"
+        "MAI_UFFD_PREFETCH_CHUNKS=4"
+        "MAI_MIGRATION_CHUNK=2M"
+        "MAI_MIGRATION_POLICY=car"
+        "MAI_POLICY_OBSERVE_PREFETCH_WRITES=1"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_car_hotset_scan
+)
+set_tests_properties(mai_uffd_pager_car_hotset_scan
+    PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
     NAME mai_uffd_pager_successor_policy
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"

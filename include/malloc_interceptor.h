@@ -127,6 +127,16 @@ typedef struct {
     size_t policy_clean_shadow_write_skipped_bytes;
     size_t policy_clean_shadow_write_skipped_chunks;
     size_t policy_clean_shadow_write_faults;
+    size_t policy_car_recent_chunks;
+    size_t policy_car_frequent_chunks;
+    size_t policy_car_recent_ghost_chunks;
+    size_t policy_car_frequent_ghost_chunks;
+    size_t policy_car_target_recent_chunks;
+    size_t policy_car_recent_ghost_hits;
+    size_t policy_car_frequent_ghost_hits;
+    size_t policy_car_target_increases;
+    size_t policy_car_target_decreases;
+    size_t policy_car_second_chances;
 } MaiStats;
 
 /**

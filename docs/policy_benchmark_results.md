@@ -268,8 +268,45 @@ The result is intentionally not promoted as a win. `lruk` behaves as a
 conservative reuse-distance baseline: it sharply rejects one-reference
 prefetch pollution, but in these pressure shapes that also increases demand
 faults and hot evictions versus `legacy` and `lfu`. Keep it benchmark-gated;
-its value is as a reference point for future LIRS/CAR-style policies, not as a
-default policy.
+its value is as a reference point for future LIRS or exact ARC-style policies,
+not as a default policy.
+
+### CAR-Lite Adaptive Replacement Probe
+
+`MAI_MIGRATION_POLICY=car` is a compact CAR/CLOCK-Pro approximation. Chunks are
+tracked as recent, frequent, or recent/frequent ghosts. Demand ghost hits move
+the recent target with an ARC-style delta, prefetched chunks remain recent
+probation until a demand touch confirms them, and unused prefetched chunks do
+not train ghosts. The pivot workload warms one frequent hotset, rotates through
+short recent hotsets with cold scans, then returns to the frequent hotset.
+
+These six-run means use 64 MiB workloads, 2 MiB chunks, an 8 MiB resident high
+watermark, a 6 MiB low watermark, and `MAI_MAX_RSS=16M`.
+
+| Workload | Policy | Events/s | Demand faults | Read MiB | Write MiB | Admission rejects | Unused evictions | Hot-evicted MiB | CAR recent ghost hits | CAR frequent ghost hits | CAR target + | CAR target - |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `policy_hotset_scan` | `legacy` | 3886 | 50 | 136 | 194 | 0 | 48 | 98 | 0 | 0 | 0 | 0 |
+| `policy_hotset_scan` | `2q` | 3620 | 98 | 136 | 192 | 93 | 2 | 188 | 0 | 0 | 0 | 0 |
+| `policy_hotset_scan` | `lfu` | 3582 | 67 | 138 | 194 | 31 | 34 | 126 | 0 | 0 | 0 | 0 |
+| `policy_hotset_scan` | `lruk` | 3708 | 98 | 136 | 192 | 93 | 2 | 188 | 0 | 0 | 0 | 0 |
+| `policy_hotset_scan` | `car` | 3936 | 55 | 143 | 201 | 3 | 48 | 106 | 4 | 7 | 4 | 4 |
+| `policy_phase_shift_hotset` | `legacy` | 3549 | 46 | 120 | 178 | 0 | 44 | 90 | 0 | 0 | 0 | 0 |
+| `policy_phase_shift_hotset` | `2q` | 3207 | 90 | 120 | 176 | 85 | 2 | 172 | 0 | 0 | 0 | 0 |
+| `policy_phase_shift_hotset` | `lfu` | 3818 | 50 | 124 | 182 | 3 | 44 | 94 | 0 | 0 | 0 | 0 |
+| `policy_phase_shift_hotset` | `lruk` | 3549 | 90 | 120 | 176 | 85 | 2 | 172 | 0 | 0 | 0 | 0 |
+| `policy_phase_shift_hotset` | `car` | 3382 | 52 | 129 | 187 | 3 | 44 | 100 | 4 | 7 | 4 | 4 |
+| `policy_recency_frequency_pivot` | `legacy` | 2673 | 98 | 328 | 386 | 0 | 96 | 194 | 0 | 0 | 0 | 0 |
+| `policy_recency_frequency_pivot` | `2q` | 2585 | 194 | 328 | 384 | 184 | 2 | 380 | 0 | 0 | 0 | 0 |
+| `policy_recency_frequency_pivot` | `lfu` | 2571 | 201 | 370 | 427 | 174 | 16 | 395 | 0 | 0 | 0 | 0 |
+| `policy_recency_frequency_pivot` | `lruk` | 2407 | 155 | 377 | 435 | 77 | 65 | 306 | 0 | 0 | 0 | 0 |
+| `policy_recency_frequency_pivot` | `car` | 2776 | 116 | 348 | 406 | 14 | 90 | 227 | 18 | 54 | 11 | 11 |
+
+CAR-lite is useful as an adaptive replacement reference, not a default. It wins
+the hotset and pivot event-rate rows in this local run and substantially
+reduces pivot hot-evicted bytes versus `2q`, `lfu`, and `lruk`, but it still
+trails `legacy` on demand faults and migration volume. Ghost feedback and
+target movement are observed, but the policy still needs better prefetch
+admission or migration traffic control before it can be promoted.
 
 ## Interpretation
 
@@ -284,6 +321,10 @@ default policy.
   interleaved mixed-mask case shows higher prefetch traffic than `markov`.
 - `lfu` wins the current hotset scan event-rate row and ties `legacy` on lowest
   demand faults, but this remains workload-specific.
+- `car` is the first adaptive recency/frequency replacement slice. It wins the
+  local hotset and pivot event-rate rows and avoids the worst `2q`/`lruk`
+  pivot hot evictions, but it still does not beat `legacy` on demand faults or
+  migration volume.
 - On the local six-run 9-matrix pressure shape, `legacy` has the highest mean
   end-to-end rate among the low-watermark 48 MiB rows. It reaches only 22.9%
   of the matching MAI-managed sufficient-memory end-to-end baseline, while its

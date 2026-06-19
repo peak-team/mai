@@ -1361,6 +1361,181 @@ static int run_policy_phase_shift_hotset(unsigned char* buffer, size_t size,
     return 0;
 }
 
+static int run_policy_recency_frequency_pivot(unsigned char* buffer,
+                                              size_t size,
+                                              uint64_t* checksum,
+                                              size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_PIVOT_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t hotset_bytes =
+        env_size("MAI_BENCH_POLICY_PIVOT_HOTSET", 8ULL * 1024ULL * 1024ULL);
+    size_t warm_rounds =
+        env_count("MAI_BENCH_POLICY_PIVOT_WARM_ROUNDS", 8);
+    size_t burst_groups =
+        env_count("MAI_BENCH_POLICY_PIVOT_BURST_GROUPS", 3);
+    size_t burst_rounds =
+        env_count("MAI_BENCH_POLICY_PIVOT_BURST_ROUNDS", 3);
+    size_t return_rounds =
+        env_count("MAI_BENCH_POLICY_PIVOT_RETURN_ROUNDS", 4);
+    size_t scan_passes =
+        env_count("MAI_BENCH_POLICY_PIVOT_SCAN_PASSES", 2);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    hotset_bytes -= hotset_bytes % unit_bytes;
+    size_t hot_units = hotset_bytes / unit_bytes;
+    if (hot_units == 0) {
+        hot_units = 1;
+    }
+    if (burst_groups == 0) {
+        burst_groups = 1;
+    }
+    if (warm_rounds == 0) {
+        warm_rounds = 1;
+    }
+    if (burst_rounds == 0) {
+        burst_rounds = 1;
+    }
+    if (return_rounds == 0) {
+        return_rounds = 1;
+    }
+    if (scan_passes == 0) {
+        scan_passes = 1;
+    }
+
+    size_t units = size / unit_bytes;
+    size_t active_groups = burst_groups + 1;
+    if (active_groups > SIZE_MAX / hot_units) {
+        return -1;
+    }
+    size_t scan_start = active_groups * hot_units;
+    if (units <= scan_start) {
+        return -1;
+    }
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (size_t round = 0; round < warm_rounds; round++) {
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t offset = unit * unit_bytes;
+            expected[unit]++;
+            buffer[offset] = expected[unit];
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    for (size_t pass = 0; pass < scan_passes; pass++) {
+        for (size_t group = 0; group < burst_groups; group++) {
+            size_t base = (group + 1) * hot_units;
+            for (size_t round = 0; round < burst_rounds; round++) {
+                for (size_t unit = 0; unit < hot_units; unit++) {
+                    size_t index = base + unit;
+                    size_t offset = index * unit_bytes;
+                    expected[index]++;
+                    buffer[offset] = expected[index];
+                    if (buffer[offset] != expected[index]) {
+                        free(expected);
+                        return -1;
+                    }
+                    *checksum += buffer[offset];
+                    (*touches)++;
+                }
+            }
+            for (size_t index = scan_start; index < units; index++) {
+                size_t offset = index * unit_bytes;
+                expected[index]++;
+                buffer[offset] = expected[index];
+                if (buffer[offset] != expected[index]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+            for (size_t unit = 0; unit < hot_units; unit++) {
+                size_t index = base + unit;
+                size_t offset = index * unit_bytes;
+                if (buffer[offset] != expected[index]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+
+        for (size_t round = 0; round < return_rounds; round++) {
+            for (size_t unit = 0; unit < hot_units; unit++) {
+                size_t offset = unit * unit_bytes;
+                expected[unit]++;
+                buffer[offset] = expected[unit];
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+        for (size_t index = scan_start; index < units; index++) {
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t offset = unit * unit_bytes;
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "recency_frequency_pivot";
+    stream_pipeline_prediction_recorded = "car_adaptive";
+    stream_pipeline_groups_recorded = active_groups;
+    stream_pipeline_group_visits_recorded = active_groups * scan_passes;
+    stream_pipeline_group_iterations_recorded = burst_rounds;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_lag_recorded = warm_rounds;
+    stream_pipeline_reclaim_horizon_recorded = return_rounds;
+
+    free(expected);
+    return 0;
+}
+
 static int run_policy_successor_cycle(unsigned char* buffer, size_t size,
                                       uint64_t* checksum,
                                       size_t* touches) {
@@ -3349,6 +3524,7 @@ int main(int argc, char** argv) {
                 "stream_tiled_bandwidth|policy_stream_pipeline|"
                 "policy_multistream_stride|policy_hotset_scan|"
                 "policy_phase_shift_hotset|"
+                "policy_recency_frequency_pivot|"
                 "policy_successor_cycle|policy_spatial_region_mask|"
                 "policy_spatial_interleaved_mask|"
                 "stream_kernel_pipeline|"
@@ -3436,6 +3612,9 @@ int main(int argc, char** argv) {
         rc = run_policy_hotset_scan(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_phase_shift_hotset") == 0) {
         rc = run_policy_phase_shift_hotset(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_recency_frequency_pivot") == 0) {
+        rc = run_policy_recency_frequency_pivot(buffer, size, &checksum,
+                                                &touches);
     } else if (strcmp(argv[1], "policy_successor_cycle") == 0) {
         rc = run_policy_successor_cycle(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "policy_spatial_region_mask") == 0) {
@@ -3571,6 +3750,31 @@ int main(int argc, char** argv) {
     size_t policy_clean_shadow_write_faults = after_stats_available ?
         after.policy_clean_shadow_write_faults -
         before.policy_clean_shadow_write_faults : 0;
+    size_t policy_car_recent_chunks = after_stats_available ?
+        after.policy_car_recent_chunks : 0;
+    size_t policy_car_frequent_chunks = after_stats_available ?
+        after.policy_car_frequent_chunks : 0;
+    size_t policy_car_recent_ghost_chunks = after_stats_available ?
+        after.policy_car_recent_ghost_chunks : 0;
+    size_t policy_car_frequent_ghost_chunks = after_stats_available ?
+        after.policy_car_frequent_ghost_chunks : 0;
+    size_t policy_car_target_recent_chunks = after_stats_available ?
+        after.policy_car_target_recent_chunks : 0;
+    size_t policy_car_recent_ghost_hits = after_stats_available ?
+        after.policy_car_recent_ghost_hits -
+        before.policy_car_recent_ghost_hits : 0;
+    size_t policy_car_frequent_ghost_hits = after_stats_available ?
+        after.policy_car_frequent_ghost_hits -
+        before.policy_car_frequent_ghost_hits : 0;
+    size_t policy_car_target_increases = after_stats_available ?
+        after.policy_car_target_increases -
+        before.policy_car_target_increases : 0;
+    size_t policy_car_target_decreases = after_stats_available ?
+        after.policy_car_target_decreases -
+        before.policy_car_target_decreases : 0;
+    size_t policy_car_second_chances = after_stats_available ?
+        after.policy_car_second_chances -
+        before.policy_car_second_chances : 0;
     const char* policy_prefetch_observation =
         after_stats_available && after.policy_prefetch_observation != 0 ?
         "write_protect" : "unobserved";
@@ -3648,6 +3852,16 @@ int main(int argc, char** argv) {
            "policy_clean_shadow_write_skipped_bytes=%zu "
            "policy_clean_shadow_write_skipped_chunks=%zu "
            "policy_clean_shadow_write_faults=%zu "
+           "policy_car_recent_chunks=%zu "
+           "policy_car_frequent_chunks=%zu "
+           "policy_car_recent_ghost_chunks=%zu "
+           "policy_car_frequent_ghost_chunks=%zu "
+           "policy_car_target_recent_chunks=%zu "
+           "policy_car_recent_ghost_hits=%zu "
+           "policy_car_frequent_ghost_hits=%zu "
+           "policy_car_target_increases=%zu "
+           "policy_car_target_decreases=%zu "
+           "policy_car_second_chances=%zu "
            "max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
@@ -3749,6 +3963,15 @@ int main(int argc, char** argv) {
            policy_clean_shadow_write_skipped_bytes,
            policy_clean_shadow_write_skipped_chunks,
            policy_clean_shadow_write_faults,
+           policy_car_recent_chunks, policy_car_frequent_chunks,
+           policy_car_recent_ghost_chunks,
+           policy_car_frequent_ghost_chunks,
+           policy_car_target_recent_chunks,
+           policy_car_recent_ghost_hits,
+           policy_car_frequent_ghost_hits,
+           policy_car_target_increases,
+           policy_car_target_decreases,
+           policy_car_second_chances,
            after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,

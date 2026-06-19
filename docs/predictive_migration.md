@@ -139,6 +139,8 @@ runtime strategy:
   victim selection baseline.
 - `lruk`, `lru-k`, `lru2`, or `lru-2`: compact LRU-2 reuse-distance
   replacement with ghost history across demotion.
+- `car`, `car-lite`, `clock-pro`, or `clockpro`: compact CAR/CLOCK-Pro-style
+  adaptive replacement with recent/frequent ghost feedback.
 - `markov`, `successor`, or `successor-table`: one-successor transition
   predictor for repeated irregular chunk order.
 - `spatial`, `spatial-mask`, or `region-mask`: per-allocation region-mask
@@ -160,7 +162,10 @@ behavior is also broken out into `policy_adaptive_windows`,
 `policy_clean_shadow_protect_failures`,
 `policy_clean_shadow_write_skipped_bytes`,
 `policy_clean_shadow_write_skipped_chunks`, and
-`policy_clean_shadow_write_faults`. `policy_throttle_slept_ns` is reserved for
+`policy_clean_shadow_write_faults`. CAR-lite also reports current
+recent/frequent resident and ghost chunk counts, recent/frequent ghost hits,
+target movement, and second-chance scans through `policy_car_*` counters.
+`policy_throttle_slept_ns` is reserved for
 a future bandwidth/stall-budget throttle; current policies reject or shrink
 speculative work instead of sleeping in the fault handler.
 
@@ -230,7 +235,7 @@ default performance mode.
 | LRU, CLOCK, FIFO, Random | Demand faults admit chunks. Prefetch enters probation. Eviction uses oldest touch, second-chance reference bit, admission order, or random victim. Throttling is fixed by resident limits and migration chunk size. | Implemented as baselines. |
 | LFU and decayed LFU | Track exact per-chunk frequency with lazy decay and ghost scores after eviction. Admit a prefetch under pressure only if its score beats the current victim or ties an unused/probation victim. Evict unused prefetches first, then low-frequency chunks. Optional write-protect observation can add one resident reuse signal but also adds handler overhead. | Implemented as `lfu`/`decayed-lfu`; approximate TinyLFU sketches remain future work. |
 | 2Q | New or prefetched chunks enter a probation queue. A second demand touch promotes them to the protected set. Eviction demotes probation before protected chunks. | Implemented as a conservative admission baseline; queue refinement remains future work. |
-| ARC, CAR, CART | Maintain recent and frequent resident sets plus ghost histories. Ghost hits tune the split between recency and frequency. Prefetched chunks never enter the frequent set until a demand touch confirms them. | Design target; CAR/CLOCK-style approximations are preferred before exact ARC. |
+| ARC, CAR, CART | Maintain recent and frequent resident sets plus ghost histories. Ghost hits tune the split between recency and frequency. Prefetched chunks never enter the frequent set until a demand touch confirms them. | Implemented first as `car`/`car-lite`, a compact CAR/CLOCK-Pro approximation using per-chunk state and ARC-style target movement; exact ARC/CART metadata remains future work. |
 | LRU-K / reuse distance | Keep a compact two-reference history per chunk. Admit speculative prefetch under pressure only when it can displace unused or immature chunks, and evict by the older Kth-reference epoch among mature chunks. | Implemented as `lruk`/`lru-k`, an LRU-2 approximation with ghost history across demotion. |
 | LIRS | Protect chunks with low inter-reference recency and demote high inter-reference recency chunks even if they were touched recently by a scan. | Simulator/reference first; exact LIRS stack metadata is still too heavy for the initial C runtime. |
 | Sequential readahead | Detect monotonic chunk faults and adapt the forward window with additive increase and multiplicative decrease from accuracy feedback. Admit only while headroom and budget permit. | Implemented as `stream` in first form. |
@@ -310,7 +315,7 @@ adjacent forward prefetches are never consumed.
 `policy_hotset_scan` is the corresponding no-oracle admission workload: it
 reuses a small hot chunk set, scans colder chunks, and verifies whether policy
 counters show less prefetch pollution and migration traffic. It is the preferred
-first check for `2q`, `lfu`/`decayed-lfu`, and `lruk`.
+first check for `2q`, `lfu`/`decayed-lfu`, `lruk`, and `car`.
 Current local smoke results show `lfu` with write-protect observation reducing
 migration traffic versus `legacy` on this workload. In the latest six-run
 policy matrix, observation-off `lfu` is competitive and wins the hotset scan
@@ -321,6 +326,10 @@ warms one hotset, switches to another, scans colder chunks, and verifies that
 the new hotset remains correct without giving MAI phase hints. Use it to test
 whether LRU-K's Kth-reference recency adapts when LFU's old frequency memory
 can linger.
+`policy_recency_frequency_pivot` is the CAR-lite guardrail: it warms an old
+frequent hotset, rotates through short recent hotsets separated by scans, then
+returns to the old frequent hotset. It checks whether CAR adapts the
+recent/frequent balance from ghost feedback without receiving workload hints.
 `policy_successor_cycle` is the no-oracle irregular-transition workload for
 `markov`/`successor`. It uses a deterministic successor cycle so simple
 next-chunk and constant-stride predictors do not receive the same signal.

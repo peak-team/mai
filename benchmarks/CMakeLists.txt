@@ -91,6 +91,25 @@ if(BUILD_TESTING)
     )
 
     add_test(
+        NAME mai_policy_recency_frequency_pivot_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_POLICY_PIVOT_HOTSET=4M"
+            "MAI_BENCH_POLICY_PIVOT_UNIT=2M"
+            "MAI_BENCH_POLICY_PIVOT_WARM_ROUNDS=2"
+            "MAI_BENCH_POLICY_PIVOT_BURST_GROUPS=2"
+            "MAI_BENCH_POLICY_PIVOT_BURST_ROUNDS=2"
+            "MAI_BENCH_POLICY_PIVOT_RETURN_ROUNDS=2"
+            "MAI_BENCH_POLICY_PIVOT_SCAN_PASSES=2"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            policy_recency_frequency_pivot
+            16M
+    )
+    set_tests_properties(mai_policy_recency_frequency_pivot_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=policy_recency_frequency_pivot .*logical_mib=104\\.000 .*stream_pipeline_group_visits=6 .*stream_pipeline_groups=3 .*stream_pipeline_group_iterations=2 .*stream_pipeline_order=recency_frequency_pivot .*stream_pipeline_prediction=car_adaptive .*stream_pipeline_reclaim_lag=2 .*stream_pipeline_reclaim_horizon=2"
+    )
+
+    add_test(
         NAME mai_policy_successor_cycle_smoke
         COMMAND ${CMAKE_COMMAND} -E env
             "MAI_ACCESS_EXPECT_MANAGED=0"

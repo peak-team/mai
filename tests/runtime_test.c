@@ -2923,7 +2923,8 @@ static int mode_uffd_pager_stride_policy(void) {
     return 0;
 }
 
-static int mode_uffd_pager_hotset_scan_policy(const char* policy_name) {
+static int mode_uffd_pager_hotset_scan_policy(const char* policy_name,
+                                              int expect_car_activity) {
     MaiStats before;
     MaiStats after_touch;
     MaiStats after_free;
@@ -3011,6 +3012,24 @@ static int mode_uffd_pager_hotset_scan_policy(const char* policy_name) {
         free(ptr);
         return fail("UFFD hotset test did not reject speculative admission");
     }
+    if (expect_car_activity) {
+        size_t car_events =
+            (after_touch.policy_car_recent_ghost_hits -
+             before.policy_car_recent_ghost_hits) +
+            (after_touch.policy_car_frequent_ghost_hits -
+             before.policy_car_frequent_ghost_hits) +
+            (after_touch.policy_car_target_increases -
+             before.policy_car_target_increases) +
+            (after_touch.policy_car_target_decreases -
+             before.policy_car_target_decreases) +
+            (after_touch.policy_car_second_chances -
+             before.policy_car_second_chances);
+        if (car_events == 0) {
+            fprintf(stderr, "CAR hotset stats did not move\n");
+            free(ptr);
+            return fail("UFFD CAR hotset test did not exercise CAR state");
+        }
+    }
 
     free(ptr);
     if (load_stats(&after_free) != 0) {
@@ -3024,11 +3043,15 @@ static int mode_uffd_pager_hotset_scan_policy(const char* policy_name) {
 }
 
 static int mode_uffd_pager_lfu_hotset_scan(void) {
-    return mode_uffd_pager_hotset_scan_policy("LFU");
+    return mode_uffd_pager_hotset_scan_policy("LFU", 0);
 }
 
 static int mode_uffd_pager_lruk_hotset_scan(void) {
-    return mode_uffd_pager_hotset_scan_policy("LRU-K");
+    return mode_uffd_pager_hotset_scan_policy("LRU-K", 0);
+}
+
+static int mode_uffd_pager_car_hotset_scan(void) {
+    return mode_uffd_pager_hotset_scan_policy("CAR", 1);
 }
 
 static int mode_uffd_pager_successor_policy(void) {
@@ -4444,6 +4467,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_lruk_hotset_scan") == 0) {
         return mode_uffd_pager_lruk_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_car_hotset_scan") == 0) {
+        return mode_uffd_pager_car_hotset_scan();
     }
     if (strcmp(argv[1], "uffd_pager_successor_policy") == 0) {
         return mode_uffd_pager_successor_policy();

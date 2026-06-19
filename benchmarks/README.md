@@ -166,7 +166,8 @@ Runtime policy knobs are intentionally separate from benchmark knobs:
 
 - `MAI_MIGRATION_POLICY` or `MAI_POLICY`: `legacy`, `lru`, `clock`, `fifo`,
   `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, or
-  `lruk`/`lru-k`, `markov`/`successor`, or `spatial`/`spatial-mask`
+  `lruk`/`lru-k`, `car`/`car-lite`, `markov`/`successor`, or
+  `spatial`/`spatial-mask`
 - `MAI_UFFD_PREFETCH_CHUNKS`: maximum UFFD prefetch lookahead
 - `MAI_UFFD_RESIDENT_LIMIT` and `MAI_UFFD_RESIDENT_LOW_LIMIT`: resident
   high/low watermarks for UFFD-managed chunks
@@ -193,7 +194,8 @@ Policy pressure scenarios can use `mai_policy_pipeline` with
 `mai_policy_stream_pipeline`, `mai_policy_clock_pipeline`, or
 `mai_policy_2q_pipeline`. The runtime accepts `legacy`, `lru`, `clock`,
 `fifo`, `random`, `stream`, `stride`, `2q`, `lfu`/`decayed-lfu`, and
-`lruk`/`lru-k`, `markov`/`successor`, and `spatial`/`spatial-mask`.
+`lruk`/`lru-k`, `car`/`car-lite`, `markov`/`successor`, and
+`spatial`/`spatial-mask`.
 
 `policy_multistream_stride` is a focused no-oracle workload for stride
 predictors. It walks fixed-size units inside one allocation as independent
@@ -228,6 +230,20 @@ It does not give MAI phase hints. Control it with
 `MAI_BENCH_POLICY_PHASE_SCAN_PASSES`. Use it to compare `lruk` with `lfu`:
 LFU can preserve old high-frequency chunks too long, while LRU-K should prefer
 chunks with more recent repeated demand references.
+
+`policy_recency_frequency_pivot` is a no-oracle CAR/CLOCK-Pro guardrail. It
+warms one frequent hotset, rotates through short-lived recent hotsets with cold
+scans between phases, then returns to the original frequent hotset. Control it
+with `MAI_BENCH_POLICY_PIVOT_HOTSET`,
+`MAI_BENCH_POLICY_PIVOT_UNIT`,
+`MAI_BENCH_POLICY_PIVOT_WARM_ROUNDS`,
+`MAI_BENCH_POLICY_PIVOT_BURST_GROUPS`,
+`MAI_BENCH_POLICY_PIVOT_BURST_ROUNDS`,
+`MAI_BENCH_POLICY_PIVOT_RETURN_ROUNDS`, and
+`MAI_BENCH_POLICY_PIVOT_SCAN_PASSES`. Use it to check whether `car` adapts
+between recency and frequency instead of only throttling prefetches. Benchmark
+output reports CAR resident state counts, ghost hits, target movement, and
+second-chance scans.
 
 `policy_successor_cycle` is a no-oracle workload for repeated irregular
 transitions. It walks fixed-size units through an affine successor cycle, so
