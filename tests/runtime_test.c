@@ -1894,6 +1894,18 @@ static int mode_uffd_pager_spatial_prefetch(void) {
         free(ptr);
         return fail("UFFD spatial prefetch did not reduce sequential faults");
     }
+    if (after_touch.policy_prefetch_requests <= before.policy_prefetch_requests ||
+        after_touch.policy_prefetch_completed <= before.policy_prefetch_completed) {
+        fprintf(stderr,
+                "policy prefetch stats: requests before=%zu after=%zu "
+                "completed before=%zu after=%zu\n",
+                before.policy_prefetch_requests,
+                after_touch.policy_prefetch_requests,
+                before.policy_prefetch_completed,
+                after_touch.policy_prefetch_completed);
+        free(ptr);
+        return fail("UFFD spatial prefetch did not update policy counters");
+    }
     if (after_touch.uffd_resident_bytes < size) {
         fprintf(stderr, "prefetch stats: resident=%zu size=%zu\n",
                 after_touch.uffd_resident_bytes, size);

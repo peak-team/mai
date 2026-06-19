@@ -124,6 +124,11 @@ Use `end_to_end_logical_mib_per_sec` as the primary comparison metric; kernel
 STREAM rates are secondary because they exclude allocation, first-touch, and
 fault setup costs.
 
+`policy_stream_pipeline` is the preferred no-oracle name for policy work. It
+is an alias of the rotating nine-matrix STREAM workload used by
+`stream_kernel_pipeline`, but the name keeps policy result tables separate from
+older helper scenarios.
+
 `stream_tiled_bandwidth` and the MAI range APIs remain useful assisted controls
 for integration experiments, but they are not part of the default no-oracle
 comparison matrix because they tell MAI which ranges will be read, written, or
@@ -154,6 +159,39 @@ pressure, allocator-time demotion, page-fault-driven kernel cache behavior,
 and optional runtime-owned background heartbeat observation. Background
 heartbeat migration defaults to disabled; set `MAI_HEARTBEAT_BACKGROUND_MIGRATE`
 only for explicit quiescent-boundary or unsafe experimental runs.
+
+Runtime policy knobs are intentionally separate from benchmark knobs:
+
+- `MAI_MIGRATION_POLICY` or `MAI_POLICY`: `legacy`, `lru`, `clock`, `fifo`,
+  `random`, `stream`, or `2q`
+- `MAI_UFFD_PREFETCH_CHUNKS`: maximum UFFD prefetch lookahead
+- `MAI_UFFD_RESIDENT_LIMIT` and `MAI_UFFD_RESIDENT_LOW_LIMIT`: resident
+  high/low watermarks for UFFD-managed chunks
+- `MAI_MIGRATION_CHUNK`: chunk size used for migration and policy metadata
+- `MAI_POLICY_OBSERVE_PREFETCH_WRITES=1`: opt-in write-protect observation for
+  useful-prefetch metrics on write-heavy workloads
+
+Policy pressure scenarios can use `mai_policy_pipeline` with
+`MAI_MIGRATION_POLICY`, or a policy-specific scenario such as
+`mai_policy_stream_pipeline`, `mai_policy_clock_pipeline`, or
+`mai_policy_2q_pipeline`.
+
+Benchmark-only knobs keep the `MAI_BENCH_` prefix. Source policy tests reject
+`MAI_BENCH_*` and `MAI_STREAM_*` references from runtime source files so MAI
+cannot learn benchmark oracle variables.
+
+Policy rows include mechanism-derived counters such as
+`policy_prefetch_observation`, `policy_prefetch_accuracy_observed`,
+`policy_prefetch_coverage_observed`,
+`policy_migration_read_bytes`, `policy_migration_write_bytes`,
+`policy_read_amplification`, `policy_write_amplification`,
+`policy_demand_fault_stall_ns`, `policy_demand_fault_stall_p50_ns`,
+`policy_demand_fault_stall_p90_ns`, `policy_demand_fault_stall_p99_ns`, and
+unused-prefetch eviction bytes. Compare these against sufficient-memory rows
+from the same host, seed, binary, and workload before making performance
+claims. The observed prefetch metrics are lower bounds unless
+`policy_prefetch_observation=write_protect`; Linux mmap and swap baselines do
+not populate MAI migration-byte counters.
 
 This is the intended pressure condition: `3 * matrix_bytes` should fit in
 physical memory while `9 * matrix_bytes` does not. It verifies sampled final

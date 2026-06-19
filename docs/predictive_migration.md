@@ -6,6 +6,21 @@ demoted to storage-backed mappings and when predicted-hot chunks should be
 promoted back to anonymous memory. It is not a correctness requirement and not
 a performance guarantee.
 
+The policy unit is not "prefetch" alone. Every strategy is evaluated as an
+integrated loop:
+
+1. observe demand faults, sampled touches, hints, and residency pressure
+2. predict a bounded set of future chunks
+3. decide whether each predicted chunk should be admitted to DRAM
+4. migrate admitted chunks only within the current bandwidth/stall budget
+5. choose demotion victims when DRAM headroom falls below the policy target
+6. feed accuracy, coverage, pollution, and stall metrics back into the next
+   decision
+
+This prevents a good predictor from degrading the application by polluting
+DRAM, evicting hot demand-fetched chunks, or creating excessive storage
+traffic.
+
 In `MAI_BACKEND=auto`, new allocations stay anonymous while the projected live
 managed footprint fits under the configured or auto-detected RSS budget. When
 that projection approaches the budget, MAI allocates a chunk-tracked anonymous
@@ -97,6 +112,71 @@ many whole hot regions resident as the cap safely allows and tile the rest at
 knows future range intent, but those calls are not used by the primary
 no-oracle STREAM pressure benchmark.
 
+## Policy Framework
+
+The internal policy framework keeps mechanism and strategy separate. UFFD and
+`mmap` code still decides how to restore, zero-fill, write-protect, and remap
+chunks. The migration policy decides only which chunks to prefetch, whether to
+admit them, and which resident chunk is the best demotion victim.
+
+`MAI_MIGRATION_POLICY` (or the shorter alias `MAI_POLICY`) selects the current
+runtime strategy:
+
+- `legacy`: preserves the original fixed forward UFFD prefetch window and
+  oldest-touch eviction behavior.
+- `lru`: oldest-touch eviction with prefetch-aware accounting.
+- `clock`: second-chance style eviction using per-chunk reference bits.
+- `fifo`: evicts the oldest resident chunk by admission time.
+- `random`: baseline random victim selection.
+- `stream`: adaptive sequential prefetch; it grows the window only after
+  repeated positive chunk deltas.
+- `2q`: first prefetch-aware admission baseline; prefetched chunks enter
+  probation and are rejected when admitting them would exceed the resident
+  limit.
+
+All policies share append-only `MaiStats` counters for prefetch requests,
+admissions, completions, useful prefetches, late demand faults, unused-prefetch
+evictions, migration read/write bytes, demand-fault stalls, demotions, and
+promotions. These counters are mechanism-derived and do not depend on benchmark
+scenario names.
+`policy_throttle_events` and `policy_throttle_slept_ns` are reserved for the
+next bandwidth/stall-budget throttle; current policies use resident limits and
+migration chunk size but do not yet report active throttle sleeps.
+
+Read-only usefulness of a UFFD-prefetched chunk is not directly observable
+without adding another faulting mechanism, because a successful prefetch avoids
+the later missing-page fault. `MAI_POLICY_OBSERVE_PREFETCH_WRITES=1` adds
+write-protection to prefetched chunks so write-heavy workloads can report
+observed useful prefetches through UFFD write-protect faults. Leave it off for
+default performance comparisons unless the benchmark explicitly studies
+observation overhead. Benchmark fields named `*_observed` are therefore
+observed lower bounds unless the row says
+`policy_prefetch_observation=write_protect`.
+
+## Algorithm Designs
+
+| Family | Integrated policy design | MAI priority |
+| --- | --- | --- |
+| LRU, CLOCK, FIFO, Random | Demand faults admit chunks. Prefetch enters probation. Eviction uses oldest touch, second-chance reference bit, admission order, or random victim. Throttling is fixed by resident limits and migration chunk size. | Implemented as baselines. |
+| LFU and decayed LFU | Track per-chunk frequency with decay. Admit a candidate only if its recent frequency beats the current victim. Evict low-frequency probation chunks first. | Candidate after baseline counters stabilize. |
+| 2Q | New or prefetched chunks enter a probation queue. A second demand touch promotes them to the protected set. Eviction demotes probation before protected chunks. | Implemented as a conservative admission baseline; queue refinement remains future work. |
+| ARC, CAR, CART | Maintain recent and frequent resident sets plus ghost histories. Ghost hits tune the split between recency and frequency. Prefetched chunks never enter the frequent set until a demand touch confirms them. | Design target; CAR/CLOCK-style approximations are preferred before exact ARC. |
+| LIRS, LRU-K | Protect chunks with low inter-reference recency or repeated Kth references. Demote high inter-reference recency chunks even if they were touched recently by a scan. | Simulator/reference first; exact LIRS metadata is too heavy for the initial C runtime. |
+| Sequential readahead | Detect monotonic chunk faults and adapt the forward window with additive increase and multiplicative decrease from accuracy feedback. Admit only while headroom and budget permit. | Implemented as `stream` in first form. |
+| Stride and multi-stream | Track several `{last, delta, confidence, window}` streams per allocation. Admit only after repeated deltas. Evict chunks far behind active streams. | Next autonomous predictor for interleaved arrays. |
+| Best-offset and multi-lookahead offset | Score candidate offsets by later demand hits. Prefetch the highest-confidence offsets, not necessarily the next chunk. | Useful for blocked and stencil-like patterns after stream baselines. |
+| Markov and delta-correlation | Keep bounded successor tables keyed by previous chunk or delta signature. Admit only high-confidence successors and decay tables quickly under phase changes. | Later; metadata and pollution risk are higher. |
+| Signature/history-table | Use rolling delta signatures to predict multi-step sequences. Confidence controls depth and admission. | Later; best paired with a global budget and quick decay. |
+| Spatial region masks | Divide allocations into fixed chunk regions and learn stable touched masks. On first fault in a region, prefetch the historically useful mask. | Good fit for MAI chunks; planned after stride. |
+| TinyLFU and frequency sketches | Use a compact approximate frequency sketch for admission. Compare candidate score against victim score to prevent pollution. | Important for hot/cold classification under mixed scans. |
+| TPP/AutoNUMA-style tiering | Maintain high/low DRAM watermarks. Proactively demote cold chunks during quiet epochs, promote on demand, and keep headroom for new hot allocations. | Core design principle for MAI pressure handling. |
+| Nomad-style shadowing | Keep valid clean storage shadows after promotion until a write invalidates them. Clean demotion can then avoid rewriting the chunk. | High-value write-amplification reduction, not yet implemented. |
+| Application hints | Treat `mai_hint_range()`, `mai_prefetch()`, and `mai_prepare_write()` as confidence and intent signals, not commands that bypass budgets. | Supported primitives; not used by no-oracle claims. |
+| Queue-aware policies | Accept future ranges with deadlines from schedulers. Admission depends on whether migration can finish before the request executes. | Integration API candidate, separate from autonomous benchmarks. |
+| ML or bandit selector | Prefer a contextual bandit over neural prediction at first: choose among stream, stride, spatial, and admission thresholds from online metrics. | Later meta-policy after several concrete policies exist. |
+| Programmable predictors | Let applications propose candidate ranges and confidence, while MAI owns admission, eviction, and throttling. | Later, for graph/database runtimes. |
+| Prefetch-aware replacement | Track source, confidence, usefulness, and deadline for each prefetched chunk. Evict unused prefetched chunks before demand-confirmed chunks. | Implemented in first form through sidecar metadata and counters. |
+
 The rotating-triplet STREAM benchmark allocates nine matrices grouped as
 `ABC`, `DEF`, and `GHI`. It runs repeated STREAM-like kernels on one triplet,
 then switches to the next triplet in either sequential or deterministic random
@@ -116,6 +196,35 @@ controlled by environment variables such as
 `MAI_HEARTBEAT_BACKGROUND_CHUNK`, and
 `MAI_HEARTBEAT_BACKGROUND_MIGRATE`; these describe observation budget and
 granularity, not future access order.
+
+## Benchmark Metrics
+
+Benchmark rows must report both throughput and policy quality:
+
+- observed prefetch accuracy: fault-observed useful prefetches divided by
+  completed prefetches
+- observed prefetch coverage: fault-observed useful prefetches divided by
+  demand faults
+- timeliness: prefetches useful before demand without a late fault
+- DRAM pollution: bytes of unused prefetched chunks evicted before demand
+- migration bandwidth: storage read plus write bytes per second
+- MAI read amplification: MAI migration read bytes divided by logical workload
+  bytes
+- MAI write amplification: MAI migration write bytes divided by logical
+  workload bytes
+- handler-time reduction: UFFD handler time versus baseline pressure rows
+- handler-tail latency: `policy_demand_fault_stall_p50_ns`,
+  `policy_demand_fault_stall_p90_ns`, `policy_demand_fault_stall_p99_ns`, and
+  `policy_demand_fault_stall_max_ns`
+- effective capacity gain: pressure performance relative to sufficient-memory
+  performance for the same workload, seed, binary, and host
+
+The preferred no-oracle workload name is `policy_stream_pipeline`; it is an
+alias of the rotating nine-matrix STREAM pipeline and intentionally does not
+call MAI range APIs or expose future group order to the runtime. Docker
+scenarios named `mai_policy_<policy>_pipeline`, such as
+`mai_policy_stream_pipeline` or `mai_policy_clock_pipeline`, run this workload
+with the corresponding runtime `MAI_MIGRATION_POLICY`.
 
 ## Benchmarks
 
@@ -149,3 +258,20 @@ These benchmarks provide reproducible observations for selected access
 patterns. They are not portable performance guarantees; use machine-specific
 baselines, variance, and workload-specific tuning before making performance
 claims.
+
+## References
+
+- ARC: Adaptive Replacement Cache, FAST 2003.
+  <https://www.cs.cmu.edu/~natassa/courses/15-721/papers/arcfast.pdf>
+- LIRS: Efficient replacement using inter-reference recency.
+  <https://ranger.uta.edu/~sjiang/pubs/papers/jiang02_LIRS.pdf>
+- Linux `readahead(2)` manual.
+  <https://man7.org/linux/man-pages/man2/readahead.2.html>
+- Linux `userfaultfd` kernel documentation.
+  <https://docs.kernel.org/admin-guide/mm/userfaultfd.html>
+- TPP: Transparent Page Placement for CXL-enabled tiered memory.
+  <https://arxiv.org/abs/2206.02878>
+- HybridTier: adaptive lightweight CXL-memory tiering.
+  <https://arxiv.org/abs/2312.04789>
+- TinyLFU: frequency-based cache admission.
+  <https://arxiv.org/abs/1512.00727>

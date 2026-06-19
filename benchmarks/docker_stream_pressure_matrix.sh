@@ -30,7 +30,7 @@ scratch_root=${MAI_BENCH_SCRATCH:-"$bench_dir/docker-stream-pressure-scratch"}
 image=${MAI_BENCH_DOCKER_IMAGE:-ubuntu:24.04}
 memories=${MAI_BENCH_DOCKER_MEMORIES:-"512m"}
 scenarios=${MAI_BENCH_SCENARIOS:-"linux_mmap_pipeline linux_swap_pipeline mai_auto_pipeline mai_uffd_pipeline"}
-trials=${MAI_BENCH_TRIALS:-1}
+trials=${MAI_BENCH_TRIALS:-6}
 swap_memory_override=${MAI_BENCH_DOCKER_SWAP_MEMORY:-}
 swap_swappiness_override=${MAI_BENCH_DOCKER_MEMORY_SWAPPINESS:-}
 stream_size=${MAI_BENCH_STREAM_ALLOCATION_SIZE:-128M}
@@ -41,6 +41,8 @@ tile_prefetch=${MAI_BENCH_STREAM_TILE_PREFETCH:-${MAI_STREAM_TILE_PREFETCH:-1}}
 tile_prepare_write=${MAI_BENCH_STREAM_TILE_PREPARE_WRITE:-${MAI_STREAM_TILE_PREPARE_WRITE:-1}}
 tile_reclaim=${MAI_BENCH_STREAM_TILE_RECLAIM:-${MAI_STREAM_TILE_RECLAIM:-1}}
 migration_chunk=${MAI_MIGRATION_CHUNK:-2M}
+migration_policy=${MAI_MIGRATION_POLICY:-${MAI_POLICY:-legacy}}
+policy_observe_prefetch_writes=${MAI_POLICY_OBSERVE_PREFETCH_WRITES:-0}
 heartbeat_background=${MAI_HEARTBEAT_BACKGROUND:-0}
 heartbeat_interval=${MAI_HEARTBEAT_BACKGROUND_INTERVAL_US:-1000}
 heartbeat_observe=${MAI_HEARTBEAT_BACKGROUND_OBSERVE_PAGES:-64}
@@ -64,7 +66,7 @@ fail_on_error=${MAI_BENCH_FAIL_ON_ERROR:-0}
 
 mkdir -p "$scratch_root"
 
-echo "suite=docker_stream_pressure_matrix image=$image trials=$trials stream_size=$stream_size passes=$passes tile_size=$tile_size resident_arrays=$resident_arrays tile_prefetch=$tile_prefetch tile_prepare_write=$tile_prepare_write tile_reclaim=$tile_reclaim migration_chunk=$migration_chunk heartbeat_background=$heartbeat_background heartbeat_interval_us=$heartbeat_interval heartbeat_observe_pages=$heartbeat_observe heartbeat_chunk=$heartbeat_chunk heartbeat_migrate=$heartbeat_migrate pipeline_group_iterations=$pipeline_group_iterations pipeline_order=$pipeline_order pipeline_seed=$pipeline_seed pipeline_scalar=$pipeline_scalar mai_threshold=$mai_threshold mai_arena_size=$mai_arena_size mai_file_dedicated_min=$mai_file_dedicated_min mai_auto_large_alloc_cap_percent=$mai_auto_large_alloc_cap_percent mai_max_rss=$mai_max_rss uffd_pager=$uffd_pager uffd_resident_limit=$uffd_resident_limit uffd_resident_low_limit=$uffd_resident_low_limit swap_memory_override=${swap_memory_override:-none} swap_swappiness_override=${swap_swappiness_override:-none}"
+echo "suite=docker_stream_pressure_matrix image=$image trials=$trials stream_size=$stream_size passes=$passes tile_size=$tile_size resident_arrays=$resident_arrays tile_prefetch=$tile_prefetch tile_prepare_write=$tile_prepare_write tile_reclaim=$tile_reclaim migration_chunk=$migration_chunk migration_policy=$migration_policy policy_observe_prefetch_writes=$policy_observe_prefetch_writes heartbeat_background=$heartbeat_background heartbeat_interval_us=$heartbeat_interval heartbeat_observe_pages=$heartbeat_observe heartbeat_chunk=$heartbeat_chunk heartbeat_migrate=$heartbeat_migrate pipeline_group_iterations=$pipeline_group_iterations pipeline_order=$pipeline_order pipeline_seed=$pipeline_seed pipeline_scalar=$pipeline_scalar mai_threshold=$mai_threshold mai_arena_size=$mai_arena_size mai_file_dedicated_min=$mai_file_dedicated_min mai_auto_large_alloc_cap_percent=$mai_auto_large_alloc_cap_percent mai_max_rss=$mai_max_rss uffd_pager=$uffd_pager uffd_resident_limit=$uffd_resident_limit uffd_resident_low_limit=$uffd_resident_low_limit swap_memory_override=${swap_memory_override:-none} swap_swappiness_override=${swap_swappiness_override:-none}"
 echo "memories=\"$memories\" scenarios=\"$scenarios\""
 echo "note=classic_STREAM_uses_three_arrays; pipeline_STREAM_uses_nine_matrices_grouped_as_three_hot_triplets"
 
@@ -99,6 +101,8 @@ for memory in $memories; do
             -e "MAI_BENCH_STREAM_TILE_PREPARE_WRITE=$tile_prepare_write" \
             -e "MAI_BENCH_STREAM_TILE_RECLAIM=$tile_reclaim" \
             -e "MAI_MIGRATION_CHUNK=$migration_chunk" \
+            -e "MAI_MIGRATION_POLICY=$migration_policy" \
+            -e "MAI_POLICY_OBSERVE_PREFETCH_WRITES=$policy_observe_prefetch_writes" \
             -e "MAI_HEARTBEAT_BACKGROUND=$heartbeat_background" \
             -e "MAI_HEARTBEAT_BACKGROUND_INTERVAL_US=$heartbeat_interval" \
             -e "MAI_HEARTBEAT_BACKGROUND_OBSERVE_PAGES=$heartbeat_observe" \
@@ -281,6 +285,44 @@ for memory in $memories; do
                         export MAI_ACCESS_EXPECT_NO_UFFD_FALLBACK=1
                         export LD_PRELOAD=/mai-lib/libmai.so
                         /mai-bench/mai_access_pattern_benchmark                             stream_kernel_pipeline "$MAI_BENCH_STREAM_ALLOCATION_SIZE"
+                        ;;
+                    mai_policy_pipeline|mai_policy_*_pipeline)
+                        export MAI_ENABLE=1
+                        export MAI_PATH=/mai-scratch/mai
+                        export MAI_RECLAIM_POLICY=donthneed
+                        export MAI_BACKEND=auto
+                        case "$MAI_BENCH_SCENARIO" in
+                            mai_policy_*_pipeline)
+                                policy_name=${MAI_BENCH_SCENARIO#mai_policy_}
+                                policy_name=${policy_name%_pipeline}
+                                ;;
+                            *)
+                                policy_name=${MAI_MIGRATION_POLICY:-legacy}
+                                ;;
+                        esac
+                        export MAI_MIGRATION_POLICY="$policy_name"
+                        export MAI_UFFD_PAGER="${MAI_BENCH_UFFD_PAGER:-required}"
+                        if [ "${MAI_BENCH_UFFD_RESIDENT_LIMIT:-auto}" = "auto" ]; then
+                            unset MAI_UFFD_RESIDENT_LIMIT
+                        else
+                            export MAI_UFFD_RESIDENT_LIMIT="$MAI_BENCH_UFFD_RESIDENT_LIMIT"
+                        fi
+                        if [ "${MAI_BENCH_UFFD_RESIDENT_LOW_LIMIT:-auto}" = "auto" ]; then
+                            unset MAI_UFFD_RESIDENT_LOW_LIMIT
+                        else
+                            export MAI_UFFD_RESIDENT_LOW_LIMIT="$MAI_BENCH_UFFD_RESIDENT_LOW_LIMIT"
+                        fi
+                        export MAI_UFFD_PREFETCH_CHUNKS="${MAI_BENCH_UFFD_PREFETCH_CHUNKS:-4}"
+                        export MAI_ACCESS_EXPECT_MANAGED=1
+                        export MAI_ACCESS_EXPECT_MANAGED_DELTA=9
+                        export MAI_ACCESS_EXPECT_UFFD=1
+                        export MAI_ACCESS_EXPECT_UFFD_DELTA=9
+                        export MAI_ACCESS_EXPECT_UFFD_FAULTS=1
+                        export MAI_ACCESS_EXPECT_UFFD_EVICTIONS=1
+                        export MAI_ACCESS_EXPECT_NO_UFFD_FALLBACK=1
+                        export LD_PRELOAD=/mai-lib/libmai.so
+                        /mai-bench/mai_access_pattern_benchmark \
+                            policy_stream_pipeline "$MAI_BENCH_STREAM_ALLOCATION_SIZE"
                         ;;
                     mai_heartbeat_pipeline)
                         export MAI_ENABLE=1

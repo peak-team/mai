@@ -18,12 +18,12 @@ fi
 lib_dir=$(cd "$(dirname "$libmai")" && pwd)
 bench_dir=$(cd "$(dirname "$access_benchmark")" && pwd)
 scratch_dir=${MAI_BENCH_SCRATCH:-"$bench_dir/sufficient-memory-scratch"}
-trials=${MAI_BENCH_TRIALS:-2}
+trials=${MAI_BENCH_TRIALS:-6}
 allocation_size=${MAI_BENCH_ALLOCATION_SIZE:-64M}
 stream_allocation_size=${MAI_BENCH_STREAM_ALLOCATION_SIZE:-512M}
 iterations=${MAI_BENCH_ALLOC_ITERATIONS:-5000}
 allocator_sizes=${MAI_BENCH_ALLOC_SIZES:-"64 4096 65536"}
-access_patterns=${MAI_BENCH_ACCESS_PATTERNS:-"stream_plain stream_bandwidth stride_plain sparse_plain random_hotset"}
+access_patterns=${MAI_BENCH_ACCESS_PATTERNS:-"stream_plain stream_bandwidth policy_stream_pipeline stride_plain sparse_plain random_hotset"}
 min_mib_per_sec=${MAI_BENCH_MIN_MIB_PER_SEC:-0}
 passthrough_threshold=${MAI_BENCH_PASSTHROUGH_THRESHOLD:-16T}
 
@@ -58,7 +58,8 @@ run_access() {
     scenario=$1
     pattern=$2
     pattern_size=$allocation_size
-    if [ "$pattern" = "stream_bandwidth" ]; then
+    if [ "$pattern" = "stream_bandwidth" ] ||
+       [ "$pattern" = "policy_stream_pipeline" ]; then
         pattern_size=$stream_allocation_size
     fi
     if [ "$scenario" = "native" ]; then

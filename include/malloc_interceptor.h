@@ -87,6 +87,33 @@ typedef struct {
     size_t uffd_evictions;
     size_t uffd_resident_bytes;
     size_t uffd_fallbacks;
+    size_t migration_policy;
+    size_t policy_prefetch_requests;
+    size_t policy_prefetch_admitted;
+    size_t policy_prefetch_completed;
+    size_t policy_prefetch_useful;
+    size_t policy_prefetch_late;
+    size_t policy_prefetch_unused_evictions;
+    size_t policy_prefetch_bytes;
+    size_t policy_prefetch_useful_bytes;
+    size_t policy_prefetch_unused_evicted_bytes;
+    size_t policy_admission_requests;
+    size_t policy_admission_rejected;
+    size_t policy_demotions;
+    size_t policy_promotions;
+    size_t policy_evicted_hot_bytes;
+    size_t policy_migration_read_bytes;
+    size_t policy_migration_write_bytes;
+    size_t policy_demand_faults;
+    size_t policy_demand_fault_stall_ns;
+    size_t policy_throttle_events;
+    size_t policy_throttle_slept_ns;
+    size_t policy_prefetch_observation;
+    size_t policy_demand_fault_stall_samples;
+    size_t policy_demand_fault_stall_p50_ns;
+    size_t policy_demand_fault_stall_p90_ns;
+    size_t policy_demand_fault_stall_p99_ns;
+    size_t policy_demand_fault_stall_max_ns;
 } MaiStats;
 
 /**

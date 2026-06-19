@@ -55,6 +55,7 @@
 #define MAI_DEFAULT_MIGRATION_CHUNK_BYTES (2ULL * 1024ULL * 1024ULL)
 #define MAI_DEFAULT_UFFD_PREFETCH_CHUNKS 4
 #define MAI_MAX_UFFD_PREFETCH_CHUNKS 16
+#define MAI_POLICY_STALL_HIST_BUCKETS 64
 #define MAI_HUGEPAGE_SIZE (2ULL * 1024ULL * 1024ULL)
 #define MAI_ACCESS_TRACE_RETIRED_GRACE_NS (10ULL * 1000ULL * 1000ULL)
 
@@ -103,6 +104,25 @@ typedef enum {
     CHUNK_ANON_HOT = 0,
     CHUNK_FILE_COLD = 1
 } ChunkState;
+
+typedef enum {
+    MIGRATION_POLICY_LEGACY = 0,
+    MIGRATION_POLICY_LRU,
+    MIGRATION_POLICY_CLOCK,
+    MIGRATION_POLICY_FIFO,
+    MIGRATION_POLICY_RANDOM,
+    MIGRATION_POLICY_STREAM,
+    MIGRATION_POLICY_2Q
+} MigrationPolicy;
+
+enum {
+    MAI_CHUNK_POLICY_DEMANDED = 1u << 0,
+    MAI_CHUNK_POLICY_PREFETCHED = 1u << 1,
+    MAI_CHUNK_POLICY_PREFETCH_USED = 1u << 2,
+    MAI_CHUNK_POLICY_REFERENCED = 1u << 3,
+    MAI_CHUNK_POLICY_PROBATION = 1u << 4,
+    MAI_CHUNK_POLICY_PROTECTED = 1u << 5
+};
 
 typedef enum {
     EXCLUSION_MLOCK = 0,
@@ -175,6 +195,17 @@ typedef struct ExclusionRange ExclusionRange;
 typedef struct RegistrationRecord RegistrationRecord;
 typedef struct AccessTracePage AccessTracePage;
 
+typedef struct {
+    size_t last_access_epoch;
+    size_t last_prefetch_epoch;
+    size_t first_resident_epoch;
+    size_t frequency;
+    uint32_t flags;
+    uint16_t policy_state;
+    uint16_t confidence;
+    ptrdiff_t last_delta;
+} MaiChunkPolicyMeta;
+
 struct ArenaBlock {
     size_t offset;
     size_t size;
@@ -227,7 +258,14 @@ struct AllocationRecord {
     unsigned char* chunk_states;
     unsigned char* chunk_has_storage;
     size_t* chunk_touch_epochs;
+    MaiChunkPolicyMeta* chunk_policy_meta;
     size_t resident_bytes;
+    size_t policy_clock_hand;
+    size_t policy_last_fault_index;
+    int policy_has_last_fault;
+    ptrdiff_t policy_last_delta;
+    size_t policy_run_length;
+    size_t policy_prefetch_window;
     int uffd_registered;
     int uffd_closing;
     ArenaSegment* segment;
@@ -338,6 +376,8 @@ static ReclaimPolicy reclaim_policy = RECLAIM_NONE;
 static ReclaimSelection reclaim_selection = RECLAIM_SELECT_OLDEST;
 static BackendMode backend_mode = BACKEND_MODE_AUTO;
 static UffdPagerMode uffd_pager_mode = UFFD_PAGER_OFF;
+static MigrationPolicy migration_policy = MIGRATION_POLICY_LEGACY;
+static int policy_observe_prefetch_writes = 0;
 static int uffd_pager_available = 0;
 static int uffd_fd = -1;
 static pthread_t uffd_thread;
@@ -348,6 +388,9 @@ static size_t uffd_resident_low_limit_bytes = 0;
 static int uffd_resident_limit_explicit = 0;
 static size_t uffd_resident_bytes = 0;
 static size_t uffd_touch_epoch = 0;
+static uint64_t policy_random_state = 0x9e3779b97f4a7c15ULL;
+static size_t policy_fault_stall_hist[MAI_POLICY_STALL_HIST_BUCKETS];
+static size_t policy_fault_stall_max_ns = 0;
 static void* uffd_scratch_buffer = NULL;
 static size_t uffd_scratch_length = 0;
 static size_t migration_chunk_bytes = MAI_DEFAULT_MIGRATION_CHUNK_BYTES;
@@ -840,6 +883,74 @@ static void meta_free(void* ptr) {
 
     MetaHeader* header = ((MetaHeader*)ptr) - 1;
     munmap(header, header->length);
+}
+
+static int parse_migration_policy_env(const char* value,
+                                      MigrationPolicy* out) {
+    if (!value || value[0] == '\0' || strcmp(value, "legacy") == 0) {
+        *out = MIGRATION_POLICY_LEGACY;
+        return 0;
+    }
+    if (strcmp(value, "lru") == 0) {
+        *out = MIGRATION_POLICY_LRU;
+        return 0;
+    }
+    if (strcmp(value, "clock") == 0) {
+        *out = MIGRATION_POLICY_CLOCK;
+        return 0;
+    }
+    if (strcmp(value, "fifo") == 0) {
+        *out = MIGRATION_POLICY_FIFO;
+        return 0;
+    }
+    if (strcmp(value, "random") == 0) {
+        *out = MIGRATION_POLICY_RANDOM;
+        return 0;
+    }
+    if (strcmp(value, "stream") == 0 ||
+        strcmp(value, "adaptive-stream") == 0 ||
+        strcmp(value, "sequential") == 0) {
+        *out = MIGRATION_POLICY_STREAM;
+        return 0;
+    }
+    if (strcmp(value, "2q") == 0 || strcmp(value, "twoq") == 0 ||
+        strcmp(value, "prefetch-aware-2q") == 0) {
+        *out = MIGRATION_POLICY_2Q;
+        return 0;
+    }
+    return -1;
+}
+
+static int init_record_policy_meta_locked(AllocationRecord* record) {
+    if (!record || record->chunk_count == 0) {
+        return 0;
+    }
+    size_t meta_bytes;
+    if (mul_overflow(record->chunk_count, sizeof(*record->chunk_policy_meta),
+                     &meta_bytes) != 0) {
+        return -1;
+    }
+    record->chunk_policy_meta =
+        meta_alloc(meta_bytes);
+    if (!record->chunk_policy_meta) {
+        return -1;
+    }
+    memset(record->chunk_policy_meta, 0, meta_bytes);
+    record->policy_clock_hand = 0;
+    record->policy_has_last_fault = 0;
+    record->policy_last_fault_index = 0;
+    record->policy_last_delta = 0;
+    record->policy_run_length = 0;
+    record->policy_prefetch_window = 0;
+    return 0;
+}
+
+static void free_record_policy_meta_locked(AllocationRecord* record) {
+    if (!record) {
+        return;
+    }
+    meta_free(record->chunk_policy_meta);
+    record->chunk_policy_meta = NULL;
 }
 
 static size_t hash_ptr(void* ptr) {
@@ -3201,7 +3312,14 @@ static AllocationRecord* carve_block_locked(ArenaBlock* block, size_t user_size,
     record->chunk_states = NULL;
     record->chunk_has_storage = NULL;
     record->chunk_touch_epochs = NULL;
+    record->chunk_policy_meta = NULL;
     record->resident_bytes = 0;
+    record->policy_clock_hand = 0;
+    record->policy_last_fault_index = 0;
+    record->policy_has_last_fault = 0;
+    record->policy_last_delta = 0;
+    record->policy_run_length = 0;
+    record->policy_prefetch_window = 0;
     record->uffd_registered = 0;
     record->segment = block->segment;
     record->block = block;
@@ -3302,6 +3420,7 @@ static AllocationRecord* managed_anon_alloc_locked(size_t size, size_t alignment
             return NULL;
         }
         memset(record->chunk_states, CHUNK_ANON_HOT, record->chunk_count);
+        (void)init_record_policy_meta_locked(record);
     }
 
     insert_record_locked(record);
@@ -3401,6 +3520,7 @@ static AllocationRecord* managed_uffd_alloc_locked(size_t size, size_t alignment
     memset(record->chunk_states, CHUNK_FILE_COLD, record->chunk_count);
     memset(record->chunk_has_storage, 0, record->chunk_count);
     memset(record->chunk_touch_epochs, 0, record->chunk_count * sizeof(size_t));
+    (void)init_record_policy_meta_locked(record);
 
     void* page_start = NULL;
     size_t page_length = record_page_range(record, &page_start);
@@ -3408,6 +3528,7 @@ static AllocationRecord* managed_uffd_alloc_locked(size_t size, size_t alignment
         meta_free(record->chunk_states);
         meta_free(record->chunk_has_storage);
         meta_free(record->chunk_touch_epochs);
+        free_record_policy_meta_locked(record);
         meta_free(record);
         munmap(base, mapped_length);
         errno = EINVAL;
@@ -3418,6 +3539,7 @@ static AllocationRecord* managed_uffd_alloc_locked(size_t size, size_t alignment
         meta_free(record->chunk_states);
         meta_free(record->chunk_has_storage);
         meta_free(record->chunk_touch_epochs);
+        free_record_policy_meta_locked(record);
         meta_free(record);
         munmap(base, mapped_length);
         return NULL;
@@ -3599,6 +3721,7 @@ static void managed_free_record_locked(AllocationRecord* record) {
             close(record->storage_fd);
             record->storage_fd = -1;
         }
+        free_record_policy_meta_locked(record);
         meta_free(record->chunk_states);
         record->chunk_states = NULL;
         meta_free(record->chunk_has_storage);
@@ -3825,6 +3948,372 @@ static int register_uffd_record(AllocationRecord* record) {
     return 0;
 }
 
+static uint64_t policy_next_random_locked(void) {
+    uint64_t x = policy_random_state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    policy_random_state = x ? x : 0x9e3779b97f4a7c15ULL;
+    return policy_random_state * 2685821657736338717ULL;
+}
+
+static int policy_chunk_is_protected(AllocationRecord* record, size_t index,
+                                     AllocationRecord* protected_record,
+                                     size_t protected_start_index,
+                                     size_t protected_end_index) {
+    return record == protected_record &&
+        index >= protected_start_index && index <= protected_end_index;
+}
+
+static int policy_chunk_is_prefetched_unused(MaiChunkPolicyMeta* meta) {
+    return meta &&
+        (meta->flags & MAI_CHUNK_POLICY_PREFETCHED) != 0 &&
+        (meta->flags & MAI_CHUNK_POLICY_PREFETCH_USED) == 0 &&
+        (meta->flags & MAI_CHUNK_POLICY_DEMANDED) == 0;
+}
+
+static void policy_note_demand_fault_locked(AllocationRecord* record,
+                                            size_t index) {
+    if (!record || index >= record->chunk_count ||
+        !record->chunk_policy_meta) {
+        return;
+    }
+
+    MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
+    if (record->policy_has_last_fault) {
+        ptrdiff_t delta =
+            (ptrdiff_t)index - (ptrdiff_t)record->policy_last_fault_index;
+        if (delta == record->policy_last_delta) {
+            record->policy_run_length++;
+        } else {
+            record->policy_run_length = 1;
+        }
+        record->policy_last_delta = delta;
+        meta->last_delta = delta;
+    } else {
+        record->policy_has_last_fault = 1;
+        record->policy_run_length = 1;
+        record->policy_last_delta = 0;
+        meta->last_delta = 0;
+    }
+    record->policy_last_fault_index = index;
+    meta->flags |= MAI_CHUNK_POLICY_DEMANDED | MAI_CHUNK_POLICY_REFERENCED;
+    meta->frequency++;
+    meta->last_access_epoch = uffd_touch_epoch + 1;
+}
+
+static size_t policy_prefetch_window_locked(AllocationRecord* record,
+                                            size_t index) {
+    (void)index;
+    size_t base = uffd_prefetch_chunks == 0 ? 1 : uffd_prefetch_chunks;
+    if (migration_policy != MIGRATION_POLICY_STREAM) {
+        return base;
+    }
+
+    if (!record || !record->policy_has_last_fault ||
+        record->policy_last_delta != 1 || record->policy_run_length < 2) {
+        return 1;
+    }
+    size_t adaptive = record->policy_run_length + 1;
+    if (adaptive > base) {
+        adaptive = base;
+    }
+    if (adaptive < 2) {
+        adaptive = 2;
+    }
+    record->policy_prefetch_window = adaptive;
+    return adaptive;
+}
+
+static int policy_admit_prefetch_locked(AllocationRecord* record, size_t index,
+                                        size_t length) {
+    if (!record || index >= record->chunk_count) {
+        return 0;
+    }
+    stats_snapshot.policy_prefetch_requests++;
+    stats_snapshot.policy_admission_requests++;
+
+    int admit = 1;
+    if (migration_policy == MIGRATION_POLICY_2Q &&
+        uffd_resident_limit_bytes != 0 &&
+        uffd_resident_bytes + length > uffd_resident_limit_bytes) {
+        admit = 0;
+    }
+    if (!admit) {
+        stats_snapshot.policy_admission_rejected++;
+        return 0;
+    }
+
+    stats_snapshot.policy_prefetch_admitted++;
+    if (record->chunk_policy_meta) {
+        MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
+        meta->flags |= MAI_CHUNK_POLICY_PREFETCHED |
+            MAI_CHUNK_POLICY_PROBATION;
+        meta->last_prefetch_epoch = uffd_touch_epoch + 1;
+        meta->confidence = record->policy_run_length > UINT16_MAX ?
+            UINT16_MAX : (uint16_t)record->policy_run_length;
+    }
+    return 1;
+}
+
+static void policy_note_populate_locked(AllocationRecord* record, size_t index,
+                                        int demand, int had_storage,
+                                        size_t length) {
+    if (had_storage) {
+        stats_snapshot.policy_migration_read_bytes += length;
+    }
+    stats_snapshot.policy_promotions++;
+
+    if (!record || index >= record->chunk_count ||
+        !record->chunk_policy_meta) {
+        if (demand) {
+            stats_snapshot.policy_demand_faults++;
+        } else {
+            stats_snapshot.policy_prefetch_completed++;
+            stats_snapshot.policy_prefetch_bytes += length;
+        }
+        return;
+    }
+
+    MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
+    meta->first_resident_epoch = uffd_touch_epoch + 1;
+    meta->last_access_epoch = uffd_touch_epoch + 1;
+    meta->flags |= MAI_CHUNK_POLICY_REFERENCED;
+
+    if (demand) {
+        stats_snapshot.policy_demand_faults++;
+        if ((meta->flags & MAI_CHUNK_POLICY_PREFETCHED) != 0 &&
+            (meta->flags & MAI_CHUNK_POLICY_PREFETCH_USED) == 0) {
+            meta->flags |= MAI_CHUNK_POLICY_PREFETCH_USED |
+                MAI_CHUNK_POLICY_PROTECTED;
+            meta->flags &= ~MAI_CHUNK_POLICY_PROBATION;
+            stats_snapshot.policy_prefetch_useful++;
+            stats_snapshot.policy_prefetch_useful_bytes += length;
+        } else if ((meta->flags & MAI_CHUNK_POLICY_PREFETCHED) == 0) {
+            stats_snapshot.policy_prefetch_late++;
+        }
+    } else {
+        meta->flags |= MAI_CHUNK_POLICY_PREFETCHED |
+            MAI_CHUNK_POLICY_PROBATION;
+        meta->last_prefetch_epoch = uffd_touch_epoch + 1;
+        stats_snapshot.policy_prefetch_completed++;
+        stats_snapshot.policy_prefetch_bytes += length;
+    }
+}
+
+static void policy_note_resident_demand_locked(AllocationRecord* record,
+                                               size_t index,
+                                               size_t length) {
+    if (!record || index >= record->chunk_count ||
+        !record->chunk_policy_meta) {
+        stats_snapshot.policy_demand_faults++;
+        return;
+    }
+    MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
+    if ((meta->flags & MAI_CHUNK_POLICY_PREFETCHED) != 0 &&
+        (meta->flags & MAI_CHUNK_POLICY_PREFETCH_USED) == 0) {
+        meta->flags |= MAI_CHUNK_POLICY_PREFETCH_USED |
+            MAI_CHUNK_POLICY_PROTECTED;
+        meta->flags &= ~MAI_CHUNK_POLICY_PROBATION;
+        stats_snapshot.policy_prefetch_useful++;
+        stats_snapshot.policy_prefetch_useful_bytes += length;
+    }
+    meta->flags |= MAI_CHUNK_POLICY_DEMANDED | MAI_CHUNK_POLICY_REFERENCED;
+    meta->frequency++;
+    meta->last_access_epoch = uffd_touch_epoch + 1;
+    stats_snapshot.policy_demand_faults++;
+}
+
+static void policy_note_evict_locked(AllocationRecord* record, size_t index,
+                                     size_t length) {
+    stats_snapshot.policy_demotions++;
+    stats_snapshot.policy_migration_write_bytes += length;
+    if (!record || index >= record->chunk_count ||
+        !record->chunk_policy_meta) {
+        return;
+    }
+    MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
+    if (policy_chunk_is_prefetched_unused(meta)) {
+        stats_snapshot.policy_prefetch_unused_evictions++;
+        stats_snapshot.policy_prefetch_unused_evicted_bytes += length;
+    } else if ((meta->flags & MAI_CHUNK_POLICY_DEMANDED) != 0 ||
+               meta->frequency > 1) {
+        stats_snapshot.policy_evicted_hot_bytes += length;
+    }
+    memset(meta, 0, sizeof(*meta));
+}
+
+static void policy_note_evict_runtime_locked(AllocationRecord* record,
+                                             size_t index, size_t length) {
+    pthread_mutex_lock(&uffd_fault_lock);
+    policy_note_evict_locked(record, index, length);
+    pthread_mutex_unlock(&uffd_fault_lock);
+}
+
+static void policy_note_promote_runtime_locked(AllocationRecord* record,
+                                               size_t index, size_t length,
+                                               int counted_read) {
+    pthread_mutex_lock(&uffd_fault_lock);
+    if (counted_read) {
+        stats_snapshot.policy_migration_read_bytes += length;
+    }
+    stats_snapshot.policy_promotions++;
+    pthread_mutex_unlock(&uffd_fault_lock);
+
+    if (!record || index >= record->chunk_count ||
+        !record->chunk_policy_meta) {
+        return;
+    }
+    MaiChunkPolicyMeta* meta = &record->chunk_policy_meta[index];
+    meta->flags |= MAI_CHUNK_POLICY_DEMANDED |
+        MAI_CHUNK_POLICY_PROTECTED | MAI_CHUNK_POLICY_REFERENCED;
+    meta->frequency++;
+    meta->last_access_epoch = reclaim_epoch + 1;
+    meta->first_resident_epoch = meta->last_access_epoch;
+}
+
+static size_t policy_stall_bucket(size_t ns) {
+    size_t bucket = 0;
+    while (ns > 1 && bucket + 1 < MAI_POLICY_STALL_HIST_BUCKETS) {
+        ns >>= 1;
+        bucket++;
+    }
+    return bucket;
+}
+
+static size_t policy_stall_bucket_upper_ns(size_t bucket) {
+    if (bucket >= sizeof(size_t) * CHAR_BIT - 1) {
+        return SIZE_MAX;
+    }
+    return ((size_t)1) << bucket;
+}
+
+static size_t policy_stall_percentile_locked(size_t percentile) {
+    size_t samples = stats_snapshot.policy_demand_fault_stall_samples;
+    if (samples == 0) {
+        return 0;
+    }
+    size_t rank = (samples / 100) * percentile +
+        ((samples % 100) * percentile + 99) / 100;
+    if (rank == 0) {
+        rank = 1;
+    }
+    size_t cumulative = 0;
+    for (size_t i = 0; i < MAI_POLICY_STALL_HIST_BUCKETS; i++) {
+        cumulative += policy_fault_stall_hist[i];
+        if (cumulative >= rank) {
+            return policy_stall_bucket_upper_ns(i);
+        }
+    }
+    return policy_fault_stall_max_ns;
+}
+
+static void policy_note_fault_handler_stall_locked(size_t ns) {
+    stats_snapshot.policy_demand_fault_stall_ns += ns;
+    stats_snapshot.policy_demand_fault_stall_samples++;
+    if (ns > policy_fault_stall_max_ns) {
+        policy_fault_stall_max_ns = ns;
+    }
+    policy_fault_stall_hist[policy_stall_bucket(ns)]++;
+}
+
+static int policy_choose_uffd_victim_locked(AllocationRecord** out_record,
+                                            size_t* out_index,
+                                            AllocationRecord* protected_record,
+                                            size_t protected_start_index,
+                                            size_t protected_end_index) {
+    AllocationRecord* best_record = NULL;
+    size_t best_index = 0;
+    size_t best_epoch = SIZE_MAX;
+    int best_class = 2;
+    size_t candidates_seen = 0;
+
+    for (AllocationRecord* record = uffd_head; record; record = record->uffd_next) {
+        if (record->backend != BACKEND_UFFD_PAGER || record->uffd_closing ||
+            !record->chunk_states ||
+            !record->chunk_touch_epochs || !record->uffd_registered) {
+            continue;
+        }
+
+        for (size_t i = 0; i < record->chunk_count; i++) {
+            if (policy_chunk_is_protected(record, i, protected_record,
+                                          protected_start_index,
+                                          protected_end_index) ||
+                record->chunk_states[i] != CHUNK_ANON_HOT) {
+                continue;
+            }
+
+            MaiChunkPolicyMeta* meta = record->chunk_policy_meta ?
+                &record->chunk_policy_meta[i] : NULL;
+            size_t epoch = record->chunk_touch_epochs[i];
+            if (epoch == 0 && meta && meta->first_resident_epoch != 0) {
+                epoch = meta->first_resident_epoch;
+            }
+
+            if (migration_policy == MIGRATION_POLICY_RANDOM) {
+                candidates_seen++;
+                if ((policy_next_random_locked() % candidates_seen) == 0) {
+                    best_record = record;
+                    best_index = i;
+                }
+                continue;
+            }
+
+            if (migration_policy == MIGRATION_POLICY_CLOCK && meta &&
+                (meta->flags & MAI_CHUNK_POLICY_REFERENCED) != 0) {
+                meta->flags &= ~MAI_CHUNK_POLICY_REFERENCED;
+                continue;
+            }
+
+            int candidate_class =
+                (migration_policy != MIGRATION_POLICY_LEGACY &&
+                 policy_chunk_is_prefetched_unused(meta)) ? 0 : 1;
+            if (migration_policy == MIGRATION_POLICY_FIFO && meta &&
+                meta->first_resident_epoch != 0) {
+                epoch = meta->first_resident_epoch;
+            }
+            if (!best_record || candidate_class < best_class ||
+                (candidate_class == best_class && epoch < best_epoch)) {
+                best_record = record;
+                best_index = i;
+                best_epoch = epoch;
+                best_class = candidate_class;
+            }
+        }
+    }
+
+    if (!best_record && migration_policy == MIGRATION_POLICY_CLOCK) {
+        for (AllocationRecord* record = uffd_head; record; record = record->uffd_next) {
+            if (record->backend != BACKEND_UFFD_PAGER || record->uffd_closing ||
+                !record->chunk_states ||
+                !record->chunk_touch_epochs || !record->uffd_registered) {
+                continue;
+            }
+            for (size_t i = 0; i < record->chunk_count; i++) {
+                if (policy_chunk_is_protected(record, i, protected_record,
+                                              protected_start_index,
+                                              protected_end_index) ||
+                    record->chunk_states[i] != CHUNK_ANON_HOT) {
+                    continue;
+                }
+                size_t epoch = record->chunk_touch_epochs[i];
+                if (!best_record || epoch < best_epoch) {
+                    best_record = record;
+                    best_index = i;
+                    best_epoch = epoch;
+                }
+            }
+        }
+    }
+
+    if (!best_record) {
+        return 0;
+    }
+    *out_record = best_record;
+    *out_index = best_index;
+    return 1;
+}
+
 static int evict_uffd_chunk_locked(AllocationRecord* record, size_t index,
                                    int runtime_lock_held) {
     uintptr_t start = 0;
@@ -3860,6 +4349,7 @@ static int evict_uffd_chunk_locked(AllocationRecord* record, size_t index,
         return -1;
     }
 
+    policy_note_evict_locked(record, index, length);
     record->chunk_states[index] = CHUNK_FILE_COLD;
     if (record->chunk_has_storage) {
         record->chunk_has_storage[index] = 1;
@@ -3887,32 +4377,10 @@ static int evict_uffd_chunks_locked(size_t target_bytes,
     while (uffd_resident_bytes > target_bytes) {
         AllocationRecord* best_record = NULL;
         size_t best_index = 0;
-        size_t best_epoch = SIZE_MAX;
-
-        for (AllocationRecord* record = uffd_head; record; record = record->uffd_next) {
-            if (record->backend != BACKEND_UFFD_PAGER || record->uffd_closing ||
-                !record->chunk_states ||
-                !record->chunk_touch_epochs || !record->uffd_registered) {
-                continue;
-            }
-            for (size_t i = 0; i < record->chunk_count; i++) {
-                if (record == protected_record &&
-                    i >= protected_start_index && i <= protected_end_index) {
-                    continue;
-                }
-                if (record->chunk_states[i] != CHUNK_ANON_HOT) {
-                    continue;
-                }
-                size_t epoch = record->chunk_touch_epochs[i];
-                if (epoch < best_epoch) {
-                    best_epoch = epoch;
-                    best_record = record;
-                    best_index = i;
-                }
-            }
-        }
-
-        if (!best_record) {
+        if (!policy_choose_uffd_victim_locked(&best_record, &best_index,
+                                              protected_record,
+                                              protected_start_index,
+                                              protected_end_index)) {
             break;
         }
         if (evict_uffd_chunk_locked(best_record, best_index,
@@ -3974,6 +4442,7 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
 
     if (record->chunk_states[index] == CHUNK_ANON_HOT) {
         if (count_fault_event) {
+            policy_note_resident_demand_locked(record, index, length);
             record->chunk_touch_epochs[index] = ++uffd_touch_epoch;
             stats_snapshot.uffd_faults++;
         }
@@ -4024,6 +4493,11 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
         if (populated_bytes) {
             *populated_bytes += length;
         }
+        policy_note_populate_locked(record, index, count_fault_event,
+                                    has_storage, length);
+        if (!count_fault_event && policy_observe_prefetch_writes) {
+            (void)uffd_writeprotect_range(chunk_start, length, 1);
+        }
     }
     record->chunk_touch_epochs[index] = ++uffd_touch_epoch;
     if (count_fault_event) {
@@ -4071,16 +4545,18 @@ static int resolve_uffd_fault_locked(uintptr_t fault_address,
         if (uffd_writeprotect_range(chunk_start, length, 0) != 0) {
             return -1;
         }
+        policy_note_resident_demand_locked(record, index, length);
         record->chunk_touch_epochs[index] = ++uffd_touch_epoch;
         stats_snapshot.uffd_faults++;
         return 0;
     }
+    policy_note_demand_fault_locked(record, index);
     if (populate_uffd_chunk_locked(record, index, 1, NULL) != 0) {
         return -1;
     }
 
     size_t protected_end_index = index;
-    size_t prefetch_window = uffd_prefetch_chunks == 0 ? 1 : uffd_prefetch_chunks;
+    size_t prefetch_window = policy_prefetch_window_locked(record, index);
     if (record->chunk_bytes != 0 && uffd_resident_limit_bytes != 0) {
         size_t cap_window = (uffd_resident_limit_bytes / 2) / record->chunk_bytes;
         if (cap_window == 0) {
@@ -4096,6 +4572,15 @@ static int resolve_uffd_fault_locked(uintptr_t fault_address,
         size_t prefetch_index = index + offset;
         if (record->chunk_states[prefetch_index] == CHUNK_ANON_HOT) {
             protected_end_index = prefetch_index;
+            continue;
+        }
+        uintptr_t prefetch_start = 0;
+        size_t prefetch_length =
+            uffd_record_chunk_length_locked(record, prefetch_index,
+                                            &prefetch_start);
+        if (prefetch_length == 0 ||
+            !policy_admit_prefetch_locked(record, prefetch_index,
+                                          prefetch_length)) {
             continue;
         }
         if (populate_uffd_chunk_locked(record, prefetch_index, 0, NULL) != 0) {
@@ -4178,10 +4663,16 @@ static void* uffd_pager_main(void* arg) {
             }
             int runtime_lock_held = 0;
             pthread_mutex_lock(&uffd_fault_lock);
+            uint64_t fault_start_ns = monotonic_time_ns_signal_safe();
             int rc = resolve_uffd_fault_locked(
                 (uintptr_t)msg.arg.pagefault.address,
                 msg.arg.pagefault.flags,
                 runtime_lock_held);
+            uint64_t fault_end_ns = monotonic_time_ns_signal_safe();
+            if (fault_start_ns != 0 && fault_end_ns >= fault_start_ns) {
+                policy_note_fault_handler_stall_locked(
+                    (size_t)(fault_end_ns - fault_start_ns));
+            }
             if (rc != 0) {
                 fail_uffd_pager_locked();
             }
@@ -4322,6 +4813,7 @@ static int migrate_anon_range_to_file_locked(AllocationRecord* record,
         }
 
         if (record->chunk_states) {
+            policy_note_evict_runtime_locked(record, i, length);
             record->chunk_states[i] = CHUNK_FILE_COLD;
         }
         migrated += length;
@@ -4410,6 +4902,7 @@ static int promote_record_range_to_anon_locked(AllocationRecord* record,
 #ifdef MADV_HUGEPAGE
         (void)madvise((void*)start, length, MADV_HUGEPAGE);
 #endif
+        policy_note_promote_runtime_locked(record, i, length, 1);
         record->chunk_states[i] = CHUNK_ANON_HOT;
         promoted += length;
     }
@@ -4468,6 +4961,7 @@ static int prepare_record_range_for_write_locked(AllocationRecord* record,
 #ifdef MADV_HUGEPAGE
         (void)madvise((void*)start, length, MADV_HUGEPAGE);
 #endif
+        policy_note_promote_runtime_locked(record, i, length, 0);
         record->chunk_states[i] = CHUNK_ANON_HOT;
         prepared += length;
     }
@@ -5107,6 +5601,16 @@ static void populate_stats_snapshot_locked(MaiStats* out) {
     out->arena_size = arena_size_bytes;
     out->target_rss = target_rss_bytes;
     out->max_rss = effective_max_rss_locked(stats_snapshot.current_rss_bytes);
+    out->migration_policy = (size_t)migration_policy;
+    out->policy_prefetch_observation =
+        policy_observe_prefetch_writes ? 1u : 0u;
+    out->policy_demand_fault_stall_p50_ns =
+        policy_stall_percentile_locked(50);
+    out->policy_demand_fault_stall_p90_ns =
+        policy_stall_percentile_locked(90);
+    out->policy_demand_fault_stall_p99_ns =
+        policy_stall_percentile_locked(99);
+    out->policy_demand_fault_stall_max_ns = policy_fault_stall_max_ns;
 }
 
 int mai_get_stats_sized(MaiStats* out, size_t stats_size) {
@@ -5804,7 +6308,23 @@ static void print_stats(void) {
             "migrated_to_file_bytes=%zu promoted_to_anon_bytes=%zu "
             "uffd_pager_available=%zu uffd_pager_allocations=%zu "
             "uffd_faults=%zu uffd_evictions=%zu uffd_resident_bytes=%zu "
-            "uffd_fallbacks=%zu\n",
+            "uffd_fallbacks=%zu migration_policy=%zu "
+            "policy_prefetch_requests=%zu policy_prefetch_admitted=%zu "
+            "policy_prefetch_completed=%zu policy_prefetch_useful=%zu "
+            "policy_prefetch_late=%zu policy_prefetch_unused_evictions=%zu "
+            "policy_prefetch_bytes=%zu policy_prefetch_useful_bytes=%zu "
+            "policy_prefetch_unused_evicted_bytes=%zu "
+            "policy_admission_requests=%zu policy_admission_rejected=%zu "
+            "policy_demotions=%zu policy_promotions=%zu "
+            "policy_evicted_hot_bytes=%zu policy_migration_read_bytes=%zu "
+            "policy_migration_write_bytes=%zu policy_demand_faults=%zu "
+            "policy_demand_fault_stall_ns=%zu policy_throttle_events=%zu "
+            "policy_throttle_slept_ns=%zu policy_prefetch_observation=%zu "
+            "policy_demand_fault_stall_samples=%zu "
+            "policy_demand_fault_stall_p50_ns=%zu "
+            "policy_demand_fault_stall_p90_ns=%zu "
+            "policy_demand_fault_stall_p99_ns=%zu "
+            "policy_demand_fault_stall_max_ns=%zu\n",
             stats.enabled, stats.configured, stats.config_error, stats.threshold,
             stats.arena_size, stats.target_rss, stats.max_rss,
             stats.current_rss_bytes, stats.high_water_rss_bytes,
@@ -5827,7 +6347,27 @@ static void print_stats(void) {
             stats.promoted_to_anon_bytes, stats.uffd_pager_available,
             stats.uffd_pager_allocations, stats.uffd_faults,
             stats.uffd_evictions, stats.uffd_resident_bytes,
-            stats.uffd_fallbacks);
+            stats.uffd_fallbacks, stats.migration_policy,
+            stats.policy_prefetch_requests, stats.policy_prefetch_admitted,
+            stats.policy_prefetch_completed, stats.policy_prefetch_useful,
+            stats.policy_prefetch_late,
+            stats.policy_prefetch_unused_evictions,
+            stats.policy_prefetch_bytes, stats.policy_prefetch_useful_bytes,
+            stats.policy_prefetch_unused_evicted_bytes,
+            stats.policy_admission_requests, stats.policy_admission_rejected,
+            stats.policy_demotions, stats.policy_promotions,
+            stats.policy_evicted_hot_bytes,
+            stats.policy_migration_read_bytes,
+            stats.policy_migration_write_bytes,
+            stats.policy_demand_faults,
+            stats.policy_demand_fault_stall_ns,
+            stats.policy_throttle_events, stats.policy_throttle_slept_ns,
+            stats.policy_prefetch_observation,
+            stats.policy_demand_fault_stall_samples,
+            stats.policy_demand_fault_stall_p50_ns,
+            stats.policy_demand_fault_stall_p90_ns,
+            stats.policy_demand_fault_stall_p99_ns,
+            stats.policy_demand_fault_stall_max_ns);
 }
 
 static void print_profile_report(void) {
@@ -5974,6 +6514,12 @@ static int configure_runtime(void) {
         getenv("MAI_UFFD_RESIDENT_LOW_LIMIT");
     const char* uffd_prefetch = getenv("MAI_UFFD_PREFETCH_CHUNKS");
     const char* migration_chunk = getenv("MAI_MIGRATION_CHUNK");
+    const char* migration_policy_env = getenv("MAI_MIGRATION_POLICY");
+    if (!migration_policy_env || migration_policy_env[0] == '\0') {
+        migration_policy_env = getenv("MAI_POLICY");
+    }
+    const char* observe_prefetch_writes =
+        getenv("MAI_POLICY_OBSERVE_PREFETCH_WRITES");
     const char* file_dedicated_min = getenv("MAI_FILE_DEDICATED_MIN");
     const char* auto_large_alloc_percent =
         getenv("MAI_AUTO_LARGE_ALLOC_CAP_PERCENT");
@@ -6002,6 +6548,8 @@ static int configure_runtime(void) {
     reclaim_selection = RECLAIM_SELECT_OLDEST;
     backend_mode = BACKEND_MODE_AUTO;
     uffd_pager_mode = UFFD_PAGER_OFF;
+    migration_policy = MIGRATION_POLICY_LEGACY;
+    policy_observe_prefetch_writes = 0;
     uffd_pager_available = 0;
     uffd_resident_limit_bytes = 0;
     uffd_resident_low_limit_bytes = 0;
@@ -6040,6 +6588,8 @@ static int configure_runtime(void) {
     file_dedicated_min_bytes = MAI_DEFAULT_FILE_DEDICATED_MIN_BYTES;
 
     memset(&stats_snapshot, 0, sizeof(stats_snapshot));
+    memset(policy_fault_stall_hist, 0, sizeof(policy_fault_stall_hist));
+    policy_fault_stall_max_ns = 0;
     pass_through_counter_generation++;
     if (pass_through_counter_generation == 0) {
         pass_through_counter_generation = 1;
@@ -6183,6 +6733,13 @@ static int configure_runtime(void) {
         runtime_config_error = 1;
         return -1;
     }
+    if (migration_policy_env &&
+        parse_migration_policy_env(migration_policy_env,
+                                   &migration_policy) != 0) {
+        runtime_config_error = 1;
+        return -1;
+    }
+    policy_observe_prefetch_writes = parse_bool_env(observe_prefetch_writes);
     if (file_dedicated_min &&
         parse_size_env(file_dedicated_min, &file_dedicated_min_bytes) != 0) {
         runtime_config_error = 1;

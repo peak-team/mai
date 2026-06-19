@@ -325,7 +325,8 @@ static int mode_uses_stream_kernel(const char* mode) {
 }
 
 static int mode_uses_stream_pipeline(const char* mode) {
-    return strcmp(mode, "stream_kernel_pipeline") == 0 ||
+    return strcmp(mode, "policy_stream_pipeline") == 0 ||
+           strcmp(mode, "stream_kernel_pipeline") == 0 ||
            strcmp(mode, "stream_kernel_pipeline_anon_mmap") == 0 ||
            strcmp(mode, "stream_kernel_pipeline_shared_file") == 0 ||
            strcmp(mode, "stream_kernel_pipeline_private_file") == 0;
@@ -2653,7 +2654,8 @@ int main(int argc, char** argv) {
                 "mprotect_overhead|heartbeat_idle|chunk_position|"
                 "heartbeat_concurrent|stream_bandwidth|stream_anon_mmap|"
                 "stream_shared_file|stream_private_file|"
-                "stream_tiled_bandwidth|stream_kernel_pipeline|"
+                "stream_tiled_bandwidth|policy_stream_pipeline|"
+                "stream_kernel_pipeline|"
                 "stream_kernel_pipeline_anon_mmap|"
                 "stream_kernel_pipeline_shared_file|"
                 "stream_kernel_pipeline_private_file <size>\n",
@@ -2773,6 +2775,59 @@ int main(int argc, char** argv) {
         after.uffd_evictions - before.uffd_evictions : 0;
     size_t uffd_fallback_delta = after_stats_available ?
         after.uffd_fallbacks - before.uffd_fallbacks : 0;
+    size_t migration_policy = after_stats_available ? after.migration_policy : 0;
+    size_t policy_prefetch_requests = after_stats_available ?
+        after.policy_prefetch_requests - before.policy_prefetch_requests : 0;
+    size_t policy_prefetch_admitted = after_stats_available ?
+        after.policy_prefetch_admitted - before.policy_prefetch_admitted : 0;
+    size_t policy_prefetch_completed = after_stats_available ?
+        after.policy_prefetch_completed - before.policy_prefetch_completed : 0;
+    size_t policy_prefetch_useful = after_stats_available ?
+        after.policy_prefetch_useful - before.policy_prefetch_useful : 0;
+    size_t policy_prefetch_late = after_stats_available ?
+        after.policy_prefetch_late - before.policy_prefetch_late : 0;
+    size_t policy_prefetch_unused_evictions = after_stats_available ?
+        after.policy_prefetch_unused_evictions -
+        before.policy_prefetch_unused_evictions : 0;
+    size_t policy_prefetch_bytes = after_stats_available ?
+        after.policy_prefetch_bytes - before.policy_prefetch_bytes : 0;
+    size_t policy_prefetch_useful_bytes = after_stats_available ?
+        after.policy_prefetch_useful_bytes -
+        before.policy_prefetch_useful_bytes : 0;
+    size_t policy_prefetch_unused_evicted_bytes = after_stats_available ?
+        after.policy_prefetch_unused_evicted_bytes -
+        before.policy_prefetch_unused_evicted_bytes : 0;
+    size_t policy_admission_requests = after_stats_available ?
+        after.policy_admission_requests - before.policy_admission_requests : 0;
+    size_t policy_admission_rejected = after_stats_available ?
+        after.policy_admission_rejected - before.policy_admission_rejected : 0;
+    size_t policy_demotions = after_stats_available ?
+        after.policy_demotions - before.policy_demotions : 0;
+    size_t policy_promotions = after_stats_available ?
+        after.policy_promotions - before.policy_promotions : 0;
+    size_t policy_evicted_hot_bytes = after_stats_available ?
+        after.policy_evicted_hot_bytes - before.policy_evicted_hot_bytes : 0;
+    size_t policy_migration_read_bytes = after_stats_available ?
+        after.policy_migration_read_bytes -
+        before.policy_migration_read_bytes : 0;
+    size_t policy_migration_write_bytes = after_stats_available ?
+        after.policy_migration_write_bytes -
+        before.policy_migration_write_bytes : 0;
+    size_t policy_demand_faults = after_stats_available ?
+        after.policy_demand_faults - before.policy_demand_faults : 0;
+    size_t policy_demand_fault_stall_ns = after_stats_available ?
+        after.policy_demand_fault_stall_ns -
+        before.policy_demand_fault_stall_ns : 0;
+    size_t policy_demand_fault_stall_samples = after_stats_available ?
+        after.policy_demand_fault_stall_samples -
+        before.policy_demand_fault_stall_samples : 0;
+    size_t policy_throttle_events = after_stats_available ?
+        after.policy_throttle_events - before.policy_throttle_events : 0;
+    size_t policy_throttle_slept_ns = after_stats_available ?
+        after.policy_throttle_slept_ns - before.policy_throttle_slept_ns : 0;
+    const char* policy_prefetch_observation =
+        after_stats_available && after.policy_prefetch_observation != 0 ?
+        "write_protect" : "unobserved";
     double seconds = seconds_since(&start, &end);
     double touched_mib = ((double)touches * (double)page_size_bytes) /
         (1024.0 * 1024.0);
@@ -2782,6 +2837,18 @@ int main(int argc, char** argv) {
         logical_mib / measured_access_seconds : 0.0;
     double end_to_end_logical_mib_per_sec = seconds > 0.0 ?
         logical_mib / seconds : 0.0;
+    double policy_prefetch_accuracy_observed = policy_prefetch_completed != 0 ?
+        (double)policy_prefetch_useful / (double)policy_prefetch_completed : 0.0;
+    double policy_prefetch_coverage_observed = policy_demand_faults != 0 ?
+        (double)policy_prefetch_useful / (double)policy_demand_faults : 0.0;
+    double policy_read_amplification = logical_bytes != 0 ?
+        (double)policy_migration_read_bytes / (double)logical_bytes : 0.0;
+    double policy_write_amplification = logical_bytes != 0 ?
+        (double)policy_migration_write_bytes / (double)logical_bytes : 0.0;
+    double policy_migration_mib = (double)(policy_migration_read_bytes +
+        policy_migration_write_bytes) / (1024.0 * 1024.0);
+    double policy_migration_mib_per_sec = seconds > 0.0 ?
+        policy_migration_mib / seconds : 0.0;
     double min_mib_per_sec = env_double("MAI_ACCESS_MIN_MIB_PER_SEC", 0.0);
 
     printf("mode=%s size=%zu touches=%zu touched_mib=%.3f seconds=%.6f "
@@ -2790,7 +2857,36 @@ int main(int argc, char** argv) {
            "file_delta=%zu migrated_delta=%zu promoted_delta=%zu "
            "uffd_available=%zu uffd_alloc_delta=%zu uffd_fault_delta=%zu "
            "uffd_eviction_delta=%zu uffd_resident_bytes=%zu "
-           "uffd_fallback_delta=%zu max_rss=%zu "
+           "uffd_fallback_delta=%zu migration_policy=%zu "
+           "policy_prefetch_requests=%zu "
+           "policy_prefetch_admitted=%zu "
+           "policy_prefetch_completed=%zu "
+           "policy_prefetch_useful=%zu policy_prefetch_late=%zu "
+           "policy_prefetch_unused_evictions=%zu "
+           "policy_prefetch_bytes=%zu "
+           "policy_prefetch_useful_bytes=%zu "
+           "policy_prefetch_unused_evicted_bytes=%zu "
+           "policy_prefetch_observation=%s "
+           "policy_prefetch_accuracy_observed=%.6f "
+           "policy_prefetch_coverage_observed=%.6f "
+           "policy_admission_requests=%zu "
+           "policy_admission_rejected=%zu "
+           "policy_demotions=%zu policy_promotions=%zu "
+           "policy_evicted_hot_bytes=%zu "
+           "policy_migration_read_bytes=%zu "
+           "policy_migration_write_bytes=%zu "
+           "policy_read_amplification=%.6f "
+           "policy_write_amplification=%.6f "
+           "policy_migration_mib_per_sec=%.3f "
+           "policy_demand_faults=%zu "
+           "policy_demand_fault_stall_ns=%zu "
+           "policy_demand_fault_stall_samples=%zu "
+           "policy_demand_fault_stall_p50_ns=%zu "
+           "policy_demand_fault_stall_p90_ns=%zu "
+           "policy_demand_fault_stall_p99_ns=%zu "
+           "policy_demand_fault_stall_max_ns=%zu "
+           "policy_throttle_events=%zu "
+           "policy_throttle_slept_ns=%zu max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
            "heartbeat_calls=%zu heartbeat_busy_ticks=%zu "
@@ -2852,7 +2948,27 @@ int main(int argc, char** argv) {
            reclaimed_delta, anon_delta, file_delta, migrated_delta,
            promoted_delta, after.uffd_pager_available, uffd_alloc_delta,
            uffd_fault_delta, uffd_eviction_delta, after.uffd_resident_bytes,
-           uffd_fallback_delta, after.max_rss, before.current_rss_bytes,
+           uffd_fallback_delta, migration_policy,
+           policy_prefetch_requests, policy_prefetch_admitted,
+           policy_prefetch_completed, policy_prefetch_useful,
+           policy_prefetch_late, policy_prefetch_unused_evictions,
+           policy_prefetch_bytes, policy_prefetch_useful_bytes,
+           policy_prefetch_unused_evicted_bytes,
+           policy_prefetch_observation,
+           policy_prefetch_accuracy_observed,
+           policy_prefetch_coverage_observed, policy_admission_requests,
+           policy_admission_rejected, policy_demotions, policy_promotions,
+           policy_evicted_hot_bytes, policy_migration_read_bytes,
+           policy_migration_write_bytes, policy_read_amplification,
+           policy_write_amplification, policy_migration_mib_per_sec,
+           policy_demand_faults, policy_demand_fault_stall_ns,
+           policy_demand_fault_stall_samples,
+           after.policy_demand_fault_stall_p50_ns,
+           after.policy_demand_fault_stall_p90_ns,
+           after.policy_demand_fault_stall_p99_ns,
+           after.policy_demand_fault_stall_max_ns,
+           policy_throttle_events, policy_throttle_slept_ns,
+           after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,
            heartbeat_reclaimed_bytes, trace_setup_calls, trace_stop_calls,
