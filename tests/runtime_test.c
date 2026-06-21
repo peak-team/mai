@@ -2335,10 +2335,10 @@ static int mode_uffd_pager_active_record_prefetch_guard(void) {
     MaiStats before;
     MaiStats after_touch;
     MaiStats after_free;
-    const size_t size = 16 * 1024 * 1024;
+    const size_t size = 32 * 1024 * 1024;
     const size_t unit = 2 * 1024 * 1024;
     const size_t chunks = size / unit;
-    unsigned char expected[8] = {0};
+    unsigned char expected[16] = {0};
 
     if (chunks > sizeof(expected)) {
         return fail("active prefetch guard expected array is too small");
@@ -2378,6 +2378,10 @@ static int mode_uffd_pager_active_record_prefetch_guard(void) {
         return fail("active prefetch guard did not exercise pressure eviction");
     }
     if (rejected == 0) {
+        fprintf(stderr,
+                "active prefetch guard counters: completed=%zu evictions_delta=%zu\n",
+                completed,
+                after_touch.uffd_evictions - before.uffd_evictions);
         free(ptr);
         return fail("active prefetch guard did not reject speculative prefetches");
     }
