@@ -2370,16 +2370,29 @@ static int mode_uffd_pager_active_record_prefetch_guard(void) {
     size_t rejected =
         after_touch.policy_admission_rejected -
         before.policy_admission_rejected;
+    size_t requests =
+        after_touch.policy_admission_requests -
+        before.policy_admission_requests;
+    size_t admitted =
+        after_touch.policy_prefetch_admitted -
+        before.policy_prefetch_admitted;
     size_t completed =
         after_touch.policy_prefetch_completed -
         before.policy_prefetch_completed;
+    if (requests == 0) {
+        free(ptr);
+        return fail("active prefetch guard did not exercise speculative admission");
+    }
     if (after_touch.uffd_evictions <= before.uffd_evictions) {
         free(ptr);
         return fail("active prefetch guard did not exercise pressure eviction");
     }
     if (rejected == 0) {
         fprintf(stderr,
-                "active prefetch guard counters: completed=%zu evictions_delta=%zu\n",
+                "active prefetch guard counters: requests=%zu admitted=%zu "
+                "completed=%zu evictions_delta=%zu\n",
+                requests,
+                admitted,
                 completed,
                 after_touch.uffd_evictions - before.uffd_evictions);
         free(ptr);
