@@ -10810,7 +10810,10 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
         record->chunk_has_storage && record->chunk_has_storage[index];
     int defer_wake_for_clean_shadow =
         uffd_clean_shadow_enabled && has_storage && track_clean_shadow;
+    int observe_prefetch_by_wp = policy_observe_prefetch_writes &&
+        !count_fault_event;
     int clean_shadow_wp_armed_by_copy = 0;
+    int prefetch_wp_armed_by_copy = 0;
     if (has_storage) {
         void* temp = NULL;
         if (ensure_uffd_scratch_locked(length, &temp) != 0) {
@@ -10835,17 +10838,23 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
         copy.len = (unsigned long)length;
         if (defer_wake_for_clean_shadow) {
             copy.mode = UFFDIO_COPY_MODE_DONTWAKE | UFFDIO_COPY_MODE_WP;
+        } else if (observe_prefetch_by_wp) {
+            copy.mode = UFFDIO_COPY_MODE_WP;
         }
-        int copy_rc = uffd_clean_shadow_force_no_copy_wp &&
-            defer_wake_for_clean_shadow ? -1 : ioctl(uffd_fd, UFFDIO_COPY, &copy);
-        int copy_errno = uffd_clean_shadow_force_no_copy_wp &&
-            defer_wake_for_clean_shadow ? EINVAL : errno;
+        int copy_needs_wp = (copy.mode & UFFDIO_COPY_MODE_WP) != 0;
+        int force_copy_wp_failure = uffd_clean_shadow_force_no_copy_wp &&
+            copy_needs_wp;
+        int copy_rc = force_copy_wp_failure ? -1 :
+            ioctl(uffd_fd, UFFDIO_COPY, &copy);
+        int copy_errno = force_copy_wp_failure ? EINVAL : errno;
         if (copy_rc != 0) {
-            if (!defer_wake_for_clean_shadow || copy_errno != EINVAL) {
+            if (!copy_needs_wp || copy_errno != EINVAL) {
                 return -1;
             }
-            stats_snapshot.policy_clean_shadow_protect_failures++;
-            defer_wake_for_clean_shadow = 0;
+            if (defer_wake_for_clean_shadow) {
+                stats_snapshot.policy_clean_shadow_protect_failures++;
+                defer_wake_for_clean_shadow = 0;
+            }
             memset(&copy, 0, sizeof(copy));
             copy.dst = (unsigned long)chunk_start;
             copy.src = (unsigned long)temp;
@@ -10855,6 +10864,34 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
             }
         } else if (defer_wake_for_clean_shadow) {
             clean_shadow_wp_armed_by_copy = 1;
+        } else if (observe_prefetch_by_wp) {
+            prefetch_wp_armed_by_copy = 1;
+        }
+    } else if (observe_prefetch_by_wp) {
+        void* temp = NULL;
+        if (ensure_uffd_scratch_locked(length, &temp) != 0) {
+            return -1;
+        }
+        memset(temp, 0, length);
+
+        struct uffdio_copy copy;
+        memset(&copy, 0, sizeof(copy));
+        copy.dst = (unsigned long)chunk_start;
+        copy.src = (unsigned long)temp;
+        copy.len = (unsigned long)length;
+        copy.mode = UFFDIO_COPY_MODE_WP;
+        if (ioctl(uffd_fd, UFFDIO_COPY, &copy) == 0) {
+            prefetch_wp_armed_by_copy = 1;
+        } else if (errno == EINVAL) {
+            struct uffdio_zeropage zero;
+            memset(&zero, 0, sizeof(zero));
+            zero.range.start = (unsigned long)chunk_start;
+            zero.range.len = (unsigned long)length;
+            if (ioctl(uffd_fd, UFFDIO_ZEROPAGE, &zero) != 0) {
+                return -1;
+            }
+        } else {
+            return -1;
         }
     } else {
         struct uffdio_zeropage zero;
@@ -10889,7 +10926,8 @@ static int populate_uffd_chunk_locked(AllocationRecord* record, size_t index,
                 (unsigned char)clean_shadow_tracked;
         }
         if (policy_observe_prefetch_writes &&
-            (!count_fault_event || migration_policy == MIGRATION_POLICY_LFU)) {
+            (!count_fault_event || migration_policy == MIGRATION_POLICY_LFU) &&
+            !clean_shadow_wp_armed_by_copy && !prefetch_wp_armed_by_copy) {
             (void)uffd_writeprotect_range(chunk_start, length, 1);
         }
     }
