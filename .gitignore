@@ -100,3 +100,9 @@ dkms.conf
 # build directory 
 build/
 build-*/
+
+# Local benchmark outputs live in the companion mai_benchmark workspace.
+docs/benchmark_artifacts/
+benchmarks/__pycache__/
+policy-matrix-results*/
+benchmark-output*/

@@ -190,6 +190,73 @@ typedef struct {
     size_t policy_hybrid_cohort_admitted;
     size_t policy_hybrid_cohort_completed;
     size_t policy_hybrid_cohort_useful;
+    size_t policy_adaptive_budget_gate;
+    size_t policy_adaptive_budget_bytes;
+    size_t policy_adaptive_window_migration_bytes;
+    size_t policy_markov_lead_candidates;
+    size_t policy_markov_lead_admitted;
+    size_t policy_markov_lead_completed;
+    size_t policy_markov_lead_useful;
+    size_t policy_phase_candidates;
+    size_t policy_phase_admitted;
+    size_t policy_phase_completed;
+    size_t policy_phase_useful;
+    size_t policy_phase_conflicts;
+    size_t policy_phase_confidence_rejected;
+    size_t policy_phase_budget_rejected;
+    size_t policy_phase_safe_victim_rejected;
+    size_t policy_phase_victim_rejected;
+    size_t policy_phase_duplicate_candidates;
+    size_t policy_phase_target_hot_skipped;
+    size_t policy_phase_active_slots;
+    size_t policy_phase_top_score;
+    size_t policy_phase_unused_evictions;
+    size_t policy_phase_boundary_prefetches;
+    size_t policy_phase_hold_activations;
+    size_t policy_phase_shadow_candidates;
+    size_t policy_phase_shadow_useful;
+    size_t policy_phase_shadow_late;
+    size_t policy_phase_shadow_expired;
+    size_t policy_phase_shadow_overwritten;
+    size_t policy_phase_shadow_probe_candidates;
+    size_t policy_phase_shadow_edge_rejected;
+    size_t policy_phase_shadow_edge_confirmed;
+    size_t policy_phase_shadow_top_late;
+    size_t policy_phase_shadow_max_late;
+    size_t policy_hint_candidates;
+    size_t policy_hint_admitted;
+    size_t policy_hint_completed;
+    size_t policy_hint_useful;
+    size_t policy_hint_rejected;
+    size_t policy_arc_t1_chunks;
+    size_t policy_arc_t2_chunks;
+    size_t policy_arc_b1_chunks;
+    size_t policy_arc_b2_chunks;
+    size_t policy_arc_p_chunks;
+    size_t policy_arc_b1_hits;
+    size_t policy_arc_b2_hits;
+    size_t policy_arc_target_increases;
+    size_t policy_arc_target_decreases;
+    size_t policy_arc_t1_hits;
+    size_t policy_arc_t2_hits;
+    size_t policy_arc_t1_to_t2_promotions;
+    size_t policy_arc_replace_t1;
+    size_t policy_arc_replace_t2;
+    size_t policy_arc_b1_pruned;
+    size_t policy_arc_b2_pruned;
+    size_t policy_arc_prefetch_admitted_t1;
+    size_t policy_arc_prefetch_rejected_pressure;
+    size_t policy_arc_prefetch_promoted_to_t2;
+    size_t policy_irr_resident_chunks;
+    size_t policy_irr_protected_chunks;
+    size_t policy_irr_ghost_chunks;
+    size_t policy_irr_target_protected_chunks;
+    size_t policy_irr_ghost_hits;
+    size_t policy_irr_promotions;
+    size_t policy_irr_demotions;
+    size_t policy_irr_pressure_rejected;
+    size_t policy_irr_immature_rejected;
+    size_t policy_irr_max_interval_epochs;
 } MaiStats;
 
 /**
@@ -209,11 +276,12 @@ typedef enum {
 /**
  * Versioned options for mai_hint_range().
  *
- * Set size to sizeof(MaiHintOptions). All fields are advisory and best-effort:
- * flags are currently recorded but not interpreted, hotset_bytes can describe
- * the expected protected working set for MAI_HINT_RANDOM_HOTSET, and
- * window_bytes can describe an expected sequential or sparse access window.
- * Reserved fields must not be used for correctness.
+ * Set size to sizeof(MaiHintOptions). All fields are advisory and best-effort.
+ * The experimental "hinted" migration policy can use MAI_HINT_SEQUENTIAL plus
+ * window_bytes to bound forward prefetch candidates. Other policies may record
+ * or ignore hints. hotset_bytes can describe the expected protected working
+ * set for MAI_HINT_RANDOM_HOTSET. Reserved fields must not be used for
+ * correctness.
  */
 typedef struct {
     size_t size;

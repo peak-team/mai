@@ -108,9 +108,9 @@ unit.
 When memory is below the full active working set, the policy should keep as
 many whole hot regions resident as the cap safely allows and tile the rest at
 `chunk_bytes` granularity. Assisted integrations can use `mai_prefetch()`,
-`mai_prepare_write()`, and `mai_reclaim_range()` when the application genuinely
-knows future range intent, but those calls are not used by the primary
-no-oracle STREAM pressure benchmark.
+`mai_prepare_write()`, `mai_reclaim_range()`, and advisory `mai_hint_range()`
+when the application genuinely knows future range intent, but those calls are
+not used by the primary no-oracle STREAM pressure benchmark.
 
 ## Policy Framework
 
@@ -139,10 +139,29 @@ runtime strategy:
   victim selection baseline.
 - `lruk`, `lru-k`, `lru2`, or `lru-2`: compact LRU-2 reuse-distance
   replacement with ghost history across demotion.
+- `irr`, `inter-reference-recency`, `lirs-lite`, `lirs_approx`, or
+  `lirs-irr`: experimental LIRS-inspired inter-reference-recency replacement.
+  It keeps compact two-touch history and demand-confirmed ghosts, protects
+  low-interval chunks, and rejects immature pressured prefetches. It is not an
+  exact LIRS stack implementation; the `lirs-*` aliases are compatibility
+  labels for this approximation only.
+- `arc`, `adaptive-replacement-cache`, or `adaptive_replacement_cache`:
+  experimental bounded ARC replacement. Demand misses enter T1, demand
+  confirmation promotes chunks to T2, B1/B2 ghost hits tune the target split,
+  and prefetched chunks remain T1/probationary until a demand touch confirms
+  them.
 - `car`, `car-lite`, `clock-pro`, or `clockpro`: compact CAR/CLOCK-Pro-style
   adaptive replacement with recent/frequent ghost feedback.
 - `markov`, `successor`, or `successor-table`: one-successor transition
   predictor for repeated irregular chunk order.
+- `markov-phase`, `markov_phase`, `phase-hold-markov`, or
+  `phase_hold_markov`: Markov successor prediction plus phase-transition
+  learning and hold/protection. The raw runtime policy disables cross-record phase prefetch by default; set
+  `MAI_POLICY_PHASE_PREFETCH=1` to measure Markov plus full phase prefetch.
+- `markov-cohort`, `markov_cohort`, `successor-cohort`,
+  `successor_cohort`, `phase-cohort`, or `phase_cohort`: experimental
+  Markov-primary policy that may append one learned cross-allocation cohort
+  lease after same-record successor candidates.
 - `spatial`, `spatial-mask`, or `region-mask`: per-allocation region-mask
   predictor for stable sparse spatial access inside fixed chunk groups.
 - `tinylfu`, `tiny-lfu`, or `sketch-lfu`: compact Count-Min-style admission
@@ -158,12 +177,18 @@ runtime strategy:
   experimental meta policy that ranks signature, successor, and stream
   candidates, then gates admission with W-TinyLFU-style frequency and victim
   checks.
+- `hinted`, `hint`, `application-hinted`, `application_hinted`,
+  `app-hinted`, or `app_hinted`: opt-in application-hinted policy. It currently
+  interprets `MAI_HINT_SEQUENTIAL` ranges, emits bounded forward candidates
+  inside the hinted range, and still applies adaptive migration-debt,
+  resident-pressure, and victim-quality admission gates. It is not used in
+  no-oracle comparisons.
 
 For `wtinylfu`, `MAI_POLICY_WTINYLFU_WINDOW_PERCENT=N` controls the target
 window share of resident capacity. The default is 25. Demand faults always
 populate; speculative prefetches must carry Markov/stream confidence and, under
 pressure, must beat the victim score unless the victim is unused/probationary.
-For `markov`, `wtinylfu`, `signature`, and `hybrid`,
+For `markov`, `markov-cohort`, `wtinylfu`, `signature`, and `hybrid`,
 `MAI_POLICY_SUCCESSOR_CHAIN_DEPTH=N` can follow high-confidence predicted edges
 beyond the immediate next chunk. The default is 1, preserving one-step
 behavior.
@@ -171,13 +196,30 @@ For `best-offset`, `MAI_POLICY_BEST_OFFSET_MIN_CHUNKS=N` can exclude nearby
 offsets from training and candidate emission. The default `0` uses the current
 `MAI_UFFD_PREFETCH_CHUNKS` window as the floor, keeping adjacent chunks in the
 stream/stride policy domain.
+For `phase` and `markov-phase`, `MAI_POLICY_PHASE_PREFETCH=0` keeps phase
+learning and record-hold protection but suppresses cross-record phase
+prefetches. `MAI_POLICY_PHASE_PREFETCH_BOUNDARY_ONLY=1` allows cross-record
+phase prefetches only near the end of the current source allocation, controlled
+by `MAI_POLICY_PHASE_BOUNDARY_CHUNKS`. The opt-in
+`MAI_POLICY_PHASE_SHADOW_PROBE_CHUNKS=N` knob admits at most `N` otherwise
+suppressed non-boundary phase candidates per demand-fault planning step. Adding
+`MAI_POLICY_PHASE_SHADOW_PROBE_MIN_LATE=M` requires the same learned phase edge
+to accumulate at least `M` late shadow confirmations before a non-boundary probe
+is eligible. These knobs are experimental ablation controls.
 
 All policies share append-only `MaiStats` counters for prefetch requests,
 admissions, completions, useful prefetches, late demand faults, unused-prefetch
 evictions, migration read/write bytes, demand-fault stalls, demotions, and
-promotions. Async UFFD policy work also reports enqueued, completed, and
-dropped task counters. These counters are mechanism-derived and do not depend
-on benchmark scenario names.
+promotions. Boundary-only phase mode also reports `policy_phase_shadow_*`
+counters for non-boundary phase candidates that were suppressed rather than
+migrated: candidates, later useful touches, late demand-fault touches, shadows
+retired by age, eviction, or free, overwritten shadow-edge metadata, emitted
+edge-confirmed probes, edge-threshold rejections, edge confirmations, live top
+late count, and cumulative max late count. These are counterfactual diagnostics;
+only the explicit probe knobs can turn a confirmed shadow edge into a prefetch
+candidate. Async UFFD policy work also
+reports enqueued, completed, and dropped task counters. These counters are
+mechanism-derived and do not depend on benchmark scenario names.
 `policy_throttle_events` reports bounded-queue drops and resident-limit hard
 reclaim events. When `MAI_POLICY_ADAPTIVE_CONTROL=1` is enabled, adaptive
 behavior is also broken out into `policy_adaptive_windows`,
@@ -188,9 +230,11 @@ behavior is also broken out into `policy_adaptive_windows`,
 `policy_clean_shadow_protect_failures`,
 `policy_clean_shadow_write_skipped_bytes`,
 `policy_clean_shadow_write_skipped_chunks`, and
-`policy_clean_shadow_write_faults`. CAR-lite also reports current
-recent/frequent resident and ghost chunk counts, recent/frequent ghost hits,
-target movement, and second-chance scans through `policy_car_*` counters.
+`policy_clean_shadow_write_faults`. CAR-lite reports current recent/frequent
+resident and ghost chunk counts, recent/frequent ghost hits, target movement,
+and second-chance scans through `policy_car_*` counters. ARC uses separate
+bounded T1/T2/B1/B2 metadata and reports target, ghost-hit, replacement,
+pruning, and prefetch-promotion activity through `policy_arc_*` counters.
 TinyLFU reports sketch updates, sketch decays, sketch admission rejects, and
 the current minimum admission score through `policy_tinylfu_*` counters.
 W-TinyLFU reuses the TinyLFU sketch counters and reports current
@@ -214,9 +258,19 @@ source-attributed admitted/completed/useful prefetches through
 allocation-record tile transitions. The regular `policy_signature_*`,
 `policy_tinylfu_*`, and `policy_wtinylfu_*` counters remain active because the
 hybrid policy trains those components directly.
-`policy_throttle_slept_ns` is reserved for
-a future bandwidth/stall-budget throttle; current policies reject or shrink
-speculative work instead of sleeping in the fault handler.
+Hinted policy reports `policy_hint_candidates`, `policy_hint_admitted`,
+`policy_hint_completed`, `policy_hint_useful`, and `policy_hint_rejected`.
+These counters are source-attributed through the common prefetch-completion
+path, so they can be compared with global accuracy, coverage, amplification,
+and stall counters.
+`policy_throttle_events` reports queue pressure, hard reclaim, adaptive
+prefetch caps, and budget-gated admission rejects. `policy_throttle_slept_ns`
+remains zero for the current UFFD policy path by design: MAI rejects or shrinks
+speculative work instead of sleeping in the fault handler. When
+`MAI_POLICY_ADAPTIVE_BUDGET_GATE=1` is enabled, MAI also exposes
+`policy_adaptive_budget_gate`, `policy_adaptive_budget_bytes`, and
+`policy_adaptive_window_migration_bytes` so benchmark rows can distinguish
+ordinary adaptive control from an explicit migration-debt throttle.
 
 `MAI_UFFD_ASYNC_PREFETCH=1` enables an experimental UFFD background policy
 worker. Demand faults are still resolved synchronously. The worker only moves
@@ -224,9 +278,15 @@ speculative prefetch and follow-on reclaim work off the fault handler, bounded
 by `MAI_UFFD_ASYNC_SLACK_CHUNKS` and the resident high/low watermarks. Async
 tasks preserve per-candidate allocation identity, so hybrid cross-record cohort
 targets are validated against live allocation sequence numbers before the
-worker admits them. Async is not a default policy because it can help
-admission-heavy policies while hurting policies whose synchronous forward
-prefetch is already cheap.
+worker admits them. `MAI_UFFD_ASYNC_QUEUE_LIMIT=N` can cap the fixed async
+queue below its compile-time capacity; `0` is useful for deterministic
+saturation tests. If the async queue is saturated, MAI drops speculative async
+prefetch for that access and performs only required reclaim instead of falling
+back to synchronous speculative prefetch. `policy_async_prefetch_completed`
+counts tasks that actually populate at least one prefetched chunk; reclaim-only
+or stale tasks are counted as drops. Async is not a default policy because it
+can help admission-heavy policies while hurting policies whose synchronous
+forward prefetch is already cheap.
 
 `MAI_RECORD_PROTECT_EPOCHS=N` enables an experimental record-aware eviction
 bias for prefetch-aware policies. A record is an allocation call, so this
@@ -254,10 +314,59 @@ prefetch admission and window size. It watches recent demand faults,
 unused-prefetch evictions, hot-evicted bytes, migration bytes, and
 demand-fault stall time. When speculation appears harmful, it first trims the
 prefetch window and then requires stronger predictor confidence before
-admission. It does not act on the `legacy` baseline because fixed next-block
-prefetch has no confidence model. Tune sensitivity with
+admission. Cohort prefetches rejected only because adaptive pressure raised the
+confidence threshold are counted in both hybrid and adaptive rejection counters.
+Without write-protect observation, MAI cannot reliably prove that a resident
+prefetched chunk was unused before eviction, so adaptive control treats
+unused-prefetch evictions as pollution only when prefetch feedback is observable
+and otherwise relies on late faults, hot evictions, and migration debt. This
+keeps unobserved read/write hits from falsely throttling the predictor.
+It does not act on the `legacy` baseline because fixed next-block prefetch has
+no confidence model. Tune sensitivity with
 `MAI_POLICY_ADAPTIVE_WINDOW_FAULTS` and
 `MAI_POLICY_ADAPTIVE_MIGRATION_BUDGET_CHUNKS`.
+`MAI_POLICY_ADAPTIVE_BUDGET_GATE=1` enables a stricter experimental gate for
+adaptive policies. The gate treats migration-byte debt, hot evictions, and async
+queue pressure as direct throttling inputs. It can cap speculative prefetch to a
+single candidate or reject admission before a new prefetch is expected to exceed
+the current migration budget; required demand population and required reclaim
+still proceed. High-confidence Markov successor candidates get a narrow
+timeliness credit: when two already-observed same-record successor edges are
+both high confidence, MAI may append exactly one second-hop lead candidate even
+when `MAI_POLICY_SUCCESSOR_CHAIN_DEPTH` remains at its default of `1`. The lead
+candidate is still probationary, still needs admission/victim checks, and is
+reported through `policy_markov_lead_candidates`,
+`policy_markov_lead_admitted`, `policy_markov_lead_completed`, and
+`policy_markov_lead_useful`. Retained-run aliases such as
+`markov_budget_adaptive`,
+`hybrid_budget_adaptive`, and `markov_cohort_budget_adaptive` enable this gate
+through the benchmark runner. Aliases ending in `_lead_budget_adaptive`, such
+as `markov_lead_budget_adaptive`, also force chain depth back to `1` so the
+`policy_markov_lead_*` counters measure the single-slot lead mechanism instead
+of ordinary opt-in successor-chain lookahead.
+
+`MAI_MIGRATION_POLICY=phase` enables an experimental allocation-record phase
+predictor. It learns immediate transitions between live UFFD allocation records
+with the same chunk size, predicts the target chunk at the observed offset, and
+admits only bounded cross-record companion prefetches through the normal
+adaptive budget, active-record victim, and TinyLFU victim gates. Phase-prefetch
+chunks carry their own source tag and counters:
+`policy_phase_candidates`, `policy_phase_admitted`,
+`policy_phase_completed`, `policy_phase_useful`,
+`policy_phase_unused_evictions`, and rejection/table-health diagnostics. Under
+pressure, phase candidates with observed conflicts are rejected, and a
+dead-on-arrival gate suppresses the predictor after repeated completed
+phase-prefetches are evicted unused. This keeps the policy workload-agnostic
+while limiting DRAM pollution on random phase orders.
+
+`MAI_MIGRATION_POLICY=hinted` enables the first implemented
+application-hinted policy. A sequential hint does not directly migrate memory;
+it only lets the policy build forward candidates inside the hinted range.
+Admission remains pressure-aware: candidates can be rejected by adaptive
+migration debt, high throttle level, lack of confidence, or inability to beat
+the current victim class. This keeps hints from acting as an oracle that can
+force DRAM pollution. Hinted rows must be reported separately from no-oracle
+strategy rows.
 
 Read-only usefulness of a UFFD-prefetched chunk is not directly observable
 without adding another faulting mechanism, because a successful prefetch avoids
@@ -280,215 +389,9 @@ the dirty chunk normally. This can reduce write amplification for read-mostly
 reuse, but it adds write-protect faults to write-heavy reuse and is not a
 default performance mode.
 
-## Algorithm Designs
+## Benchmark And Planning Material
 
-| Family | Integrated policy design | MAI priority |
-| --- | --- | --- |
-| LRU, CLOCK, FIFO, Random | Demand faults admit chunks. Prefetch enters probation. Eviction uses oldest touch, second-chance reference bit, admission order, or random victim. Throttling is fixed by resident limits and migration chunk size. | Implemented as baselines. |
-| LFU and decayed LFU | Track exact per-chunk frequency with lazy decay and ghost scores after eviction. Admit a prefetch under pressure only if its score beats the current victim or ties an unused/probation victim. Evict unused prefetches first, then low-frequency chunks. Optional write-protect observation can add one resident reuse signal but also adds handler overhead. | Implemented as `lfu`/`decayed-lfu`; use it as the exact-frequency baseline for the separate `tinylfu` sketch policy. |
-| 2Q | New or prefetched chunks enter a probation queue. A second demand touch promotes them to the protected set. Eviction demotes probation before protected chunks. | Implemented as a conservative admission baseline; queue refinement remains future work. |
-| ARC, CAR, CART | Maintain recent and frequent resident sets plus ghost histories. Ghost hits tune the split between recency and frequency. Prefetched chunks never enter the frequent set until a demand touch confirms them. | Implemented first as `car`/`car-lite`, a compact CAR/CLOCK-Pro approximation using per-chunk state and ARC-style target movement; exact ARC/CART metadata remains future work. |
-| LRU-K / reuse distance | Keep a compact two-reference history per chunk. Admit speculative prefetch under pressure only when it can displace unused or immature chunks, and evict by the older Kth-reference epoch among mature chunks. | Implemented as `lruk`/`lru-k`, an LRU-2 approximation with ghost history across demotion. |
-| LIRS | Protect chunks with low inter-reference recency and demote high inter-reference recency chunks even if they were touched recently by a scan. | Simulator/reference first; exact LIRS stack metadata is still too heavy for the initial C runtime. |
-| Sequential readahead | Detect monotonic chunk faults and adapt the forward window with additive increase and multiplicative decrease from accuracy feedback. Admit only while headroom and budget permit. | Implemented as `stream` in first form. |
-| Stride and multi-stream | Track several `{last, delta, confidence, window}` streams per allocation. Admit only after repeated deltas. Evict chunks far behind active streams. | Implemented as `stride` in first form. |
-| W-TinyLFU / prefetch-aware replacement | Combine a small recency window, sketch admission, probationary prefetches, protected demand-confirmed chunks, and throttle-raised admission margins. | Implemented as `wtinylfu`/`window-tinylfu`. Local guardrails show it sharply reduces unused prefetch evictions and lowers long-tail write traffic, but it raises demand events and hot-evicted bytes on current pressure probes; experimental only. |
-| Best-offset and multi-lookahead offset | Score candidate offsets by later demand hits. Prefetch the highest-confidence forward offset, not necessarily the next chunk. Penalize unused offset-prefetch evictions and apply pressure admission before displacing resident chunks. | Implemented as `best-offset`/`offset-prefetch`, an experimental top-1 offset predictor. Corrected local results show it can reduce worst-case speculative traffic versus legacy-style prefetch, but dense footprints can make it learn nearby incidental offsets instead of the intended lagged offset; it does not beat conservative stream/markov rows on throughput or migration volume. |
-| Markov and delta-correlation | Keep one bounded successor edge per chunk. Admit only repeated high-confidence successors, and require stronger confidence under resident pressure. Optional chain lookahead follows high-confidence successor edges for earlier timeliness. | Implemented as `markov`/`successor` plus opt-in `MAI_POLICY_SUCCESSOR_CHAIN_DEPTH`. Current local results show depth-2 is a no-op without write-protect observation and not yet promotable. |
-| Signature/history-table | Use rolling two-delta signatures to predict context-dependent successors. Train only from observed demand/resident-demand transitions, decay a fixed-size table, penalize unused prefetched edges, and require stronger confidence under pressure before displacing a resident chunk. | Implemented as `signature`/`history-table`, experimental. Local context-cycle rows show more useful prefetches and lower late faults than one-successor `markov`, but higher migration traffic and lower throughput than W-TinyLFU; not a default performance win. |
-| Hybrid/meta-prefetch | Train signature, successor, stream, cross-record cohort, TinyLFU, and W-TinyLFU state together. Rank candidates by predictor confidence, preserve fallback candidates when a cohort prefetch is rejected, emit fewer candidates under pressure, and require the admitted chunk to clear both confidence and victim-score gates. Cohort confidence is tied to live allocation-record sequence numbers and is penalized when a cohort-prefetched chunk is evicted unused. | Implemented as `hybrid`/`meta-prefetch`, experimental. It is intended to reduce signature overfetch while preserving context-sensitive timeliness; use the context-cycle and STREAM-pipeline rows before considering it for default use. |
-| Spatial region masks | Divide allocations into fixed chunk regions and learn stable touched masks. A small tagged region table lets interleaved regions keep separate masks. Under pressure, same-region transitions may prefetch a learned mask, while inter-region transitions prefetch conservatively to limit pollution. | Implemented as `spatial`/`spatial-mask`; tune width, table slots, and confidence with `MAI_SPATIAL_REGION_CHUNKS`, `MAI_SPATIAL_TABLE_SLOTS`, `MAI_SPATIAL_LEARN_THRESHOLD`, and `MAI_SPATIAL_ADMIT_THRESHOLD`. |
-| TinyLFU and frequency sketches | Use a compact approximate frequency sketch for admission. Train only on demand-confirmed touches, compare candidate score against victim score under pressure, and decay the sketch by halving counters after a fixed update window. TinyLFU gates candidates generated by other predictors; it is not itself a prefetcher. | Implemented as `tinylfu`/`tiny-lfu`, an experimental long-tail admission classifier with fixed global sketch state and no per-chunk allocation. |
-| TPP/AutoNUMA-style tiering | Maintain high/low DRAM watermarks. Proactively demote cold chunks during quiet epochs, promote on demand, and keep headroom for new hot allocations. | Core design principle for MAI pressure handling. |
-| Record-aware demotion | Treat an allocation record as a coarse working-set unit. Under pressure, avoid demoting demand-confirmed chunks from records with recent faults, but still evict unused prefetched chunks first. | Implemented as opt-in `MAI_RECORD_PROTECT_EPOCHS`; useful as a tuning control, not a default. |
-| Active-record working-set control | Infer the active allocation-record set from demand faults. Coordinate admission, eviction, and the reclaim floor so active resident demand-confirmed chunks are not displaced by speculative prefetch or an overly tight low watermark. | Implemented as opt-in `MAI_ACTIVE_RECORD_EPOCHS` plus `MAI_ACTIVE_RECORD_SLACK_CHUNKS`; designed for phase-capture experiments such as the no-oracle 9-matrix pipeline. |
-| Adaptive admission/throttling | Treat prefetch, admission, eviction, and throttle as one loop. Recent pollution or stall pressure shrinks lookahead and raises confidence thresholds; useful or late-prefetch pressure relaxes them. | Implemented as opt-in `MAI_POLICY_ADAPTIVE_CONTROL`; currently useful for confidence-bearing policies such as `markov`, not for `legacy`. |
-| Nomad-style shadowing | Keep valid clean storage shadows after promotion until a write invalidates them. Clean demotion can then avoid rewriting the chunk; dirty demotion still writes back. | Implemented as opt-in `MAI_UFFD_CLEAN_SHADOW`; useful for read-mostly reuse and explicitly not a default write-heavy mode. |
-| Application hints | Treat `mai_hint_range()`, `mai_prefetch()`, and `mai_prepare_write()` as confidence and intent signals, not commands that bypass budgets. | Supported primitives; not used by no-oracle claims. |
-| Queue-aware policies | Accept future ranges with deadlines from schedulers. Admission depends on whether migration can finish before the request executes. | Integration API candidate, separate from autonomous benchmarks. |
-| ML or bandit selector | Prefer a contextual bandit over neural prediction at first: choose among stream, stride, spatial, and admission thresholds from online metrics. | Later meta-policy after several concrete policies exist. |
-| Programmable predictors | Let applications propose candidate ranges and confidence, while MAI owns admission, eviction, and throttling. | Later, for graph/database runtimes. |
-| Prefetch-aware replacement | Track source, confidence, usefulness, and deadline for each prefetched chunk. Evict unused prefetched chunks before demand-confirmed chunks. | Implemented in first form through sidecar metadata and counters. |
-
-The rotating-triplet STREAM benchmark allocates nine matrices grouped as
-`ABC`, `DEF`, and `GHI`. It runs repeated STREAM-like kernels on one triplet,
-then switches to the next triplet in either sequential or deterministic random
-order. Each triplet visit runs the same four kernels as classic STREAM:
-copy, scale, add, and triad. The benchmark does not call MAI range APIs and
-does not reveal the next triplet to MAI. This is the preferred pressure
-benchmark for autonomous migration strategy work because it directly models the
-target case: one hot three-matrix working set should fit in physical memory
-while the full nine-matrix set does not.
-
-The autonomous MAI strategies tested by this benchmark are allocation-time
-`MAI_BACKEND=auto` placement, allocator-time pressure demotion, cgroup/RSS
-cap reclaim, and optional runtime-owned background heartbeat observation. The heartbeat is
-controlled by environment variables such as
-`MAI_HEARTBEAT_BACKGROUND_INTERVAL_US`,
-`MAI_HEARTBEAT_BACKGROUND_OBSERVE_PAGES`,
-`MAI_HEARTBEAT_BACKGROUND_CHUNK`, and
-`MAI_HEARTBEAT_BACKGROUND_MIGRATE`; these describe observation budget and
-granularity, not future access order.
-
-## Benchmark Metrics
-
-Benchmark rows must report both throughput and policy quality:
-
-- observed prefetch accuracy: fault-observed useful prefetches divided by
-  completed prefetches
-- observed prefetch coverage: fault-observed useful prefetches divided by
-  demand faults
-- timeliness: prefetches useful before demand without a late fault
-- DRAM pollution: bytes of unused prefetched chunks evicted before demand
-- migration bandwidth: storage read plus write bytes per second
-- MAI read amplification: MAI migration read bytes divided by logical workload
-  bytes
-- MAI write amplification: MAI migration write bytes divided by logical
-  workload bytes
-- handler-time reduction: UFFD handler time versus baseline pressure rows
-- handler-tail latency: `policy_demand_fault_stall_p50_ns`,
-  `policy_demand_fault_stall_p90_ns`, `policy_demand_fault_stall_p99_ns`, and
-  `policy_demand_fault_stall_max_ns`
-- effective capacity gain: pressure performance relative to sufficient-memory
-  performance for the same workload, seed, binary, and host
-
-The preferred no-oracle workload name is `policy_stream_pipeline`; it is an
-alias of the rotating nine-matrix STREAM pipeline and intentionally does not
-call MAI range APIs or expose future group order to the runtime. Docker
-scenarios named `mai_policy_<policy>_pipeline`, such as
-`mai_policy_stream_pipeline` or `mai_policy_clock_pipeline`, run this workload
-with the corresponding runtime `MAI_MIGRATION_POLICY`.
-`policy_multistream_stride` is a focused no-oracle predictor workload that
-walks several fixed-size streams inside one allocation with non-unit deltas; use
-it to compare `legacy`, `stream`, and `stride` without giving future ranges to
-MAI. Its throughput is a policy-event metric, not a DRAM bandwidth metric,
-because each unit touch samples one byte rather than sweeping complete arrays.
-Use `policy_sampled_units_per_sec` and migration counters for this workload.
-Set `MAI_BENCH_POLICY_ACTIVE_STREAMS=1` when you need a negative control where
-adjacent forward prefetches are never consumed.
-`policy_hotset_scan` is the corresponding no-oracle admission workload: it
-reuses a small hot chunk set, scans colder chunks, and verifies whether policy
-counters show less prefetch pollution and migration traffic. It is the preferred
-first check for `2q`, `lfu`/`decayed-lfu`, `lruk`, and `car`.
-Current local smoke results show `lfu` with write-protect observation reducing
-migration traffic versus `legacy` on this workload. In the latest six-run
-policy matrix, observation-off `lfu` is competitive and wins the hotset scan
-event-rate row while tying `legacy` on lowest demand faults. Treat it as a
-workload-specific frequency-admission baseline, not a default policy.
-`policy_phase_shift_hotset` is the reuse-distance guardrail for `lruk`: it
-warms one hotset, switches to another, scans colder chunks, and verifies that
-the new hotset remains correct without giving MAI phase hints. Use it to test
-whether LRU-K's Kth-reference recency adapts when LFU's old frequency memory
-can linger.
-`policy_recency_frequency_pivot` is the CAR-lite guardrail: it warms an old
-frequent hotset, rotates through short recent hotsets separated by scans, then
-returns to the old frequent hotset. It checks whether CAR adapts the
-recent/frequent balance from ghost feedback without receiving workload hints.
-`policy_long_tail_admission` is the TinyLFU guardrail: it mixes a stable hotset,
-a medium-frequency set, and a full-permutation one-pass cold tail before
-changing hotsets. It tests whether a demand-trained sketch can reject cold-tail
-prefetches without preserving stale heat forever.
-`policy_best_offset_lag` is the best-offset guardrail: it shuffles disjoint
-anchor chunks, then touches `anchor + offset` only after several later anchors.
-The workload exposes a recurring historical offset without telling MAI the next
-target, prevents target chunks from also appearing as anchors, and avoids
-constant-stride ordering in the benchmark itself.
-`policy_successor_cycle` is the no-oracle irregular-transition workload for
-`markov`/`successor`. It uses a deterministic successor cycle so simple
-next-chunk and constant-stride predictors do not receive the same signal.
-Current local smoke results show `markov` reducing demand faults versus
-`stride` on this workload without increasing migration volume, with the best
-throughput when write-protect observation is disabled. Observation mode is
-still useful for accuracy counters, but it changes the measured cost.
-`policy_spatial_region_mask` is the no-oracle sparse-region workload for
-`spatial`/`spatial-mask`. It touches a stable set of offsets inside each
-eight-unit region, but rotates and reverses in-region order across passes and
-regions so next-chunk, constant-stride, and one-successor predictors do not get
-the same signal. `policy_spatial_interleaved_mask` is the harder guardrail:
-regions are interleaved, and at region widths of four chunks or larger,
-alternating regions use different masks so a single allocation-wide mask would
-overfetch. These are policy-event probes;
-`logical_mib_per_sec` is synthetic logical progress because each unit touch
-samples one byte.
-
-Spatial-mask learning uses observed demand faults and optional write-protect
-faults, not every CPU load/store. A successful resident read hit may therefore
-be useful to the application without adding fresh spatial evidence. The tagged
-table also has finite capacity: if active regions exceed
-`MAI_SPATIAL_TABLE_SLOTS` (default 64, maximum 64), older masks churn and
-prefetch quality can fall sharply. Use the interleaved workload with a reduced
-table-slot setting to expose this cliff before claiming robustness on large
-allocations.
-
-On the local 64M allocation / 16M resident-limit shape with write-protect
-observation disabled, six-run means on `policy_spatial_region_mask` were:
-`spatial` 73 demand faults, 170 MiB migration reads, 182 MiB migration writes,
-and 2204 logical MiB/s; `stream` was 96 faults, 168/180 MiB, and 3144 logical
-MiB/s; `markov` was 95 faults, 174/186 MiB, and 2867 logical MiB/s. On
-`policy_spatial_interleaved_mask`, `spatial` and `markov` both reduced demand
-faults versus `stream` (67.0 and 67.3 versus 71.0), but `spatial` paid more
-prefetch traffic. This makes the interleaved workload a pollution/timeliness
-guardrail rather than a spatial victory lap.
-
-## Benchmarks
-
-Use `benchmarks/policy_retained_matrix.py` for retained policy comparisons.
-It records native sufficient, MAI pass-through, MAI managed sufficient, and
-policy-pressure rows for each workload, seed, and repetition, then computes
-pressure ratios against the matching sufficient-memory MAI row. The default
-matrix uses `policy_stream_pipeline` plus admission, recency/frequency, and
-context-sensitive guardrails without calling assisted range APIs. Its default
-sizes are developer guardrail sizes; rerun with matrix and allocation sizes
-well beyond CPU cache before using the results for bandwidth claims.
-
-The current local six-run comparison is retained in
-[`docs/policy_benchmark_results.md`](policy_benchmark_results.md). Re-run it
-before making host-independent performance claims.
-
-Correctness tests stay deterministic:
-
-- sufficient-memory fast path must not move reclaim counters
-- sufficient-memory fast path must use anonymous managed allocations and avoid
-  storage migration counters
-- busy heartbeat with a migration budget must report `reclaimed_bytes=0`
-- quiet heartbeat reclaimed bytes must scale with `chunk_bytes`
-
-Scheduled/manual benchmarks collect timing evidence:
-
-- native, preload-disabled, MAI pass-through, anonymous MAI-managed
-  sufficient-memory, and legacy `MAI_BACKEND=file` runs for allocator and
-  access-pattern workloads
-- `trace_chunks` chunk sweeps for mprotect/SIGSEGV overhead
-- `mprotect_overhead` phase sweeps comparing no observation, MAI direct trace,
-  MAI heartbeat observation, and raw benchmark-local `mprotect`
-- `heartbeat_busy` chunk sweeps showing active-access heartbeat cost and zero
-  heartbeat reclaim
-- Docker cgroup pressure benchmarks for over-physical-memory behavior
-
-`reclaimed_bytes` is an accounting counter for ranges that MAI advised to the
-kernel. It is not, by itself, proof that physical RSS dropped by the same
-amount. Benchmark artifacts include RSS fields where MAI stats are available;
-use cgroup or process residency measurements when validating actual pressure
-relief.
-
-These benchmarks provide reproducible observations for selected access
-patterns. They are not portable performance guarantees; use machine-specific
-baselines, variance, and workload-specific tuning before making performance
-claims.
-
-## References
-
-- ARC: Adaptive Replacement Cache, FAST 2003.
-  <https://www.cs.cmu.edu/~natassa/courses/15-721/papers/arcfast.pdf>
-- LIRS: Efficient replacement using inter-reference recency.
-  <https://ranger.uta.edu/~sjiang/pubs/papers/jiang02_LIRS.pdf>
-- Linux `readahead(2)` manual.
-  <https://man7.org/linux/man-pages/man2/readahead.2.html>
-- Linux `userfaultfd` kernel documentation.
-  <https://docs.kernel.org/admin-guide/mm/userfaultfd.html>
-- TPP: Transparent Page Placement for CXL-enabled tiered memory.
-  <https://arxiv.org/abs/2206.02878>
-- HybridTier: adaptive lightweight CXL-memory tiering.
-  <https://arxiv.org/abs/2312.04789>
-- TinyLFU: frequency-based cache admission.
-  <https://arxiv.org/abs/1512.00727>
+Retained benchmark results, benchmark protocols, and future strategy plans are
+kept outside the implementation repository in the companion `mai_benchmark`
+workspace. This document intentionally describes only the runtime mechanisms,
+policy selectors, and exported counters that are implemented in MAI.
