@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <malloc.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -14,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 typedef int (*get_stats_fn)(MaiStats*);
@@ -55,6 +57,30 @@ static int skip(const char* message) {
     return 77;
 }
 
+static volatile unsigned char runtime_byte_sink;
+
+static __attribute__((noinline)) void runtime_compiler_barrier(void) {
+    __asm__ __volatile__("" ::: "memory");
+}
+
+static __attribute__((noinline)) unsigned char
+runtime_load_byte(volatile unsigned char* ptr, size_t offset) {
+    runtime_compiler_barrier();
+    unsigned char value = ptr[offset];
+    runtime_byte_sink = value;
+    runtime_compiler_barrier();
+    return value;
+}
+
+static __attribute__((noinline)) void
+runtime_store_byte(volatile unsigned char* ptr, size_t offset,
+                   unsigned char value) {
+    runtime_compiler_barrier();
+    ptr[offset] = value;
+    runtime_byte_sink = value;
+    runtime_compiler_barrier();
+}
+
 static int has_prefix(const char* value, const char* prefix) {
     return strncmp(value, prefix, strlen(prefix)) == 0;
 }
@@ -70,6 +96,26 @@ static int load_stats(MaiStats* stats) {
         return -1;
     }
     return get_stats(stats);
+}
+
+static int wait_for_uffd_evictions(size_t target, MaiStats* out) {
+    MaiStats stats;
+    for (size_t wait = 0; wait < 200; wait++) {
+        if (load_stats(&stats) != 0) {
+            return -1;
+        }
+        if (stats.uffd_evictions >= target) {
+            if (out) {
+                *out = stats;
+            }
+            return 0;
+        }
+        usleep(1000);
+    }
+    if (out) {
+        *out = stats;
+    }
+    return 1;
 }
 
 static int visible_arena_files(void) {
@@ -1124,6 +1170,36 @@ static int mode_access_trace(void) {
         }
     }
 
+    long sys_page_size = sysconf(_SC_PAGESIZE);
+    if (sys_page_size <= 0) {
+        free(ptr);
+        return fail("access trace page size unavailable");
+    }
+    uintptr_t first_page =
+        (uintptr_t)ptr & ~((uintptr_t)sys_page_size - (uintptr_t)1);
+    pid_t child = fork();
+    if (child < 0) {
+        free(ptr);
+        return fail("access trace post-stop fork failed");
+    }
+    if (child == 0) {
+        if (mprotect((void*)first_page, (size_t)sys_page_size, PROT_NONE) != 0) {
+            _exit(2);
+        }
+        volatile unsigned char value = *(volatile unsigned char*)ptr;
+        (void)value;
+        _exit(0);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        free(ptr);
+        return fail("access trace post-stop child wait failed");
+    }
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGSEGV) {
+        free(ptr);
+        return fail("access trace consumed an unrelated post-stop protection fault");
+    }
+
     free(ptr);
     return 0;
 }
@@ -1367,6 +1443,7 @@ static int mode_heartbeat_chunk_sensitivity(void) {
 typedef struct {
     unsigned char* ptr;
     size_t size;
+    size_t page_stride;
     atomic_int* stop;
     atomic_size_t touches;
 } TraceStressArgs;
@@ -1376,7 +1453,7 @@ static void* trace_stress_worker(void* arg) {
     size_t pass = 0;
 
     while (!atomic_load_explicit(worker->stop, memory_order_acquire)) {
-        for (size_t offset = 0; offset < worker->size; offset += 4096) {
+        for (size_t offset = 0; offset < worker->size; offset += worker->page_stride) {
             worker->ptr[offset] = (unsigned char)((offset + pass) & 0xff);
             atomic_fetch_add_explicit(&worker->touches, 1, memory_order_relaxed);
         }
@@ -1384,6 +1461,16 @@ static void* trace_stress_worker(void* arg) {
     }
 
     return NULL;
+}
+
+static int wait_trace_touches_above(atomic_size_t* touches, size_t previous) {
+    for (size_t spin = 0; spin < 1000; spin++) {
+        if (atomic_load_explicit(touches, memory_order_acquire) > previous) {
+            return 1;
+        }
+        usleep(1000);
+    }
+    return 0;
 }
 
 static int mode_access_trace_concurrent_stress(void) {
@@ -1396,9 +1483,14 @@ static int mode_access_trace_concurrent_stress(void) {
         return fail("trace stress symbols are unavailable");
     }
 
+    long sys_page_size = sysconf(_SC_PAGESIZE);
+    if (sys_page_size <= 0) {
+        return fail("trace stress page size unavailable");
+    }
+    size_t page_stride = (size_t)sys_page_size;
     const size_t size = 65536;
-    unsigned char* ptr = malloc(size);
-    if (!ptr) {
+    unsigned char* ptr = NULL;
+    if (posix_memalign((void**)&ptr, page_stride, size) != 0) {
         return fail("trace stress allocation failed");
     }
     memset(ptr, 0, size);
@@ -1408,6 +1500,7 @@ static int mode_access_trace_concurrent_stress(void) {
     TraceStressArgs args = {
         .ptr = ptr,
         .size = size,
+        .page_stride = page_stride,
         .stop = &stop,
     };
     atomic_init(&args.touches, 0);
@@ -1416,6 +1509,12 @@ static int mode_access_trace_concurrent_stress(void) {
     if (pthread_create(&thread, NULL, trace_stress_worker, &args) != 0) {
         free(ptr);
         return fail("trace stress worker create failed");
+    }
+    if (!wait_trace_touches_above(&args.touches, 0)) {
+        atomic_store_explicit(&stop, 1, memory_order_release);
+        (void)pthread_join(thread, NULL);
+        free(ptr);
+        return fail("trace stress worker did not start");
     }
 
     MaiAccessTraceOptions trace_opts;
@@ -1432,18 +1531,29 @@ static int mode_access_trace_concurrent_stress(void) {
     heartbeat_opts.migrate_bytes = 0;
 
     int rc = 0;
+    const char* reason = NULL;
     for (size_t i = 0; i < 64; i++) {
+        size_t before =
+            atomic_load_explicit(&args.touches, memory_order_acquire);
         if (trace_access(ptr, size, &trace_opts) != 0) {
+            reason = "trace stress trace_access failed";
+            rc = -1;
+            break;
+        }
+        if (!wait_trace_touches_above(&args.touches, before)) {
+            reason = "trace stress worker stalled during trace";
             rc = -1;
             break;
         }
         if (i % 2 == 0) {
             MaiHeartbeatSnapshot snapshot;
             if (heartbeat(&heartbeat_opts, &snapshot) != 0) {
+                reason = "trace stress heartbeat failed";
                 rc = -1;
                 break;
             }
         } else if (stop_trace(ptr) != 0) {
+            reason = "trace stress stop failed";
             rc = -1;
             break;
         }
@@ -1456,22 +1566,25 @@ static int mode_access_trace_concurrent_stress(void) {
     }
 
     if (stop_trace(ptr) != 0) {
+        reason = "trace stress final stop failed";
         rc = -1;
     }
     if (atomic_load_explicit(&args.touches, memory_order_relaxed) == 0) {
+        reason = "trace stress worker did not touch memory";
         rc = -1;
     }
 
-    for (size_t offset = 0; offset < size; offset += 4096) {
+    for (size_t offset = 0; offset < size; offset += page_stride) {
         ptr[offset] = 0xa7;
         if (ptr[offset] != 0xa7) {
+            reason = "trace stress post-stop write verification failed";
             rc = -1;
             break;
         }
     }
 
     free(ptr);
-    return rc == 0 ? 0 : fail("access trace concurrent stress failed");
+    return rc == 0 ? 0 : fail(reason ? reason : "access trace concurrent stress failed");
 }
 
 static int mode_heartbeat_round_robin_fairness(void) {
@@ -1894,6 +2007,18 @@ static int mode_uffd_pager_spatial_prefetch(void) {
         free(ptr);
         return fail("UFFD spatial prefetch did not reduce sequential faults");
     }
+    if (after_touch.policy_prefetch_requests <= before.policy_prefetch_requests ||
+        after_touch.policy_prefetch_completed <= before.policy_prefetch_completed) {
+        fprintf(stderr,
+                "policy prefetch stats: requests before=%zu after=%zu "
+                "completed before=%zu after=%zu\n",
+                before.policy_prefetch_requests,
+                after_touch.policy_prefetch_requests,
+                before.policy_prefetch_completed,
+                after_touch.policy_prefetch_completed);
+        free(ptr);
+        return fail("UFFD spatial prefetch did not update policy counters");
+    }
     if (after_touch.uffd_resident_bytes < size) {
         fprintf(stderr, "prefetch stats: resident=%zu size=%zu\n",
                 after_touch.uffd_resident_bytes, size);
@@ -1908,6 +2033,3225 @@ static int mode_uffd_pager_spatial_prefetch(void) {
     if (after_free.live_managed_bytes != before.live_managed_bytes ||
         after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
         return fail("UFFD prefetch allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_async_prefetch(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 16 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t resident_limit = 8 * 1024 * 1024;
+    const size_t resident_slack = 4 * 1024 * 1024;
+    const size_t chunks = size / unit;
+    unsigned char expected[8] = {0};
+
+    if (chunks > sizeof(expected)) {
+        return fail("async prefetch expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD async prefetch test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for async prefetch test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD async prefetch allocation failed");
+    }
+
+    for (size_t i = 0; i < chunks; i++) {
+        expected[i] = (unsigned char)(0x40 + i);
+        ptr[i * unit] = expected[i];
+        usleep(1000);
+    }
+    ptr[size - 1] = 0xc3;
+    for (size_t wait = 0; wait < 100; wait++) {
+        if (load_stats(&after_touch) != 0) {
+            free(ptr);
+            return fail("mai_get_stats failed while waiting for UFFD async prefetch");
+        }
+        if (after_touch.policy_async_prefetch_completed >
+            before.policy_async_prefetch_completed) {
+            break;
+        }
+        usleep(1000);
+    }
+
+    for (size_t i = 0; i < chunks; i++) {
+        if (ptr[i * unit] != expected[i]) {
+            free(ptr);
+            return fail("UFFD async prefetch lost chunk data");
+        }
+    }
+    if (ptr[size - 1] != 0xc3) {
+        free(ptr);
+        return fail("UFFD async prefetch lost tail data");
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD async prefetch touches");
+    }
+    size_t async_enqueued =
+        after_touch.policy_async_prefetch_enqueued -
+        before.policy_async_prefetch_enqueued;
+    size_t async_completed =
+        after_touch.policy_async_prefetch_completed -
+        before.policy_async_prefetch_completed;
+    size_t prefetch_completed =
+        after_touch.policy_prefetch_completed - before.policy_prefetch_completed;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults) {
+        free(ptr);
+        return fail("UFFD async prefetch did not exercise pager faults");
+    }
+    if (async_enqueued == 0 || async_completed == 0) {
+        fprintf(stderr,
+                "async worker stats: enqueued=%zu completed=%zu dropped=%zu\n",
+                async_enqueued, async_completed,
+                after_touch.policy_async_prefetch_dropped -
+                before.policy_async_prefetch_dropped);
+        free(ptr);
+        return fail("UFFD async prefetch worker did not run");
+    }
+    if (prefetch_completed == 0) {
+        fprintf(stderr,
+                "async prefetch stats: completed before=%zu after=%zu\n",
+                before.policy_prefetch_completed,
+                after_touch.policy_prefetch_completed);
+        free(ptr);
+        return fail("UFFD async prefetch worker did not complete prefetches");
+    }
+    if (after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD async prefetch did not exercise pressure eviction");
+    }
+    if (after_touch.uffd_resident_bytes > resident_limit + resident_slack) {
+        fprintf(stderr,
+                "async resident stats: resident=%zu limit=%zu slack=%zu\n",
+                after_touch.uffd_resident_bytes, resident_limit, resident_slack);
+        free(ptr);
+        return fail("UFFD async prefetch exceeded resident slack bound");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD async prefetch free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD async prefetch allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_record_protect_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 16 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t chunks = size / unit;
+    unsigned char expected_a[8] = {0};
+    unsigned char expected_b[8] = {0};
+
+    if (chunks > sizeof(expected_a) || chunks > sizeof(expected_b)) {
+        return fail("record protect expected arrays are too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD record protect test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for record protect test");
+    }
+
+    unsigned char* a = malloc(size);
+    unsigned char* b = malloc(size);
+    if (!a || !b) {
+        free(a);
+        free(b);
+        return fail("UFFD record protect allocations failed");
+    }
+
+    for (size_t i = 0; i < 4; i++) {
+        expected_a[i] = (unsigned char)(0x70 + i);
+        a[i * unit] = expected_a[i];
+    }
+    for (size_t i = 0; i < chunks; i++) {
+        expected_b[i] = (unsigned char)(0x90 + i);
+        b[i * unit] = expected_b[i];
+    }
+    for (size_t i = 0; i < 4; i++) {
+        if (a[i * unit] != expected_a[i]) {
+            free(a);
+            free(b);
+            return fail("UFFD record protect lost hot record data");
+        }
+    }
+    for (size_t i = 0; i < chunks; i++) {
+        if (b[i * unit] != expected_b[i]) {
+            free(a);
+            free(b);
+            return fail("UFFD record protect lost scan record data");
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(a);
+        free(b);
+        return fail("mai_get_stats failed after UFFD record protect touches");
+    }
+    size_t unused_evictions =
+        after_touch.policy_prefetch_unused_evictions -
+        before.policy_prefetch_unused_evictions;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.managed_allocations < before.managed_allocations + 2 ||
+        after_touch.uffd_pager_allocations < before.uffd_pager_allocations + 2 ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(a);
+        free(b);
+        return fail("UFFD record protect did not exercise two-record pressure");
+    }
+    if (unused_evictions == 0) {
+        free(a);
+        free(b);
+        return fail("UFFD record protect did not evict unused prefetches");
+    }
+
+    free(a);
+    free(b);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD record protect free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD record protect allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_active_record_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t records = 3;
+    const size_t record_size = 4 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t resident_limit = 8 * 1024 * 1024;
+    const size_t configured_low = 2 * 1024 * 1024;
+    unsigned char* ptrs[3] = {0};
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD active record test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for active record test");
+    }
+
+    for (size_t r = 0; r < records; r++) {
+        ptrs[r] = malloc(record_size);
+        if (!ptrs[r]) {
+            for (size_t i = 0; i < r; i++) {
+                free(ptrs[i]);
+            }
+            return fail("UFFD active record allocation failed");
+        }
+    }
+
+    for (size_t r = 0; r < records; r++) {
+        ptrs[r][0] = (unsigned char)(0x60 + r);
+        ptrs[r][unit] = (unsigned char)(0x70 + r);
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        for (size_t r = 0; r < records; r++) {
+            free(ptrs[r]);
+        }
+        return fail("mai_get_stats failed after UFFD active record touches");
+    }
+    if (after_touch.uffd_evictions <= before.uffd_evictions) {
+        for (size_t r = 0; r < records; r++) {
+            free(ptrs[r]);
+        }
+        return fail("UFFD active record test did not exercise pressure eviction");
+    }
+    if (after_touch.uffd_resident_bytes > resident_limit) {
+        fprintf(stderr,
+                "active record resident above limit: resident=%zu limit=%zu\n",
+                after_touch.uffd_resident_bytes, resident_limit);
+        for (size_t r = 0; r < records; r++) {
+            free(ptrs[r]);
+        }
+        return fail("UFFD active record controller exceeded resident limit");
+    }
+    if (after_touch.uffd_resident_bytes <= configured_low + unit) {
+        fprintf(stderr,
+                "active record resident too low: resident=%zu low=%zu unit=%zu\n",
+                after_touch.uffd_resident_bytes, configured_low, unit);
+        for (size_t r = 0; r < records; r++) {
+            free(ptrs[r]);
+        }
+        return fail("UFFD active record controller reclaimed to configured low watermark");
+    }
+
+    for (size_t r = 0; r < records; r++) {
+        if (ptrs[r][0] != (unsigned char)(0x60 + r) ||
+            ptrs[r][unit] != (unsigned char)(0x70 + r)) {
+            for (size_t i = 0; i < records; i++) {
+                free(ptrs[i]);
+            }
+            return fail("UFFD active record controller lost data");
+        }
+    }
+
+    for (size_t r = 0; r < records; r++) {
+        free(ptrs[r]);
+    }
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD active record free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD active record allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_active_record_prefetch_guard(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t chunks = size / unit;
+    unsigned char expected[16] = {0};
+
+    if (chunks > sizeof(expected)) {
+        return fail("active prefetch guard expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before active prefetch guard test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for active prefetch guard test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("active prefetch guard allocation failed");
+    }
+
+    for (size_t i = 0; i < chunks; i++) {
+        expected[i] = (unsigned char)(0x80 + i);
+        ptr[i * unit] = expected[i];
+    }
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after active prefetch guard touches");
+    }
+
+    size_t rejected =
+        after_touch.policy_admission_rejected -
+        before.policy_admission_rejected;
+    size_t requests =
+        after_touch.policy_admission_requests -
+        before.policy_admission_requests;
+    size_t admitted =
+        after_touch.policy_prefetch_admitted -
+        before.policy_prefetch_admitted;
+    size_t completed =
+        after_touch.policy_prefetch_completed -
+        before.policy_prefetch_completed;
+    if (requests == 0) {
+        free(ptr);
+        return fail("active prefetch guard did not exercise speculative admission");
+    }
+    if (after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("active prefetch guard did not exercise pressure eviction");
+    }
+    if (rejected == 0) {
+        fprintf(stderr,
+                "active prefetch guard counters: requests=%zu admitted=%zu "
+                "completed=%zu evictions_delta=%zu\n",
+                requests,
+                admitted,
+                completed,
+                after_touch.uffd_evictions - before.uffd_evictions);
+        free(ptr);
+        return fail("active prefetch guard did not reject speculative prefetches");
+    }
+    if (completed > chunks) {
+        fprintf(stderr,
+                "active prefetch guard completed too much prefetch: completed=%zu chunks=%zu\n",
+                completed, chunks);
+        free(ptr);
+        return fail("active prefetch guard over-admitted protected prefetches");
+    }
+    for (size_t i = 0; i < chunks; i++) {
+        if (ptr[i * unit] != expected[i]) {
+            free(ptr);
+            return fail("active prefetch guard lost data");
+        }
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after active prefetch guard free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("active prefetch guard allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_adaptive_policy_throttle(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t chunks = size / unit;
+    unsigned char expected[16] = {0};
+
+    if (chunks > sizeof(expected)) {
+        return fail("adaptive policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before adaptive policy test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for adaptive policy test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD adaptive policy allocation failed");
+    }
+
+    for (size_t pass = 0; pass < 3; pass++) {
+        for (size_t i = 0; i + 1 < chunks; i += 2) {
+            expected[i]++;
+            ptr[i * unit] = expected[i];
+            expected[i + 1]++;
+            ptr[(i + 1) * unit] = expected[i + 1];
+        }
+    }
+
+    for (size_t pass = 0; pass < 3; pass++) {
+        for (size_t i = 0; i < chunks; i += 2) {
+            expected[i]++;
+            ptr[i * unit] = expected[i];
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after adaptive policy touches");
+    }
+    size_t throttle_events =
+        after_touch.policy_throttle_events - before.policy_throttle_events;
+    size_t admission_rejected =
+        after_touch.policy_admission_rejected - before.policy_admission_rejected;
+    const char* budget_gate_env = getenv("MAI_POLICY_ADAPTIVE_BUDGET_GATE");
+    int budget_gate_expected =
+        budget_gate_env && strcmp(budget_gate_env, "0") != 0;
+    if (budget_gate_expected) {
+        if (after_touch.policy_adaptive_budget_gate == 0 ||
+            after_touch.policy_adaptive_budget_bytes != unit) {
+            fprintf(stderr,
+                    "adaptive budget gate stats: gate=%zu budget=%zu "
+                    "expected_budget=%zu window_debt=%zu\n",
+                    after_touch.policy_adaptive_budget_gate,
+                    after_touch.policy_adaptive_budget_bytes, unit,
+                    after_touch.policy_adaptive_window_migration_bytes);
+            free(ptr);
+            return fail("UFFD adaptive budget gate stats were not exposed");
+        }
+    } else if (after_touch.policy_adaptive_budget_gate != 0) {
+        free(ptr);
+        return fail("UFFD adaptive budget gate enabled without env opt-in");
+    }
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD adaptive policy did not exercise pager pressure");
+    }
+    if (throttle_events == 0) {
+        fprintf(stderr,
+                "adaptive policy stats: throttle=%zu rejected=%zu "
+                "unused_evictions=%zu hot_evicted=%zu\n",
+                throttle_events, admission_rejected,
+                after_touch.policy_prefetch_unused_evictions -
+                before.policy_prefetch_unused_evictions,
+                after_touch.policy_evicted_hot_bytes -
+                before.policy_evicted_hot_bytes);
+        free(ptr);
+        return fail("UFFD adaptive policy did not throttle harmful speculation");
+    }
+    if (after_touch.policy_adaptive_windows <= before.policy_adaptive_windows ||
+        after_touch.policy_adaptive_level_changes <=
+            before.policy_adaptive_level_changes ||
+        after_touch.policy_adaptive_admission_rejected <=
+            before.policy_adaptive_admission_rejected) {
+        fprintf(stderr,
+                "adaptive policy counters: windows=%zu level=%zu "
+                "changes=%zu adaptive_rejects=%zu\n",
+                after_touch.policy_adaptive_windows -
+                before.policy_adaptive_windows,
+                after_touch.policy_adaptive_level,
+                after_touch.policy_adaptive_level_changes -
+                before.policy_adaptive_level_changes,
+                after_touch.policy_adaptive_admission_rejected -
+                before.policy_adaptive_admission_rejected);
+        free(ptr);
+        return fail("UFFD adaptive policy did not report adaptive Markov gating");
+    }
+    for (size_t i = 0; i < chunks; i += 2) {
+        if (ptr[i * unit] != expected[i]) {
+            free(ptr);
+            return fail("UFFD adaptive policy lost data");
+        }
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after adaptive policy free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD adaptive policy allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_adaptive_legacy_noop(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t chunks = size / unit;
+    unsigned char expected[16] = {0};
+
+    if (chunks > sizeof(expected)) {
+        return fail("adaptive legacy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before adaptive legacy test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for adaptive legacy test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD adaptive legacy allocation failed");
+    }
+
+    for (size_t pass = 0; pass < 3; pass++) {
+        for (size_t i = 0; i < chunks; i += 2) {
+            expected[i]++;
+            ptr[i * unit] = expected[i];
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after adaptive legacy touches");
+    }
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD adaptive legacy did not exercise pager pressure");
+    }
+    if (after_touch.policy_adaptive_level != 0 ||
+        after_touch.policy_adaptive_budget_gate != 0 ||
+        after_touch.policy_adaptive_level_changes !=
+            before.policy_adaptive_level_changes ||
+        after_touch.policy_adaptive_prefetch_capped !=
+            before.policy_adaptive_prefetch_capped ||
+        after_touch.policy_adaptive_admission_rejected !=
+            before.policy_adaptive_admission_rejected) {
+        fprintf(stderr,
+                "adaptive legacy counters: level=%zu changes=%zu capped=%zu "
+                "rejects=%zu\n",
+                after_touch.policy_adaptive_level,
+                after_touch.policy_adaptive_level_changes -
+                before.policy_adaptive_level_changes,
+                after_touch.policy_adaptive_prefetch_capped -
+                before.policy_adaptive_prefetch_capped,
+                after_touch.policy_adaptive_admission_rejected -
+                before.policy_adaptive_admission_rejected);
+        free(ptr);
+        return fail("UFFD adaptive control changed legacy baseline behavior");
+    }
+    for (size_t i = 0; i < chunks; i += 2) {
+        if (ptr[i * unit] != expected[i]) {
+            free(ptr);
+            return fail("UFFD adaptive legacy lost data");
+        }
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after adaptive legacy free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD adaptive legacy allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_clean_shadow_skip(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 8 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before clean shadow skip test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for clean shadow skip test");
+    }
+
+    volatile unsigned char* ptr = (volatile unsigned char*)malloc(size);
+    if (!ptr) {
+        return fail("UFFD clean shadow allocation failed");
+    }
+
+    size_t base_evictions = before.uffd_evictions;
+    runtime_store_byte(ptr, 0, 0x11);
+    runtime_store_byte(ptr, unit, 0x22);
+    if (wait_for_uffd_evictions(base_evictions + 1, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow skip did not demote initial chunk");
+    }
+    unsigned char restored = runtime_load_byte(ptr, 0);
+    if (wait_for_uffd_evictions(base_evictions + 2, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow skip did not demote post-restore chunk");
+    }
+    runtime_store_byte(ptr, 2 * unit, 0x33);
+    if (wait_for_uffd_evictions(base_evictions + 3, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow skip did not demote restored chunk");
+    }
+    if (restored != 0x11 || runtime_load_byte(ptr, 0) != 0x11) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow lost restored data");
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free((void*)ptr);
+        return fail("mai_get_stats failed after clean shadow skip touches");
+    }
+    size_t skipped =
+        after_touch.policy_clean_shadow_write_skipped_bytes -
+        before.policy_clean_shadow_write_skipped_bytes;
+    size_t skipped_chunks =
+        after_touch.policy_clean_shadow_write_skipped_chunks -
+        before.policy_clean_shadow_write_skipped_chunks;
+    size_t write_faults =
+        after_touch.policy_clean_shadow_write_faults -
+        before.policy_clean_shadow_write_faults;
+    size_t tracked =
+        after_touch.policy_clean_shadow_tracked_chunks -
+        before.policy_clean_shadow_tracked_chunks;
+    size_t protect_failures =
+        after_touch.policy_clean_shadow_protect_failures -
+        before.policy_clean_shadow_protect_failures;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow skip did not exercise pager pressure");
+    }
+    if (skipped < unit || skipped_chunks == 0 || write_faults != 0) {
+        fprintf(stderr,
+                "clean shadow skip stats: skipped=%zu chunks=%zu "
+                "write_faults=%zu tracked=%zu protect_failures=%zu "
+                "evictions=%zu demand_faults=%zu read_bytes=%zu "
+                "write_bytes=%zu useful_prefetch=%zu late_prefetch=%zu\n",
+                skipped, skipped_chunks, write_faults, tracked,
+                protect_failures,
+                after_touch.uffd_evictions - before.uffd_evictions,
+                after_touch.policy_demand_faults - before.policy_demand_faults,
+                after_touch.policy_migration_read_bytes -
+                    before.policy_migration_read_bytes,
+                after_touch.policy_migration_write_bytes -
+                    before.policy_migration_write_bytes,
+                after_touch.policy_prefetch_useful -
+                    before.policy_prefetch_useful,
+                after_touch.policy_prefetch_late -
+                    before.policy_prefetch_late);
+        free((void*)ptr);
+        return fail("UFFD clean shadow did not skip a clean demotion write");
+    }
+
+    free((void*)ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after clean shadow skip free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD clean shadow skip allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_clean_shadow_dirty(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 8 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before clean shadow dirty test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for clean shadow dirty test");
+    }
+
+    volatile unsigned char* ptr = (volatile unsigned char*)malloc(size);
+    if (!ptr) {
+        return fail("UFFD clean shadow dirty allocation failed");
+    }
+
+    size_t base_evictions = before.uffd_evictions;
+    runtime_store_byte(ptr, 0, 0x41);
+    runtime_store_byte(ptr, unit, 0x52);
+    if (wait_for_uffd_evictions(base_evictions + 1, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty did not demote initial chunk");
+    }
+    if (runtime_load_byte(ptr, 0) != 0x41) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty failed to restore clean chunk");
+    }
+    if (wait_for_uffd_evictions(base_evictions + 2, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty did not demote post-restore chunk");
+    }
+    runtime_store_byte(ptr, 0, 0x63);
+    if (runtime_load_byte(ptr, 0) != 0x63) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty lost updated resident data");
+    }
+    runtime_store_byte(ptr, 2 * unit, 0x74);
+    if (wait_for_uffd_evictions(base_evictions + 3, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty did not demote dirty chunk");
+    }
+    if (runtime_load_byte(ptr, 0) != 0x63) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty lost updated data");
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free((void*)ptr);
+        return fail("mai_get_stats failed after clean shadow dirty touches");
+    }
+    size_t skipped =
+        after_touch.policy_clean_shadow_write_skipped_bytes -
+        before.policy_clean_shadow_write_skipped_bytes;
+    size_t write_faults =
+        after_touch.policy_clean_shadow_write_faults -
+        before.policy_clean_shadow_write_faults;
+    size_t tracked =
+        after_touch.policy_clean_shadow_tracked_chunks -
+        before.policy_clean_shadow_tracked_chunks;
+    size_t protect_failures =
+        after_touch.policy_clean_shadow_protect_failures -
+        before.policy_clean_shadow_protect_failures;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow dirty did not exercise pager pressure");
+    }
+    if (skipped != 0 || write_faults == 0) {
+        fprintf(stderr,
+                "clean shadow dirty stats: skipped=%zu write_faults=%zu "
+                "tracked=%zu protect_failures=%zu evictions=%zu "
+                "demand_faults=%zu read_bytes=%zu write_bytes=%zu "
+                "useful_prefetch=%zu late_prefetch=%zu\n",
+                skipped, write_faults, tracked, protect_failures,
+                after_touch.uffd_evictions - before.uffd_evictions,
+                after_touch.policy_demand_faults - before.policy_demand_faults,
+                after_touch.policy_migration_read_bytes -
+                    before.policy_migration_read_bytes,
+                after_touch.policy_migration_write_bytes -
+                    before.policy_migration_write_bytes,
+                after_touch.policy_prefetch_useful -
+                    before.policy_prefetch_useful,
+                after_touch.policy_prefetch_late -
+                    before.policy_prefetch_late);
+        free((void*)ptr);
+        return fail("UFFD clean shadow did not invalidate on write");
+    }
+
+    free((void*)ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after clean shadow dirty free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD clean shadow dirty allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_clean_shadow_fallback(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 8 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before clean shadow fallback test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for clean shadow fallback test");
+    }
+
+    volatile unsigned char* ptr = (volatile unsigned char*)malloc(size);
+    if (!ptr) {
+        return fail("UFFD clean shadow fallback allocation failed");
+    }
+
+    size_t base_evictions = before.uffd_evictions;
+    runtime_store_byte(ptr, 0, 0x21);
+    runtime_store_byte(ptr, unit, 0x32);
+    if (wait_for_uffd_evictions(base_evictions + 1, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback did not demote initial chunk");
+    }
+    if (runtime_load_byte(ptr, 0) != 0x21) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback failed to restore data");
+    }
+    if (wait_for_uffd_evictions(base_evictions + 2, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback did not demote after restore");
+    }
+    runtime_store_byte(ptr, 2 * unit, 0x43);
+    if (wait_for_uffd_evictions(base_evictions + 3, NULL) != 0) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback did not demote restored chunk");
+    }
+    if (runtime_load_byte(ptr, 0) != 0x21) {
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback lost restored data");
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free((void*)ptr);
+        return fail("mai_get_stats failed after clean shadow fallback touches");
+    }
+    size_t skipped =
+        after_touch.policy_clean_shadow_write_skipped_bytes -
+        before.policy_clean_shadow_write_skipped_bytes;
+    size_t tracked =
+        after_touch.policy_clean_shadow_tracked_chunks -
+        before.policy_clean_shadow_tracked_chunks;
+    size_t protect_failures =
+        after_touch.policy_clean_shadow_protect_failures -
+        before.policy_clean_shadow_protect_failures;
+    if (skipped != 0 || tracked != 0 || protect_failures == 0) {
+        fprintf(stderr,
+                "clean shadow fallback stats: skipped=%zu tracked=%zu "
+                "protect_failures=%zu\n",
+                skipped, tracked, protect_failures);
+        free((void*)ptr);
+        return fail("UFFD clean shadow fallback tracked an unsafe clean shadow");
+    }
+
+    free((void*)ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after clean shadow fallback free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD clean shadow fallback allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_async_queue_saturation_no_sync_prefetch(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 16 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t chunks = size / unit;
+    unsigned char expected[8] = {0};
+
+    if (chunks > sizeof(expected)) {
+        return fail("async saturation expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD async saturation test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for async saturation test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD async saturation allocation failed");
+    }
+
+    for (size_t i = 0; i < chunks; i++) {
+        expected[i] = (unsigned char)(0x60 + i);
+        ptr[i * unit] = expected[i];
+    }
+    for (size_t i = 0; i < chunks; i++) {
+        if (ptr[i * unit] != expected[i]) {
+            free(ptr);
+            return fail("UFFD async saturation lost chunk data");
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD async saturation touches");
+    }
+    size_t async_enqueued =
+        after_touch.policy_async_prefetch_enqueued -
+        before.policy_async_prefetch_enqueued;
+    size_t async_dropped =
+        after_touch.policy_async_prefetch_dropped -
+        before.policy_async_prefetch_dropped;
+    size_t prefetch_completed =
+        after_touch.policy_prefetch_completed - before.policy_prefetch_completed;
+    size_t throttle_events =
+        after_touch.policy_throttle_events - before.policy_throttle_events;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults) {
+        free(ptr);
+        return fail("UFFD async saturation did not exercise pager faults");
+    }
+    if (async_enqueued != 0 || async_dropped == 0 ||
+        prefetch_completed != 0 || throttle_events < async_dropped) {
+        fprintf(stderr,
+                "async saturation stats: enqueued=%zu dropped=%zu "
+                "prefetch_completed=%zu throttle_events=%zu\n",
+                async_enqueued, async_dropped, prefetch_completed,
+                throttle_events);
+        free(ptr);
+        return fail("UFFD async saturation fell back to sync prefetch");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD async saturation free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD async saturation allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_stride_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t streams = 4;
+    const size_t passes = 3;
+    const size_t units = size / unit;
+    size_t active_streams = streams;
+    const char* active_streams_env = getenv("MAI_UFFD_STRIDE_ACTIVE_STREAMS");
+    if (active_streams_env && active_streams_env[0] != '\0') {
+        char* end = NULL;
+        unsigned long long parsed = strtoull(active_streams_env, &end, 10);
+        if (end && *end == '\0' && parsed > 0 && parsed <= streams) {
+            active_streams = (size_t)parsed;
+        }
+    }
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD stride policy test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for stride policy test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD stride policy allocation failed");
+    }
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t stream = 0; stream < active_streams; stream++) {
+            for (size_t step = 0; step < units; step++) {
+                size_t chunk = stream + step * streams;
+                if (chunk >= units) {
+                    continue;
+                }
+                ptr[chunk * unit] = (unsigned char)(0x20 + pass + chunk);
+            }
+        }
+        for (size_t stream = 0; stream < active_streams; stream++) {
+            for (size_t step = 0; step < units; step++) {
+                size_t chunk = stream + step * streams;
+                if (chunk >= units) {
+                    continue;
+                }
+                unsigned char expected = (unsigned char)(0x20 + pass + chunk);
+                if (ptr[chunk * unit] != expected) {
+                    free(ptr);
+                    return fail("UFFD stride policy lost chunk data");
+                }
+            }
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD stride policy touches");
+    }
+    size_t prefetch_completed =
+        after_touch.policy_prefetch_completed - before.policy_prefetch_completed;
+    size_t prefetch_useful =
+        after_touch.policy_prefetch_useful - before.policy_prefetch_useful;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        fprintf(stderr,
+                "stride policy stats: managed before=%zu after=%zu "
+                "uffd_alloc before=%zu after=%zu faults before=%zu after=%zu "
+                "evictions before=%zu after=%zu\n",
+                before.managed_allocations, after_touch.managed_allocations,
+                before.uffd_pager_allocations, after_touch.uffd_pager_allocations,
+                before.uffd_faults, after_touch.uffd_faults,
+                before.uffd_evictions, after_touch.uffd_evictions);
+        free(ptr);
+        return fail("UFFD stride policy did not exercise pager pressure");
+    }
+    if (getenv("MAI_UFFD_EXPECT_NO_USEFUL_PREFETCH")) {
+        if (prefetch_completed == 0 || prefetch_useful != 0) {
+            fprintf(stderr,
+                    "stride negative-control stats: completed=%zu useful=%zu\n",
+                    prefetch_completed, prefetch_useful);
+            free(ptr);
+            return fail("UFFD forward prefetch was useful in isolated stride test");
+        }
+    } else if (prefetch_completed == 0 || prefetch_useful == 0) {
+        fprintf(stderr,
+                "stride policy prefetch stats: completed=%zu useful=%zu\n",
+                prefetch_completed, prefetch_useful);
+        free(ptr);
+        return fail("UFFD stride policy did not produce useful prefetches");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD stride policy free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD stride policy allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_hotset_scan_policy(const char* policy_name,
+                                              int expect_car_activity,
+                                              int expect_tinylfu_activity,
+                                              int expect_wtinylfu_activity,
+                                              int expect_irr_activity) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t hot_units = 4;
+    const size_t hot_rounds = 4;
+    const size_t scan_passes = 3;
+    unsigned char expected[16] = {0};
+
+    if (units > sizeof(expected)) {
+        return fail("UFFD hotset test expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD hotset test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for hotset test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD hotset allocation failed");
+    }
+    for (size_t pass = 0; pass < scan_passes; pass++) {
+        for (size_t round = 0; round < hot_rounds; round++) {
+            for (size_t unit_index = 0; unit_index < hot_units; unit_index++) {
+                expected[unit_index]++;
+                ptr[unit_index * unit] = expected[unit_index];
+                if (ptr[unit_index * unit] != expected[unit_index]) {
+                    free(ptr);
+                    return fail("UFFD hotset lost hot data");
+                }
+            }
+        }
+        for (size_t unit_index = hot_units; unit_index < units; unit_index++) {
+            expected[unit_index]++;
+            ptr[unit_index * unit] = expected[unit_index];
+            if (ptr[unit_index * unit] != expected[unit_index]) {
+                free(ptr);
+                return fail("UFFD hotset lost scan data");
+            }
+        }
+        for (size_t unit_index = 0; unit_index < hot_units; unit_index++) {
+            if (ptr[unit_index * unit] != expected[unit_index]) {
+                free(ptr);
+                return fail("UFFD hotset verification failed");
+            }
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD hotset touches");
+    }
+    size_t admission_requests =
+        after_touch.policy_admission_requests - before.policy_admission_requests;
+    size_t admission_rejected =
+        after_touch.policy_admission_rejected - before.policy_admission_rejected;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        fprintf(stderr,
+                "%s hotset pager stats: managed before=%zu after=%zu "
+                "live before=%zu after=%zu uffd_alloc before=%zu after=%zu "
+                "faults before=%zu after=%zu evictions before=%zu after=%zu\n",
+                policy_name,
+                before.managed_allocations, after_touch.managed_allocations,
+                before.live_managed_bytes, after_touch.live_managed_bytes,
+                before.uffd_pager_allocations, after_touch.uffd_pager_allocations,
+                before.uffd_faults, after_touch.uffd_faults,
+                before.uffd_evictions, after_touch.uffd_evictions);
+        free(ptr);
+        return fail("UFFD hotset test did not exercise pager pressure");
+    }
+    if (admission_requests == 0 || admission_rejected == 0) {
+        fprintf(stderr,
+                "%s hotset admission stats: requests=%zu rejected=%zu\n",
+                policy_name, admission_requests, admission_rejected);
+        free(ptr);
+        return fail("UFFD hotset test did not reject speculative admission");
+    }
+    if (expect_car_activity) {
+        size_t car_events =
+            (after_touch.policy_car_recent_ghost_hits -
+             before.policy_car_recent_ghost_hits) +
+            (after_touch.policy_car_frequent_ghost_hits -
+             before.policy_car_frequent_ghost_hits) +
+            (after_touch.policy_car_target_increases -
+             before.policy_car_target_increases) +
+            (after_touch.policy_car_target_decreases -
+             before.policy_car_target_decreases) +
+            (after_touch.policy_car_second_chances -
+             before.policy_car_second_chances);
+        if (car_events == 0) {
+            fprintf(stderr, "CAR hotset stats did not move\n");
+            free(ptr);
+            return fail("UFFD CAR hotset test did not exercise CAR state");
+        }
+    }
+    if (expect_tinylfu_activity) {
+        size_t updates =
+            after_touch.policy_tinylfu_sketch_updates -
+            before.policy_tinylfu_sketch_updates;
+        size_t rejected =
+            after_touch.policy_tinylfu_admission_rejected -
+            before.policy_tinylfu_admission_rejected;
+        if (updates == 0 || rejected == 0) {
+            fprintf(stderr,
+                    "TinyLFU hotset stats: updates=%zu rejected=%zu\n",
+                    updates, rejected);
+            free(ptr);
+            return fail("UFFD TinyLFU hotset test did not exercise sketch admission");
+        }
+    }
+    if (expect_wtinylfu_activity) {
+        size_t updates =
+            after_touch.policy_tinylfu_sketch_updates -
+            before.policy_tinylfu_sketch_updates;
+        size_t rejected =
+            after_touch.policy_wtinylfu_main_admission_rejected -
+            before.policy_wtinylfu_main_admission_rejected;
+        size_t state_chunks =
+            after_touch.policy_wtinylfu_window_chunks +
+            after_touch.policy_wtinylfu_probation_chunks +
+            after_touch.policy_wtinylfu_protected_chunks;
+        size_t victim_rejected =
+            after_touch.policy_wtinylfu_victim_score_rejected -
+            before.policy_wtinylfu_victim_score_rejected;
+        if (updates == 0 || rejected == 0 || victim_rejected == 0 ||
+            state_chunks == 0) {
+            fprintf(stderr,
+                    "W-TinyLFU hotset stats: updates=%zu rejected=%zu "
+                    "victim_rejected=%zu window=%zu probation=%zu "
+                    "protected=%zu\n",
+                    updates, rejected, victim_rejected,
+                    after_touch.policy_wtinylfu_window_chunks,
+                    after_touch.policy_wtinylfu_probation_chunks,
+                    after_touch.policy_wtinylfu_protected_chunks);
+            free(ptr);
+            return fail("UFFD W-TinyLFU hotset test did not exercise states");
+        }
+    }
+    if (expect_irr_activity) {
+        size_t ghost_hits =
+            after_touch.policy_irr_ghost_hits - before.policy_irr_ghost_hits;
+        size_t promotions =
+            after_touch.policy_irr_promotions - before.policy_irr_promotions;
+        size_t demotions =
+            after_touch.policy_irr_demotions - before.policy_irr_demotions;
+        size_t pressure_rejected =
+            after_touch.policy_irr_pressure_rejected -
+            before.policy_irr_pressure_rejected;
+        size_t immature_rejected =
+            after_touch.policy_irr_immature_rejected -
+            before.policy_irr_immature_rejected;
+        if (after_touch.policy_irr_resident_chunks == 0 ||
+            after_touch.policy_irr_target_protected_chunks == 0 ||
+            ghost_hits == 0 || promotions == 0 || demotions == 0 ||
+            pressure_rejected == 0 || immature_rejected == 0 ||
+            after_touch.policy_irr_max_interval_epochs == 0) {
+            fprintf(stderr,
+                    "IRR hotset stats: resident=%zu protected=%zu ghost=%zu "
+                    "target=%zu ghost_hits=%zu promotions=%zu demotions=%zu "
+                    "pressure_rejected=%zu immature_rejected=%zu "
+                    "max_interval=%zu\n",
+                    after_touch.policy_irr_resident_chunks,
+                    after_touch.policy_irr_protected_chunks,
+                    after_touch.policy_irr_ghost_chunks,
+                    after_touch.policy_irr_target_protected_chunks,
+                    ghost_hits, promotions, demotions, pressure_rejected,
+                    immature_rejected,
+                    after_touch.policy_irr_max_interval_epochs);
+            free(ptr);
+            return fail("UFFD IRR hotset test did not exercise IRR state");
+        }
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD hotset free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD hotset allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_lfu_hotset_scan(void) {
+    return mode_uffd_pager_hotset_scan_policy("LFU", 0, 0, 0, 0);
+}
+
+static int mode_uffd_pager_lruk_hotset_scan(void) {
+    return mode_uffd_pager_hotset_scan_policy("LRU-K", 0, 0, 0, 0);
+}
+
+static int mode_uffd_pager_car_hotset_scan(void) {
+    return mode_uffd_pager_hotset_scan_policy("CAR", 1, 0, 0, 0);
+}
+
+static int mode_uffd_pager_irr_hotset_scan(void) {
+    return mode_uffd_pager_hotset_scan_policy("IRR", 0, 0, 0, 1);
+}
+
+static int mode_uffd_pager_arc_pivot_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t hot_units = 2;
+    const size_t warm_rounds = 8;
+    const size_t burst_groups = 3;
+    const size_t burst_rounds = 3;
+    const size_t scan_passes = 2;
+    const size_t return_rounds = 6;
+    const size_t scan_start = (burst_groups + 1) * hot_units;
+    unsigned char expected[16] = {0};
+
+    if (units > sizeof(expected) || units <= scan_start) {
+        return fail("UFFD ARC pivot expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD ARC pivot test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for ARC pivot test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD ARC pivot allocation failed");
+    }
+
+    for (size_t round = 0; round < warm_rounds; round++) {
+        for (size_t unit_index = 0; unit_index < hot_units; unit_index++) {
+            expected[unit_index]++;
+            ptr[unit_index * unit] = expected[unit_index];
+            if (ptr[unit_index * unit] != expected[unit_index]) {
+                free(ptr);
+                return fail("UFFD ARC pivot lost warm hot data");
+            }
+        }
+    }
+
+    for (size_t pass = 0; pass < scan_passes; pass++) {
+        for (size_t group = 0; group < burst_groups; group++) {
+            size_t base = (group + 1) * hot_units;
+            for (size_t round = 0; round < burst_rounds; round++) {
+                for (size_t unit_index = 0; unit_index < hot_units;
+                     unit_index++) {
+                    size_t index = base + unit_index;
+                    expected[index]++;
+                    ptr[index * unit] = expected[index];
+                    if (ptr[index * unit] != expected[index]) {
+                        free(ptr);
+                        return fail("UFFD ARC pivot lost burst data");
+                    }
+                }
+            }
+            for (size_t index = scan_start; index < units; index++) {
+                expected[index]++;
+                ptr[index * unit] = expected[index];
+                if (ptr[index * unit] != expected[index]) {
+                    free(ptr);
+                    return fail("UFFD ARC pivot lost scan data");
+                }
+            }
+            for (size_t unit_index = 0; unit_index < hot_units;
+                 unit_index++) {
+                size_t index = base + unit_index;
+                if (ptr[index * unit] != expected[index]) {
+                    free(ptr);
+                    return fail("UFFD ARC pivot burst verification failed");
+                }
+            }
+        }
+        for (size_t round = 0; round < return_rounds; round++) {
+            for (size_t unit_index = 0; unit_index < hot_units; unit_index++) {
+                expected[unit_index]++;
+                ptr[unit_index * unit] = expected[unit_index];
+                if (ptr[unit_index * unit] != expected[unit_index]) {
+                    free(ptr);
+                    return fail("UFFD ARC pivot lost return hot data");
+                }
+            }
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD ARC pivot touches");
+    }
+
+    size_t recent_ghost_hits =
+        after_touch.policy_arc_b1_hits - before.policy_arc_b1_hits;
+    size_t frequent_ghost_hits =
+        after_touch.policy_arc_b2_hits - before.policy_arc_b2_hits;
+    size_t target_increases =
+        after_touch.policy_arc_target_increases -
+        before.policy_arc_target_increases;
+    size_t target_decreases =
+        after_touch.policy_arc_target_decreases -
+        before.policy_arc_target_decreases;
+    size_t prefetch_admitted_t1 =
+        after_touch.policy_arc_prefetch_admitted_t1 -
+        before.policy_arc_prefetch_admitted_t1;
+    size_t prefetch_rejected_pressure =
+        after_touch.policy_arc_prefetch_rejected_pressure -
+        before.policy_arc_prefetch_rejected_pressure;
+    size_t prefetch_promoted_to_t2 =
+        after_touch.policy_arc_prefetch_promoted_to_t2 -
+        before.policy_arc_prefetch_promoted_to_t2;
+    size_t unused_prefetch_evictions =
+        after_touch.policy_prefetch_unused_evictions -
+        before.policy_prefetch_unused_evictions;
+    size_t second_chances =
+        after_touch.policy_car_second_chances -
+        before.policy_car_second_chances;
+
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions ||
+        after_touch.policy_demand_faults <= before.policy_demand_faults) {
+        free(ptr);
+        return fail("UFFD ARC pivot did not exercise pager pressure");
+    }
+    if (after_touch.uffd_resident_bytes > 12 * 1024 * 1024) {
+        fprintf(stderr, "ARC resident bytes=%zu\n",
+                after_touch.uffd_resident_bytes);
+        free(ptr);
+        return fail("UFFD ARC pivot exceeded resident cap");
+    }
+    if (after_touch.policy_arc_t1_chunks + after_touch.policy_arc_t2_chunks >
+            6 ||
+        after_touch.policy_arc_b1_chunks + after_touch.policy_arc_b2_chunks >
+            6) {
+        fprintf(stderr,
+                "ARC bounded counts: t1=%zu t2=%zu b1=%zu b2=%zu\n",
+                after_touch.policy_arc_t1_chunks,
+                after_touch.policy_arc_t2_chunks,
+                after_touch.policy_arc_b1_chunks,
+                after_touch.policy_arc_b2_chunks);
+        free(ptr);
+        return fail("UFFD ARC pivot exceeded bounded list sizes");
+    }
+    if (recent_ghost_hits == 0 || frequent_ghost_hits == 0 ||
+        target_increases == 0 || target_decreases == 0 ||
+        prefetch_admitted_t1 == 0 || prefetch_rejected_pressure == 0 ||
+        prefetch_promoted_to_t2 == 0 ||
+        unused_prefetch_evictions > prefetch_promoted_to_t2 ||
+        after_touch.policy_arc_t1_to_t2_promotions <=
+            before.policy_arc_t1_to_t2_promotions ||
+        after_touch.policy_arc_replace_t1 <= before.policy_arc_replace_t1 ||
+        after_touch.policy_arc_replace_t2 <= before.policy_arc_replace_t2) {
+        fprintf(stderr,
+                "ARC pivot stats: recent_ghost=%zu frequent_ghost=%zu "
+                "target_inc=%zu target_dec=%zu t1=%zu t2=%zu b1=%zu b2=%zu "
+                "target=%zu promotions=%zu replace_t1=%zu replace_t2=%zu "
+                "prefetch_admit=%zu prefetch_reject_pressure=%zu "
+                "prefetch_promote=%zu unused_prefetch=%zu\n",
+                recent_ghost_hits, frequent_ghost_hits, target_increases,
+                target_decreases, after_touch.policy_arc_t1_chunks,
+                after_touch.policy_arc_t2_chunks,
+                after_touch.policy_arc_b1_chunks,
+                after_touch.policy_arc_b2_chunks,
+                after_touch.policy_arc_p_chunks,
+                after_touch.policy_arc_t1_to_t2_promotions -
+                    before.policy_arc_t1_to_t2_promotions,
+                after_touch.policy_arc_replace_t1 -
+                    before.policy_arc_replace_t1,
+                after_touch.policy_arc_replace_t2 -
+                    before.policy_arc_replace_t2,
+                prefetch_admitted_t1, prefetch_rejected_pressure,
+                prefetch_promoted_to_t2, unused_prefetch_evictions);
+        free(ptr);
+        return fail("UFFD ARC pivot did not exercise bounded ARC admission");
+    }
+    if (second_chances != 0) {
+        fprintf(stderr, "ARC second-chance count=%zu\n", second_chances);
+        free(ptr);
+        return fail("UFFD ARC pivot unexpectedly used CAR second chances");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD ARC pivot free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD ARC pivot allocation leaked managed or resident bytes");
+    }
+    if (after_free.policy_arc_t1_chunks != before.policy_arc_t1_chunks ||
+        after_free.policy_arc_t2_chunks != before.policy_arc_t2_chunks ||
+        after_free.policy_arc_b1_chunks != before.policy_arc_b1_chunks ||
+        after_free.policy_arc_b2_chunks != before.policy_arc_b2_chunks) {
+        fprintf(stderr,
+                "ARC counts after free: before t1=%zu t2=%zu b1=%zu b2=%zu "
+                "after t1=%zu t2=%zu b1=%zu b2=%zu\n",
+                before.policy_arc_t1_chunks, before.policy_arc_t2_chunks,
+                before.policy_arc_b1_chunks, before.policy_arc_b2_chunks,
+                after_free.policy_arc_t1_chunks,
+                after_free.policy_arc_t2_chunks,
+                after_free.policy_arc_b1_chunks,
+                after_free.policy_arc_b2_chunks);
+        return fail("UFFD ARC pivot leaked ARC list membership");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_tinylfu_hotset_scan(void) {
+    return mode_uffd_pager_hotset_scan_policy("TinyLFU", 0, 1, 0, 0);
+}
+
+static int mode_uffd_pager_wtinylfu_hotset_scan(void) {
+    return mode_uffd_pager_hotset_scan_policy("W-TinyLFU", 0, 1, 1, 0);
+}
+
+static int mode_uffd_pager_bestoffset_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t offset_chunks = 16;
+    const size_t passes = 4;
+    const size_t pair_count = offset_chunks;
+    const size_t order[16] = {
+        5, 0, 11, 2, 14, 7, 1, 13,
+        4, 10, 3, 15, 6, 12, 8, 9
+    };
+    unsigned char expected[32] = {0};
+
+    if (units > sizeof(expected) || pair_count == 0 ||
+        pair_count != sizeof(order) / sizeof(order[0])) {
+        return fail("UFFD best-offset expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD best-offset test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for best-offset test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD best-offset allocation failed");
+    }
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t step = 0; step < pair_count; step++) {
+            size_t anchor = order[(step + pass) % pair_count];
+            expected[anchor]++;
+            ptr[anchor * unit] = expected[anchor];
+            if (ptr[anchor * unit] != expected[anchor]) {
+                free(ptr);
+                return fail("UFFD best-offset lost anchor data");
+            }
+            size_t target = anchor + offset_chunks;
+            expected[target]++;
+            ptr[target * unit] = expected[target];
+            if (ptr[target * unit] != expected[target]) {
+                free(ptr);
+                return fail("UFFD best-offset lost target data");
+            }
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD best-offset touches");
+    }
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD best-offset test did not exercise pager pressure");
+    }
+    size_t samples =
+        after_touch.policy_bestoffset_train_samples -
+        before.policy_bestoffset_train_samples;
+    size_t hits =
+        after_touch.policy_bestoffset_train_hits -
+        before.policy_bestoffset_train_hits;
+    size_t slots =
+        after_touch.policy_bestoffset_slots_created -
+        before.policy_bestoffset_slots_created;
+    size_t candidates =
+        after_touch.policy_bestoffset_candidates -
+        before.policy_bestoffset_candidates;
+    if (samples == 0 || hits == 0 || slots == 0 || candidates == 0 ||
+        after_touch.policy_bestoffset_top_score == 0 ||
+        after_touch.policy_bestoffset_top_offset_sign != 1 ||
+        after_touch.policy_bestoffset_top_offset_magnitude != offset_chunks) {
+        fprintf(stderr,
+                "best-offset stats: samples=%zu hits=%zu slots=%zu "
+                "candidates=%zu "
+                "top_score=%zu top_sign=%zu top_mag=%zu\n",
+                samples, hits, slots, candidates,
+                after_touch.policy_bestoffset_top_score,
+                after_touch.policy_bestoffset_top_offset_sign,
+                after_touch.policy_bestoffset_top_offset_magnitude);
+        free(ptr);
+        return fail("UFFD best-offset test did not exercise offset predictor");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD best-offset free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD best-offset allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_successor_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t passes = 4;
+    const size_t multiplier = 5;
+    const size_t addend = 3;
+    unsigned char expected[32] = {0};
+
+    if (units > sizeof(expected)) {
+        return fail("successor policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD successor policy test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for successor policy test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD successor policy allocation failed");
+    }
+    for (size_t pass = 0; pass < passes; pass++) {
+        size_t index = 0;
+        for (size_t step = 0; step < units; step++) {
+            expected[index]++;
+            ptr[index * unit] = expected[index];
+            if (ptr[index * unit] != expected[index]) {
+                free(ptr);
+                return fail("UFFD successor policy lost write data");
+            }
+            index = (multiplier * index + addend) % units;
+        }
+        index = 0;
+        for (size_t step = 0; step < units; step++) {
+            if (ptr[index * unit] != expected[index]) {
+                free(ptr);
+                return fail("UFFD successor policy lost read data");
+            }
+            index = (multiplier * index + addend) % units;
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD successor policy touches");
+    }
+    size_t prefetch_completed =
+        after_touch.policy_prefetch_completed - before.policy_prefetch_completed;
+    size_t prefetch_useful =
+        after_touch.policy_prefetch_useful - before.policy_prefetch_useful;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD successor policy did not exercise pager pressure");
+    }
+    if (prefetch_completed == 0 || prefetch_useful == 0) {
+        fprintf(stderr,
+                "successor policy prefetch stats: completed=%zu useful=%zu\n",
+                prefetch_completed, prefetch_useful);
+        free(ptr);
+        return fail("UFFD successor policy did not produce useful prefetches");
+    }
+    if (getenv("MAI_EXPECT_MARKOV_LEAD")) {
+        size_t lead_candidates =
+            after_touch.policy_markov_lead_candidates -
+            before.policy_markov_lead_candidates;
+        size_t lead_admitted =
+            after_touch.policy_markov_lead_admitted -
+            before.policy_markov_lead_admitted;
+        size_t lead_completed =
+            after_touch.policy_markov_lead_completed -
+            before.policy_markov_lead_completed;
+        size_t lead_useful =
+            after_touch.policy_markov_lead_useful -
+            before.policy_markov_lead_useful;
+        if (after_touch.policy_successor_chain_depth != 1 ||
+            lead_candidates == 0 || lead_admitted == 0 ||
+            lead_completed == 0 || lead_useful == 0) {
+            fprintf(stderr,
+                    "markov lead stats: candidates=%zu admitted=%zu "
+                    "completed=%zu useful=%zu depth=%zu\n",
+                    lead_candidates, lead_admitted, lead_completed,
+                    lead_useful, after_touch.policy_successor_chain_depth);
+            free(ptr);
+            return fail("UFFD Markov lead-ahead did not produce useful prefetches");
+        }
+    } else if (getenv("MAI_EXPECT_SUCCESSOR_CHAIN")) {
+        size_t chain_candidates =
+            after_touch.policy_successor_chain_candidates -
+            before.policy_successor_chain_candidates;
+        if (chain_candidates == 0 ||
+            after_touch.policy_successor_chain_depth < 2) {
+            fprintf(stderr,
+                    "successor chain stats: candidates=%zu depth=%zu\n",
+                    chain_candidates,
+                    after_touch.policy_successor_chain_depth);
+            free(ptr);
+            return fail("UFFD successor chain did not emit candidates");
+        }
+    } else if (after_touch.policy_successor_chain_depth != 1 ||
+               after_touch.policy_successor_chain_candidates !=
+                   before.policy_successor_chain_candidates) {
+        fprintf(stderr,
+                "successor default chain stats: candidates_before=%zu "
+                "candidates_after=%zu depth=%zu\n",
+                before.policy_successor_chain_candidates,
+                after_touch.policy_successor_chain_candidates,
+                after_touch.policy_successor_chain_depth);
+        free(ptr);
+        return fail("UFFD successor default depth did not preserve one-step behavior");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD successor policy free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD successor policy allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_signature_like_policy(const char* policy_name,
+                                                 int expect_hybrid_activity) {
+    static const size_t context_a[] = {0, 2, 3, 5, 7};
+    static const size_t context_b[] = {1, 4, 3, 6, 4};
+    const size_t context_len = sizeof(context_a) / sizeof(context_a[0]);
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t region_units = 8;
+    const size_t regions = size / unit / region_units;
+    const size_t passes = 6;
+    unsigned char expected[32] = {0};
+
+    if (regions * region_units > sizeof(expected)) {
+        return fail("signature-like policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD signature-like policy test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for signature-like policy test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD signature-like policy allocation failed");
+    }
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t region = 0; region < regions; region++) {
+            size_t base = region * region_units;
+            for (size_t context = 0; context < 2; context++) {
+                const size_t* pattern = ((pass + region + context) & 1u) == 0 ?
+                    context_a : context_b;
+                for (size_t pos = 0; pos < context_len; pos++) {
+                    size_t index = base + pattern[pos];
+                    expected[index]++;
+                    ptr[index * unit] = expected[index];
+                    if (ptr[index * unit] != expected[index]) {
+                        free(ptr);
+                        return fail("UFFD signature-like policy lost write data");
+                    }
+                }
+            }
+        }
+    }
+    for (size_t index = 0; index < regions * region_units; index++) {
+        if (ptr[index * unit] != expected[index]) {
+            free(ptr);
+            return fail("UFFD signature-like policy lost read data");
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD signature-like policy touches");
+    }
+    size_t train_samples =
+        after_touch.policy_signature_train_samples -
+        before.policy_signature_train_samples;
+    size_t train_hits =
+        after_touch.policy_signature_train_hits -
+        before.policy_signature_train_hits;
+    size_t slots_created =
+        after_touch.policy_signature_slots_created -
+        before.policy_signature_slots_created;
+    size_t candidates =
+        after_touch.policy_signature_candidates -
+        before.policy_signature_candidates;
+    size_t chain_candidates =
+        after_touch.policy_signature_chain_candidates -
+        before.policy_signature_chain_candidates;
+    size_t prefetch_completed =
+        after_touch.policy_prefetch_completed - before.policy_prefetch_completed;
+    size_t prefetch_useful =
+        after_touch.policy_prefetch_useful - before.policy_prefetch_useful;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD signature-like policy did not exercise pager pressure");
+    }
+    if (train_samples == 0 || train_hits == 0 || slots_created == 0 ||
+        candidates == 0 || chain_candidates == 0 ||
+        prefetch_completed == 0 || prefetch_useful == 0 ||
+        after_touch.policy_signature_chain_depth < 2 ||
+        after_touch.policy_signature_top_score == 0) {
+        fprintf(stderr,
+                "%s stats: train=%zu hits=%zu slots=%zu "
+                "candidates=%zu chain_candidates=%zu completed=%zu "
+                "useful=%zu depth=%zu top_score=%zu\n",
+                policy_name, train_samples, train_hits, slots_created, candidates,
+                chain_candidates, prefetch_completed, prefetch_useful,
+                after_touch.policy_signature_chain_depth,
+                after_touch.policy_signature_top_score);
+        free(ptr);
+        return fail("UFFD signature-like policy did not exercise signature predictor");
+    }
+    if (expect_hybrid_activity) {
+        size_t sketch_updates =
+            after_touch.policy_tinylfu_sketch_updates -
+            before.policy_tinylfu_sketch_updates;
+        size_t state_chunks =
+            after_touch.policy_wtinylfu_window_chunks +
+            after_touch.policy_wtinylfu_probation_chunks +
+            after_touch.policy_wtinylfu_protected_chunks;
+        size_t hybrid_candidates =
+            (after_touch.policy_hybrid_signature_candidates -
+             before.policy_hybrid_signature_candidates) +
+            (after_touch.policy_hybrid_successor_candidates -
+             before.policy_hybrid_successor_candidates) +
+            (after_touch.policy_hybrid_stream_candidates -
+             before.policy_hybrid_stream_candidates);
+        size_t hybrid_signature_candidates =
+            after_touch.policy_hybrid_signature_candidates -
+            before.policy_hybrid_signature_candidates;
+        size_t hybrid_rejected =
+            after_touch.policy_hybrid_admission_rejected -
+            before.policy_hybrid_admission_rejected;
+        if (sketch_updates == 0 || state_chunks == 0 ||
+            hybrid_candidates == 0 || hybrid_signature_candidates == 0 ||
+            hybrid_rejected == 0) {
+            fprintf(stderr,
+                    "hybrid stats: sketch_updates=%zu state_chunks=%zu "
+                    "hybrid_candidates=%zu signature_candidates=%zu "
+                    "hybrid_rejected=%zu\n",
+                    sketch_updates, state_chunks, hybrid_candidates,
+                    hybrid_signature_candidates, hybrid_rejected);
+            free(ptr);
+            return fail("UFFD hybrid policy did not exercise integrated policy");
+        }
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD signature-like policy free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD signature-like policy allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_signature_policy(void) {
+    return mode_uffd_pager_signature_like_policy("signature", 0);
+}
+
+static int mode_uffd_pager_hybrid_policy(void) {
+    return mode_uffd_pager_signature_like_policy("hybrid", 1);
+}
+
+static int mode_uffd_pager_hybrid_stream_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t passes = 6;
+    unsigned char expected[32] = {0};
+
+    if (units > sizeof(expected)) {
+        return fail("hybrid stream policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD hybrid stream test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for hybrid stream test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD hybrid stream allocation failed");
+    }
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t index = 0; index < units; index += 2) {
+            expected[index]++;
+            ptr[index * unit] = expected[index];
+            if (ptr[index * unit] != expected[index]) {
+                free(ptr);
+                return fail("UFFD hybrid stream lost write data");
+            }
+        }
+    }
+    for (size_t index = 0; index < units; index += 2) {
+        if (ptr[index * unit] != expected[index]) {
+            free(ptr);
+            return fail("UFFD hybrid stream lost read data");
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD hybrid stream touches");
+    }
+    size_t stream_candidates =
+        after_touch.policy_hybrid_stream_candidates -
+        before.policy_hybrid_stream_candidates;
+    size_t stream_admitted =
+        after_touch.policy_hybrid_stream_admitted -
+        before.policy_hybrid_stream_admitted;
+    size_t stream_completed =
+        after_touch.policy_hybrid_stream_completed -
+        before.policy_hybrid_stream_completed;
+    size_t stream_useful =
+        after_touch.policy_hybrid_stream_useful -
+        before.policy_hybrid_stream_useful;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD hybrid stream test did not exercise pager pressure");
+    }
+    if (stream_candidates == 0 || stream_admitted == 0 ||
+        stream_completed == 0 || stream_useful == 0) {
+        fprintf(stderr,
+                "hybrid stream stats: candidates=%zu admitted=%zu "
+                "completed=%zu useful=%zu\n",
+                stream_candidates, stream_admitted, stream_completed,
+                stream_useful);
+        free(ptr);
+        return fail("UFFD hybrid stream test did not exercise stream admission");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD hybrid stream free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD hybrid stream allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_hybrid_cohort_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t allocations = 3;
+    const size_t size = 16 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t passes = 4;
+    unsigned char* ptrs[3] = {0};
+    unsigned char expected[3][8] = {{0}};
+
+    if (allocations > 3 || units > 8) {
+        return fail("hybrid cohort policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD hybrid cohort test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for hybrid cohort test");
+    }
+
+    for (size_t allocation = 0; allocation < allocations; allocation++) {
+        ptrs[allocation] = malloc(size);
+        if (!ptrs[allocation]) {
+            for (size_t free_index = 0; free_index < allocation; free_index++) {
+                free(ptrs[free_index]);
+            }
+            return fail("UFFD hybrid cohort allocation failed");
+        }
+    }
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t index = 0; index < units; index++) {
+            for (size_t allocation = 0; allocation < allocations; allocation++) {
+                expected[allocation][index]++;
+                ptrs[allocation][index * unit] = expected[allocation][index];
+                if (ptrs[allocation][index * unit] !=
+                    expected[allocation][index]) {
+                    for (size_t free_index = 0; free_index < allocations;
+                         free_index++) {
+                        free(ptrs[free_index]);
+                    }
+                    return fail("UFFD hybrid cohort lost write data");
+                }
+            }
+        }
+    }
+    for (size_t allocation = 0; allocation < allocations; allocation++) {
+        for (size_t index = 0; index < units; index++) {
+            if (ptrs[allocation][index * unit] !=
+                expected[allocation][index]) {
+                for (size_t free_index = 0; free_index < allocations;
+                     free_index++) {
+                    free(ptrs[free_index]);
+                }
+                return fail("UFFD hybrid cohort lost read data");
+            }
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("mai_get_stats failed after UFFD hybrid cohort touches");
+    }
+    size_t cohort_candidates =
+        after_touch.policy_hybrid_cohort_candidates -
+        before.policy_hybrid_cohort_candidates;
+    size_t cohort_admitted =
+        after_touch.policy_hybrid_cohort_admitted -
+        before.policy_hybrid_cohort_admitted;
+    size_t cohort_completed =
+        after_touch.policy_hybrid_cohort_completed -
+        before.policy_hybrid_cohort_completed;
+    size_t cohort_useful =
+        after_touch.policy_hybrid_cohort_useful -
+        before.policy_hybrid_cohort_useful;
+    if (!stats_show_managed_alloc(&before, &after_touch,
+                                  allocations * size) ||
+        after_touch.uffd_pager_allocations <
+            before.uffd_pager_allocations + allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("UFFD hybrid cohort test did not exercise pager pressure");
+    }
+    if (cohort_candidates == 0 || cohort_admitted == 0 ||
+        cohort_completed == 0 || cohort_useful == 0) {
+        fprintf(stderr,
+                "hybrid cohort stats: candidates=%zu admitted=%zu "
+                "completed=%zu useful=%zu\n",
+                cohort_candidates, cohort_admitted, cohort_completed,
+                cohort_useful);
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("UFFD hybrid cohort test did not exercise cohort prefetch");
+    }
+
+    for (size_t allocation = 0; allocation < allocations; allocation++) {
+        free(ptrs[allocation]);
+    }
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD hybrid cohort free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD hybrid cohort allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_phase_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t allocations = 3;
+    const size_t size = 16 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t passes = 6;
+    unsigned char* ptrs[3] = {0};
+    unsigned char expected[3][8] = {{0}};
+
+    if (allocations > 3 || units > 8) {
+        return fail("phase policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD phase test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for phase test");
+    }
+
+    for (size_t allocation = 0; allocation < allocations; allocation++) {
+        ptrs[allocation] = malloc(size);
+        if (!ptrs[allocation]) {
+            for (size_t free_index = 0; free_index < allocation; free_index++) {
+                free(ptrs[free_index]);
+            }
+            return fail("UFFD phase allocation failed");
+        }
+    }
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t index = 0; index < units; index++) {
+            for (size_t allocation = 0; allocation < allocations; allocation++) {
+                expected[allocation][index]++;
+                ptrs[allocation][index * unit] = expected[allocation][index];
+                if (ptrs[allocation][index * unit] !=
+                    expected[allocation][index]) {
+                    for (size_t free_index = 0; free_index < allocations;
+                         free_index++) {
+                        free(ptrs[free_index]);
+                    }
+                    return fail("UFFD phase lost write data");
+                }
+            }
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("mai_get_stats failed after UFFD phase touches");
+    }
+    size_t phase_candidates =
+        after_touch.policy_phase_candidates - before.policy_phase_candidates;
+    size_t phase_admitted =
+        after_touch.policy_phase_admitted - before.policy_phase_admitted;
+    size_t phase_completed =
+        after_touch.policy_phase_completed - before.policy_phase_completed;
+    size_t phase_useful =
+        after_touch.policy_phase_useful - before.policy_phase_useful;
+    size_t phase_boundary =
+        after_touch.policy_phase_boundary_prefetches -
+        before.policy_phase_boundary_prefetches;
+    size_t phase_hold =
+        after_touch.policy_phase_hold_activations -
+        before.policy_phase_hold_activations;
+    size_t phase_shadow_candidates =
+        after_touch.policy_phase_shadow_candidates -
+        before.policy_phase_shadow_candidates;
+    size_t phase_shadow_useful =
+        after_touch.policy_phase_shadow_useful -
+        before.policy_phase_shadow_useful;
+    size_t phase_shadow_late =
+        after_touch.policy_phase_shadow_late -
+        before.policy_phase_shadow_late;
+    size_t phase_shadow_expired =
+        after_touch.policy_phase_shadow_expired -
+        before.policy_phase_shadow_expired;
+    size_t phase_shadow_overwritten =
+        after_touch.policy_phase_shadow_overwritten -
+        before.policy_phase_shadow_overwritten;
+    size_t phase_shadow_probe_candidates =
+        after_touch.policy_phase_shadow_probe_candidates -
+        before.policy_phase_shadow_probe_candidates;
+    size_t phase_shadow_edge_rejected =
+        after_touch.policy_phase_shadow_edge_rejected -
+        before.policy_phase_shadow_edge_rejected;
+    size_t phase_shadow_edge_confirmed =
+        after_touch.policy_phase_shadow_edge_confirmed -
+        before.policy_phase_shadow_edge_confirmed;
+    size_t phase_shadow_max_late = after_touch.policy_phase_shadow_max_late;
+    const char* boundary_only =
+        getenv("MAI_POLICY_PHASE_PREFETCH_BOUNDARY_ONLY");
+    const char* shadow_probe_chunks_env =
+        getenv("MAI_POLICY_PHASE_SHADOW_PROBE_CHUNKS");
+    const char* shadow_probe_min_late_env =
+        getenv("MAI_POLICY_PHASE_SHADOW_PROBE_MIN_LATE");
+    const char* migration_policy_env = getenv("MAI_MIGRATION_POLICY");
+    const char* phase_prefetch_env = getenv("MAI_POLICY_PHASE_PREFETCH");
+    int boundary_only_enabled =
+        boundary_only &&
+        (strcmp(boundary_only, "1") == 0 ||
+         strcmp(boundary_only, "true") == 0 ||
+         strcmp(boundary_only, "yes") == 0 ||
+         strcmp(boundary_only, "on") == 0);
+    int shadow_probe_enabled =
+        shadow_probe_chunks_env && shadow_probe_chunks_env[0] != '\0' &&
+        strcmp(shadow_probe_chunks_env, "0") != 0;
+    size_t shadow_probe_min_late = 0;
+    if (shadow_probe_min_late_env) {
+        shadow_probe_min_late = (size_t)strtoull(shadow_probe_min_late_env,
+                                                 NULL, 10);
+    }
+    int markov_phase_hold_only =
+        migration_policy_env &&
+        (strcmp(migration_policy_env, "markov_phase") == 0 ||
+         strcmp(migration_policy_env, "markov-phase") == 0 ||
+         strcmp(migration_policy_env, "phase_hold_markov") == 0 ||
+         strcmp(migration_policy_env, "phase-hold-markov") == 0) &&
+        !phase_prefetch_env;
+    if (!stats_show_managed_alloc(&before, &after_touch,
+                                  allocations * size) ||
+        after_touch.uffd_pager_allocations <
+            before.uffd_pager_allocations + allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("UFFD phase test did not exercise pager pressure");
+    }
+    if (markov_phase_hold_only) {
+        if (phase_candidates != 0 || phase_admitted != 0 ||
+            phase_completed != 0 || phase_hold == 0) {
+            fprintf(stderr,
+                    "markov phase stats: candidates=%zu admitted=%zu "
+                    "completed=%zu hold=%zu\n",
+                    phase_candidates, phase_admitted, phase_completed,
+                    phase_hold);
+            for (size_t allocation = 0; allocation < allocations; allocation++) {
+                free(ptrs[allocation]);
+            }
+            return fail("UFFD markov-phase default should hold without phase prefetch");
+        }
+    } else if (phase_candidates == 0 || phase_admitted == 0 ||
+               phase_completed == 0 ||
+               (!boundary_only_enabled && phase_useful == 0)) {
+        fprintf(stderr,
+                "phase stats: candidates=%zu admitted=%zu "
+                "completed=%zu useful=%zu conflicts=%zu\n",
+                phase_candidates, phase_admitted, phase_completed,
+                phase_useful,
+                after_touch.policy_phase_conflicts -
+                    before.policy_phase_conflicts);
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("UFFD phase policy did not produce useful prefetches");
+    }
+    if (boundary_only_enabled && !shadow_probe_enabled &&
+        (phase_boundary == 0 || phase_boundary != phase_admitted)) {
+        fprintf(stderr,
+                "phase boundary stats: boundary=%zu admitted=%zu\n",
+                phase_boundary, phase_admitted);
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("UFFD boundary phase policy admitted non-boundary prefetches");
+    }
+    if (boundary_only_enabled && shadow_probe_enabled &&
+        phase_boundary == 0) {
+        fprintf(stderr,
+                "phase probe stats: boundary=%zu admitted=%zu probe=%zu\n",
+                phase_boundary, phase_admitted,
+                phase_shadow_probe_candidates);
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("UFFD phase probe test lost boundary admissions");
+    }
+    if (boundary_only_enabled &&
+        (phase_shadow_candidates == 0 || phase_shadow_useful == 0 ||
+         phase_shadow_late == 0 ||
+         phase_shadow_useful + phase_shadow_expired >
+             phase_shadow_candidates ||
+         phase_shadow_overwritten > phase_shadow_candidates)) {
+        fprintf(stderr,
+                "phase shadow stats: candidates=%zu useful=%zu "
+                "late=%zu expired=%zu\n",
+                phase_shadow_candidates, phase_shadow_useful,
+                phase_shadow_late, phase_shadow_expired);
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("UFFD boundary phase policy shadow telemetry is incomplete");
+    }
+    if (boundary_only_enabled && shadow_probe_enabled &&
+        shadow_probe_min_late != 0 &&
+        (phase_shadow_edge_rejected == 0 ||
+         phase_shadow_edge_confirmed == 0 ||
+         phase_shadow_max_late < shadow_probe_min_late)) {
+        fprintf(stderr,
+                "phase edge probe stats: probe=%zu edge_rejected=%zu "
+                "edge_confirmed=%zu max_late=%zu min_late=%zu\n",
+                phase_shadow_probe_candidates, phase_shadow_edge_rejected,
+                phase_shadow_edge_confirmed, phase_shadow_max_late,
+                shadow_probe_min_late);
+        for (size_t allocation = 0; allocation < allocations; allocation++) {
+            free(ptrs[allocation]);
+        }
+        return fail("UFFD edge-confirmed phase probe telemetry is incomplete");
+    }
+
+    for (size_t allocation = 0; allocation < allocations; allocation++) {
+        free(ptrs[allocation]);
+    }
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD phase free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD phase allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_hinted_policy(void) {
+    hint_range_fn hint_range =
+        (hint_range_fn)dlsym(RTLD_DEFAULT, "mai_hint_range");
+    if (!hint_range) {
+        return fail("mai_hint_range symbol unavailable for UFFD hinted test");
+    }
+
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t resident_limit = 16 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t passes = 3;
+    unsigned char expected[16] = {0};
+
+    if (units > sizeof(expected)) {
+        return fail("hinted policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD hinted test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for hinted test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD hinted allocation failed");
+    }
+
+    MaiHintOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.size = sizeof(opts);
+    opts.window_bytes = 8 * 1024 * 1024;
+    if (hint_range(ptr, size, MAI_HINT_SEQUENTIAL, &opts) != 0) {
+        free(ptr);
+        return fail("mai_hint_range rejected managed UFFD hinted range");
+    }
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t index = 0; index < units; index++) {
+            expected[index]++;
+            ptr[index * unit] = expected[index];
+            if (ptr[index * unit] != expected[index]) {
+                free(ptr);
+                return fail("UFFD hinted lost write data");
+            }
+        }
+        for (size_t index = 0; index < units; index++) {
+            if (ptr[index * unit] != expected[index]) {
+                free(ptr);
+                return fail("UFFD hinted lost read data");
+            }
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD hinted touches");
+    }
+    size_t hint_candidates =
+        after_touch.policy_hint_candidates - before.policy_hint_candidates;
+    size_t hint_admitted =
+        after_touch.policy_hint_admitted - before.policy_hint_admitted;
+    size_t hint_completed =
+        after_touch.policy_hint_completed - before.policy_hint_completed;
+    size_t hint_useful =
+        after_touch.policy_hint_useful - before.policy_hint_useful;
+    size_t hint_rejected =
+        after_touch.policy_hint_rejected - before.policy_hint_rejected;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <
+            before.uffd_pager_allocations + 1 ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD hinted test did not exercise pager pressure");
+    }
+    if (after_touch.uffd_resident_bytes > resident_limit) {
+        fprintf(stderr,
+                "hinted resident above limit: resident=%zu limit=%zu\n",
+                after_touch.uffd_resident_bytes, resident_limit);
+        free(ptr);
+        return fail("UFFD hinted policy exceeded resident limit");
+    }
+    if (hint_candidates == 0 || hint_admitted == 0 ||
+        hint_completed == 0 || hint_useful == 0 || hint_rejected == 0) {
+        fprintf(stderr,
+                "hint stats: candidates=%zu admitted=%zu "
+                "completed=%zu useful=%zu rejected=%zu\n",
+                hint_candidates, hint_admitted, hint_completed, hint_useful,
+                hint_rejected);
+        free(ptr);
+        return fail("UFFD hinted policy did not produce useful prefetches");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD hinted free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD hinted allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_hybrid_cross_record_cohort_policy_impl(
+    int expect_async) {
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t delta = 8;
+    const size_t train_indices[] = {0, 5, 2, 7, 1};
+    const size_t train_len = sizeof(train_indices) / sizeof(train_indices[0]);
+    const size_t trigger_index = 3;
+    const size_t target_index = trigger_index + delta;
+    MaiStats before;
+    MaiStats before_trigger;
+    MaiStats after_prefetch;
+    MaiStats after_use;
+    MaiStats after_free;
+    unsigned char expected_a[16] = {0};
+    unsigned char expected_b[16] = {0};
+
+    if (units > sizeof(expected_a) || units > sizeof(expected_b) ||
+        target_index >= units) {
+        return fail("hybrid cross-record cohort expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD hybrid cross-record cohort test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for hybrid cross-record cohort test");
+    }
+
+    unsigned char* a = malloc(size);
+    unsigned char* b = malloc(size);
+    if (!a || !b) {
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort allocation failed");
+    }
+
+    for (size_t i = 0; i < train_len; i++) {
+        size_t source = train_indices[i];
+        size_t target = source + delta;
+        expected_a[source]++;
+        a[source * unit] = expected_a[source];
+        if (a[source * unit] != expected_a[source]) {
+            free(a);
+            free(b);
+            return fail("UFFD hybrid cross-record cohort lost A training data");
+        }
+        expected_b[target]++;
+        b[target * unit] = expected_b[target];
+        if (b[target * unit] != expected_b[target]) {
+            free(a);
+            free(b);
+            return fail("UFFD hybrid cross-record cohort lost B training data");
+        }
+    }
+
+    if (load_stats(&before_trigger) != 0) {
+        free(a);
+        free(b);
+        return fail("mai_get_stats failed before UFFD hybrid cross-record trigger");
+    }
+
+    expected_a[trigger_index]++;
+    a[trigger_index * unit] = expected_a[trigger_index];
+    if (a[trigger_index * unit] != expected_a[trigger_index]) {
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort lost A trigger data");
+    }
+    for (size_t wait = 0; wait < 200; wait++) {
+        if (load_stats(&after_prefetch) != 0) {
+            free(a);
+            free(b);
+            return fail("mai_get_stats failed after UFFD hybrid cross-record trigger");
+        }
+        size_t completed =
+            after_prefetch.policy_hybrid_cohort_completed -
+            before_trigger.policy_hybrid_cohort_completed;
+        size_t async_completed =
+            after_prefetch.policy_async_prefetch_completed -
+            before_trigger.policy_async_prefetch_completed;
+        if (completed >= 1 && (!expect_async || async_completed >= 1)) {
+            break;
+        }
+        usleep(1000);
+    }
+
+    size_t cohort_candidates =
+        after_prefetch.policy_hybrid_cohort_candidates -
+        before_trigger.policy_hybrid_cohort_candidates;
+    size_t cohort_admitted =
+        after_prefetch.policy_hybrid_cohort_admitted -
+        before_trigger.policy_hybrid_cohort_admitted;
+    size_t cohort_completed =
+        after_prefetch.policy_hybrid_cohort_completed -
+        before_trigger.policy_hybrid_cohort_completed;
+    size_t prefetch_requests =
+        after_prefetch.policy_prefetch_requests -
+        before_trigger.policy_prefetch_requests;
+    size_t prefetch_admitted =
+        after_prefetch.policy_prefetch_admitted -
+        before_trigger.policy_prefetch_admitted;
+    size_t prefetch_completed =
+        after_prefetch.policy_prefetch_completed -
+        before_trigger.policy_prefetch_completed;
+    size_t async_enqueued =
+        after_prefetch.policy_async_prefetch_enqueued -
+        before_trigger.policy_async_prefetch_enqueued;
+    size_t async_completed =
+        after_prefetch.policy_async_prefetch_completed -
+        before_trigger.policy_async_prefetch_completed;
+    if (cohort_candidates != 1 || cohort_admitted != 1 ||
+        cohort_completed != 1 || prefetch_requests < 1 ||
+        prefetch_admitted != 1 || prefetch_completed != 1) {
+        fprintf(stderr,
+                "hybrid cross-record cohort prefetch stats: "
+                "cohort candidates=%zu admitted=%zu completed=%zu "
+                "prefetch requests=%zu admitted=%zu completed=%zu\n",
+                cohort_candidates, cohort_admitted, cohort_completed,
+                prefetch_requests, prefetch_admitted, prefetch_completed);
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort did not prefetch target chunk");
+    }
+    if (expect_async && (async_enqueued == 0 || async_completed == 0)) {
+        fprintf(stderr,
+                "hybrid cross-record async stats: enqueued=%zu completed=%zu\n",
+                async_enqueued, async_completed);
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort did not run asynchronously");
+    }
+
+    expected_b[target_index]++;
+    b[target_index * unit] = expected_b[target_index];
+    if (b[target_index * unit] != expected_b[target_index]) {
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort lost prefetched B data");
+    }
+    if (load_stats(&after_use) != 0) {
+        free(a);
+        free(b);
+        return fail("mai_get_stats failed after UFFD hybrid cross-record use");
+    }
+    size_t cohort_useful =
+        after_use.policy_hybrid_cohort_useful -
+        after_prefetch.policy_hybrid_cohort_useful;
+    size_t prefetch_useful =
+        after_use.policy_prefetch_useful -
+        after_prefetch.policy_prefetch_useful;
+    size_t useful_bytes =
+        after_use.policy_prefetch_useful_bytes -
+        after_prefetch.policy_prefetch_useful_bytes;
+    if (cohort_useful != 1 || prefetch_useful != 1 ||
+        useful_bytes < unit) {
+        fprintf(stderr,
+                "hybrid cross-record cohort useful stats: "
+                "cohort=%zu prefetch=%zu useful_bytes=%zu\n",
+                cohort_useful, prefetch_useful, useful_bytes);
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort prefetch was not useful");
+    }
+    if (!stats_show_managed_alloc(&before, &after_use, size * 2) ||
+        after_use.uffd_pager_allocations <
+            before.uffd_pager_allocations + 2 ||
+        after_use.uffd_faults <= before.uffd_faults) {
+        free(a);
+        free(b);
+        return fail("UFFD hybrid cross-record cohort test did not exercise pager");
+    }
+
+    free(a);
+    free(b);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD hybrid cross-record cohort free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD hybrid cross-record cohort allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_hybrid_cross_record_cohort_policy(void) {
+    return mode_uffd_pager_hybrid_cross_record_cohort_policy_impl(0);
+}
+
+static int mode_uffd_pager_hybrid_cross_record_cohort_async_policy(void) {
+    return mode_uffd_pager_hybrid_cross_record_cohort_policy_impl(1);
+}
+
+static int mode_uffd_pager_markov_cohort_pressure_cold_start_policy(void) {
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t delta = 8;
+    const size_t resident_low = 10 * 1024 * 1024;
+    const size_t train_indices[] = {0, 5, 2};
+    const size_t train_len = sizeof(train_indices) / sizeof(train_indices[0]);
+    const size_t trigger_index = 3;
+    const size_t target_index = trigger_index + delta;
+    MaiStats before;
+    MaiStats before_trigger;
+    MaiStats after_prefetch;
+    MaiStats after_use;
+    MaiStats after_free;
+    unsigned char expected_a[16] = {0};
+    unsigned char expected_b[16] = {0};
+
+    if (units > sizeof(expected_a) || units > sizeof(expected_b) ||
+        target_index >= units) {
+        return fail("markov-cohort cold-start expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before markov-cohort cold-start test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for markov-cohort cold-start test");
+    }
+
+    unsigned char* a = malloc(size);
+    unsigned char* b = malloc(size);
+    if (!a || !b) {
+        free(a);
+        free(b);
+        return fail("markov-cohort cold-start allocation failed");
+    }
+
+    for (size_t i = 0; i < train_len; i++) {
+        size_t source = train_indices[i];
+        size_t target = source + delta;
+        expected_a[source]++;
+        a[source * unit] = expected_a[source];
+        if (a[source * unit] != expected_a[source]) {
+            free(a);
+            free(b);
+            return fail("markov-cohort cold-start lost A training data");
+        }
+        expected_b[target]++;
+        b[target * unit] = expected_b[target];
+        if (b[target * unit] != expected_b[target]) {
+            free(a);
+            free(b);
+            return fail("markov-cohort cold-start lost B training data");
+        }
+    }
+
+    if (load_stats(&before_trigger) != 0) {
+        free(a);
+        free(b);
+        return fail("mai_get_stats failed before markov-cohort cold-start trigger");
+    }
+    size_t prior_candidates =
+        before_trigger.policy_hybrid_cohort_candidates -
+        before.policy_hybrid_cohort_candidates;
+    size_t prior_admitted =
+        before_trigger.policy_hybrid_cohort_admitted -
+        before.policy_hybrid_cohort_admitted;
+    size_t prior_completed =
+        before_trigger.policy_hybrid_cohort_completed -
+        before.policy_hybrid_cohort_completed;
+    size_t prior_useful =
+        before_trigger.policy_hybrid_cohort_useful -
+        before.policy_hybrid_cohort_useful;
+    if (prior_candidates != 0 || prior_admitted != 0 ||
+        prior_completed != 0 || prior_useful != 0) {
+        fprintf(stderr,
+                "markov-cohort cold-start prior stats: candidates=%zu "
+                "admitted=%zu completed=%zu useful=%zu\n",
+                prior_candidates, prior_admitted, prior_completed,
+                prior_useful);
+        free(a);
+        free(b);
+        return fail("markov-cohort cold-start fired before the trigger");
+    }
+    if (before_trigger.uffd_resident_bytes < resident_low) {
+        fprintf(stderr,
+                "markov-cohort cold-start resident bytes=%zu low=%zu\n",
+                before_trigger.uffd_resident_bytes, resident_low);
+        free(a);
+        free(b);
+        return fail("markov-cohort cold-start did not reach low pressure");
+    }
+
+    expected_a[trigger_index]++;
+    a[trigger_index * unit] = expected_a[trigger_index];
+    if (a[trigger_index * unit] != expected_a[trigger_index]) {
+        free(a);
+        free(b);
+        return fail("markov-cohort cold-start lost A trigger data");
+    }
+    for (size_t wait = 0; wait < 200; wait++) {
+        if (load_stats(&after_prefetch) != 0) {
+            free(a);
+            free(b);
+            return fail("mai_get_stats failed after markov-cohort cold-start trigger");
+        }
+        size_t completed =
+            after_prefetch.policy_hybrid_cohort_completed -
+            before_trigger.policy_hybrid_cohort_completed;
+        if (completed >= 1) {
+            break;
+        }
+        usleep(1000);
+    }
+
+    size_t cohort_candidates =
+        after_prefetch.policy_hybrid_cohort_candidates -
+        before_trigger.policy_hybrid_cohort_candidates;
+    size_t cohort_admitted =
+        after_prefetch.policy_hybrid_cohort_admitted -
+        before_trigger.policy_hybrid_cohort_admitted;
+    size_t cohort_completed =
+        after_prefetch.policy_hybrid_cohort_completed -
+        before_trigger.policy_hybrid_cohort_completed;
+    if (cohort_candidates != 1 || cohort_admitted != 1 ||
+        cohort_completed != 1) {
+        fprintf(stderr,
+                "markov-cohort cold-start stats: candidates=%zu "
+                "admitted=%zu completed=%zu\n",
+                cohort_candidates, cohort_admitted, cohort_completed);
+        free(a);
+        free(b);
+        return fail("markov-cohort cold-start did not admit first pressured seed");
+    }
+
+    expected_b[target_index]++;
+    b[target_index * unit] = expected_b[target_index];
+    if (b[target_index * unit] != expected_b[target_index]) {
+        free(a);
+        free(b);
+        return fail("markov-cohort cold-start lost prefetched B data");
+    }
+    if (load_stats(&after_use) != 0) {
+        free(a);
+        free(b);
+        return fail("mai_get_stats failed after markov-cohort cold-start use");
+    }
+    size_t cohort_useful =
+        after_use.policy_hybrid_cohort_useful -
+        after_prefetch.policy_hybrid_cohort_useful;
+    size_t prefetch_useful =
+        after_use.policy_prefetch_useful -
+        after_prefetch.policy_prefetch_useful;
+    if (cohort_useful != 1 || prefetch_useful != 1) {
+        fprintf(stderr,
+                "markov-cohort cold-start useful stats: cohort=%zu "
+                "prefetch=%zu\n",
+                cohort_useful, prefetch_useful);
+        free(a);
+        free(b);
+        return fail("markov-cohort cold-start prefetch was not useful");
+    }
+    if (!stats_show_managed_alloc(&before, &after_use, size * 2) ||
+        after_use.uffd_pager_allocations <
+            before.uffd_pager_allocations + 2 ||
+        after_use.uffd_faults <= before.uffd_faults) {
+        free(a);
+        free(b);
+        return fail("markov-cohort cold-start did not exercise pager");
+    }
+
+    free(a);
+    free(b);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after markov-cohort cold-start free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("markov-cohort cold-start leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_markov_cohort_free_releases_lease(void) {
+    const size_t size = 32 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t units = size / unit;
+    const size_t delta = 8;
+    const size_t train_first[] = {0, 5, 2};
+    const size_t train_second[] = {0, 5, 2, 1};
+    const size_t first_len = sizeof(train_first) / sizeof(train_first[0]);
+    const size_t second_len = sizeof(train_second) / sizeof(train_second[0]);
+    const size_t trigger_index = 3;
+    MaiStats before;
+    MaiStats before_first_trigger;
+    MaiStats after_first_prefetch;
+    MaiStats after_release;
+    MaiStats after_second_prefetch;
+    MaiStats after_free;
+    unsigned char expected_a[16] = {0};
+    unsigned char expected_b[16] = {0};
+    unsigned char expected_c[16] = {0};
+    unsigned char expected_d[16] = {0};
+
+    if (units > sizeof(expected_a) || units > sizeof(expected_b) ||
+        units > sizeof(expected_c) || units > sizeof(expected_d) ||
+        trigger_index + delta >= units) {
+        return fail("markov-cohort free-release expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before markov-cohort free-release test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for markov-cohort free-release test");
+    }
+
+    unsigned char* a = malloc(size);
+    unsigned char* b = malloc(size);
+    if (!a || !b) {
+        free(a);
+        free(b);
+        return fail("markov-cohort free-release first allocation failed");
+    }
+    for (size_t i = 0; i < first_len; i++) {
+        size_t source = train_first[i];
+        size_t target = source + delta;
+        expected_a[source]++;
+        a[source * unit] = expected_a[source];
+        if (a[source * unit] != expected_a[source]) {
+            free(a);
+            free(b);
+            return fail("markov-cohort free-release lost A training data");
+        }
+        expected_b[target]++;
+        b[target * unit] = expected_b[target];
+        if (b[target * unit] != expected_b[target]) {
+            free(a);
+            free(b);
+            return fail("markov-cohort free-release lost B training data");
+        }
+    }
+    if (load_stats(&before_first_trigger) != 0) {
+        free(a);
+        free(b);
+        return fail("mai_get_stats failed before markov-cohort first trigger");
+    }
+    expected_a[trigger_index]++;
+    a[trigger_index * unit] = expected_a[trigger_index];
+    if (a[trigger_index * unit] != expected_a[trigger_index]) {
+        free(a);
+        free(b);
+        return fail("markov-cohort free-release lost A trigger data");
+    }
+    for (size_t wait = 0; wait < 200; wait++) {
+        if (load_stats(&after_first_prefetch) != 0) {
+            free(a);
+            free(b);
+            return fail("mai_get_stats failed after markov-cohort first trigger");
+        }
+        size_t completed =
+            after_first_prefetch.policy_hybrid_cohort_completed -
+            before_first_trigger.policy_hybrid_cohort_completed;
+        if (completed >= 1) {
+            break;
+        }
+        usleep(1000);
+    }
+    size_t first_completed =
+        after_first_prefetch.policy_hybrid_cohort_completed -
+        before_first_trigger.policy_hybrid_cohort_completed;
+    if (first_completed == 0) {
+        free(a);
+        free(b);
+        return fail("markov-cohort free-release did not create first lease");
+    }
+
+    free(b);
+    free(a);
+    if (load_stats(&after_release) != 0) {
+        return fail("mai_get_stats failed after markov-cohort first free");
+    }
+
+    unsigned char* c = malloc(size);
+    unsigned char* d = malloc(size);
+    if (!c || !d) {
+        free(c);
+        free(d);
+        return fail("markov-cohort free-release second allocation failed");
+    }
+    for (size_t i = 0; i < second_len; i++) {
+        size_t source = train_second[i];
+        size_t target = source + delta;
+        expected_c[source]++;
+        c[source * unit] = expected_c[source];
+        if (c[source * unit] != expected_c[source]) {
+            free(c);
+            free(d);
+            return fail("markov-cohort free-release lost C training data");
+        }
+        expected_d[target]++;
+        d[target * unit] = expected_d[target];
+        if (d[target * unit] != expected_d[target]) {
+            free(c);
+            free(d);
+            return fail("markov-cohort free-release lost D training data");
+        }
+    }
+    expected_c[trigger_index]++;
+    c[trigger_index * unit] = expected_c[trigger_index];
+    if (c[trigger_index * unit] != expected_c[trigger_index]) {
+        free(c);
+        free(d);
+        return fail("markov-cohort free-release lost C trigger data");
+    }
+    for (size_t wait = 0; wait < 200; wait++) {
+        if (load_stats(&after_second_prefetch) != 0) {
+            free(c);
+            free(d);
+            return fail("mai_get_stats failed after markov-cohort second trigger");
+        }
+        size_t completed =
+            after_second_prefetch.policy_hybrid_cohort_completed -
+            after_release.policy_hybrid_cohort_completed;
+        if (completed >= 1) {
+            break;
+        }
+        usleep(1000);
+    }
+    size_t second_candidates =
+        after_second_prefetch.policy_hybrid_cohort_candidates -
+        after_release.policy_hybrid_cohort_candidates;
+    size_t second_admitted =
+        after_second_prefetch.policy_hybrid_cohort_admitted -
+        after_release.policy_hybrid_cohort_admitted;
+    size_t second_completed =
+        after_second_prefetch.policy_hybrid_cohort_completed -
+        after_release.policy_hybrid_cohort_completed;
+    if (second_candidates == 0 || second_admitted == 0 ||
+        second_completed == 0) {
+        fprintf(stderr,
+                "markov-cohort free-release second stats: "
+                "candidates=%zu admitted=%zu completed=%zu\n",
+                second_candidates, second_admitted, second_completed);
+        free(c);
+        free(d);
+        return fail("markov-cohort free-before-use lease suppressed later prefetch");
+    }
+
+    free(c);
+    free(d);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after markov-cohort free-release free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("markov-cohort free-release leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_hybrid_default_low_window(void) {
+    MaiStats before;
+    MaiStats before_trigger;
+    MaiStats after_trigger;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    unsigned char expected[32] = {0};
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD hybrid default-low test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for hybrid default-low test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD hybrid default-low allocation failed");
+    }
+    for (size_t index = 0; index < 3; index++) {
+        size_t unit_index = index * 2;
+        expected[unit_index]++;
+        ptr[unit_index * unit] = expected[unit_index];
+        if (ptr[unit_index * unit] != expected[unit_index]) {
+            free(ptr);
+            return fail("UFFD hybrid default-low lost warmup data");
+        }
+    }
+    if (load_stats(&before_trigger) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed before hybrid default-low trigger");
+    }
+
+    size_t trigger_unit = 6;
+    expected[trigger_unit]++;
+    ptr[trigger_unit * unit] = expected[trigger_unit];
+    if (ptr[trigger_unit * unit] != expected[trigger_unit]) {
+        free(ptr);
+        return fail("UFFD hybrid default-low lost trigger data");
+    }
+    if (load_stats(&after_trigger) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after hybrid default-low trigger");
+    }
+
+    size_t stream_admitted =
+        after_trigger.policy_hybrid_stream_admitted -
+        before_trigger.policy_hybrid_stream_admitted;
+    size_t stream_completed =
+        after_trigger.policy_hybrid_stream_completed -
+        before_trigger.policy_hybrid_stream_completed;
+    size_t total_admitted =
+        after_trigger.policy_prefetch_admitted -
+        before_trigger.policy_prefetch_admitted;
+    size_t total_completed =
+        after_trigger.policy_prefetch_completed -
+        before_trigger.policy_prefetch_completed;
+    if (total_admitted < 2 || total_completed < 2) {
+        fprintf(stderr,
+                "hybrid default-low window stats: total_admitted=%zu "
+                "total_completed=%zu stream_admitted=%zu "
+                "stream_completed=%zu resident=%zu\n",
+                total_admitted, total_completed,
+                stream_admitted, stream_completed,
+                after_trigger.uffd_resident_bytes);
+        free(ptr);
+        return fail("UFFD hybrid default-low test did not emit multi-candidate window");
+    }
+    if (after_trigger.uffd_resident_bytes >= after_trigger.max_rss) {
+        free(ptr);
+        return fail("UFFD hybrid default-low trigger unexpectedly reached RSS cap");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD hybrid default-low free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD hybrid default-low allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static size_t runtime_spatial_offset(size_t position, size_t pass,
+                                     size_t region, int mixed_masks) {
+    static const size_t offsets_a[] = {0, 3, 5};
+    static const size_t offsets_b[] = {1, 4, 7};
+    const size_t* offsets = offsets_a;
+    size_t count = sizeof(offsets_a) / sizeof(offsets_a[0]);
+    if (mixed_masks && (region & 1u) != 0) {
+        offsets = offsets_b;
+    }
+    size_t rotated = (position + pass + region) % count;
+    if (((pass + region) & 1u) != 0) {
+        rotated = count - 1 - rotated;
+    }
+    return offsets[rotated];
+}
+
+static int mode_uffd_pager_spatial_mask_policy(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 2 * 1024 * 1024;
+    const size_t region_units = 8;
+    const size_t mask_units = 3;
+    const size_t units = size / unit;
+    const size_t regions = units / region_units;
+    const size_t passes = 4;
+    const size_t logical_touches = passes * regions * mask_units * 2;
+    unsigned char expected[32] = {0};
+
+    if (units > sizeof(expected) || units % region_units != 0) {
+        return fail("spatial policy expected array is too small");
+    }
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD spatial policy test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for spatial policy test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD spatial policy allocation failed");
+    }
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t position = 0; position < mask_units; position++) {
+            for (size_t region = 0; region < regions; region++) {
+                size_t region_base = region * region_units;
+                size_t index = region_base +
+                    runtime_spatial_offset(position, pass, region, 1);
+                expected[index]++;
+                ptr[index * unit] = expected[index];
+                if (ptr[index * unit] != expected[index]) {
+                    free(ptr);
+                    return fail("UFFD spatial policy lost write data");
+                }
+            }
+        }
+        for (size_t position = 0; position < mask_units; position++) {
+            for (size_t region = 0; region < regions; region++) {
+                size_t region_base = region * region_units;
+                size_t index = region_base +
+                    runtime_spatial_offset(position, pass + 1, region, 1);
+                if (ptr[index * unit] != expected[index]) {
+                    free(ptr);
+                    return fail("UFFD spatial policy lost read data");
+                }
+            }
+        }
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD spatial policy touches");
+    }
+    size_t prefetch_completed =
+        after_touch.policy_prefetch_completed - before.policy_prefetch_completed;
+    size_t prefetch_useful =
+        after_touch.policy_prefetch_useful - before.policy_prefetch_useful;
+    size_t demand_faults =
+        after_touch.policy_demand_faults - before.policy_demand_faults;
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_touch.uffd_evictions <= before.uffd_evictions) {
+        free(ptr);
+        return fail("UFFD spatial policy did not exercise pager pressure");
+    }
+    if (prefetch_completed == 0) {
+        fprintf(stderr,
+                "spatial policy prefetch stats: completed=%zu useful=%zu\n",
+                prefetch_completed, prefetch_useful);
+        free(ptr);
+        return fail("UFFD spatial policy did not prefetch learned regions");
+    }
+    if (demand_faults >= logical_touches) {
+        fprintf(stderr,
+                "spatial policy demand faults: faults=%zu touches=%zu\n",
+                demand_faults, logical_touches);
+        free(ptr);
+        return fail("UFFD spatial policy did not reduce demand faults");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD spatial policy free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD spatial policy allocation leaked managed or resident bytes");
     }
     return 0;
 }
@@ -3088,6 +6432,102 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_spatial_prefetch") == 0) {
         return mode_uffd_pager_spatial_prefetch();
+    }
+    if (strcmp(argv[1], "uffd_pager_async_prefetch") == 0) {
+        return mode_uffd_pager_async_prefetch();
+    }
+    if (strcmp(argv[1], "uffd_pager_async_queue_saturation_no_sync_prefetch") == 0) {
+        return mode_uffd_pager_async_queue_saturation_no_sync_prefetch();
+    }
+    if (strcmp(argv[1], "uffd_pager_record_protect_policy") == 0) {
+        return mode_uffd_pager_record_protect_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_active_record_policy") == 0) {
+        return mode_uffd_pager_active_record_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_active_record_prefetch_guard") == 0) {
+        return mode_uffd_pager_active_record_prefetch_guard();
+    }
+    if (strcmp(argv[1], "uffd_pager_adaptive_policy_throttle") == 0) {
+        return mode_uffd_pager_adaptive_policy_throttle();
+    }
+    if (strcmp(argv[1], "uffd_pager_adaptive_legacy_noop") == 0) {
+        return mode_uffd_pager_adaptive_legacy_noop();
+    }
+    if (strcmp(argv[1], "uffd_pager_clean_shadow_skip") == 0) {
+        return mode_uffd_pager_clean_shadow_skip();
+    }
+    if (strcmp(argv[1], "uffd_pager_clean_shadow_dirty") == 0) {
+        return mode_uffd_pager_clean_shadow_dirty();
+    }
+    if (strcmp(argv[1], "uffd_pager_clean_shadow_fallback") == 0) {
+        return mode_uffd_pager_clean_shadow_fallback();
+    }
+    if (strcmp(argv[1], "uffd_pager_stride_policy") == 0) {
+        return mode_uffd_pager_stride_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_lfu_hotset_scan") == 0) {
+        return mode_uffd_pager_lfu_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_lruk_hotset_scan") == 0) {
+        return mode_uffd_pager_lruk_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_car_hotset_scan") == 0) {
+        return mode_uffd_pager_car_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_irr_hotset_scan") == 0) {
+        return mode_uffd_pager_irr_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_arc_pivot_policy") == 0) {
+        return mode_uffd_pager_arc_pivot_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_tinylfu_hotset_scan") == 0) {
+        return mode_uffd_pager_tinylfu_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_wtinylfu_hotset_scan") == 0) {
+        return mode_uffd_pager_wtinylfu_hotset_scan();
+    }
+    if (strcmp(argv[1], "uffd_pager_bestoffset_policy") == 0) {
+        return mode_uffd_pager_bestoffset_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_successor_policy") == 0) {
+        return mode_uffd_pager_successor_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_signature_policy") == 0) {
+        return mode_uffd_pager_signature_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_hybrid_policy") == 0) {
+        return mode_uffd_pager_hybrid_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_hybrid_stream_policy") == 0) {
+        return mode_uffd_pager_hybrid_stream_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_hybrid_cohort_policy") == 0) {
+        return mode_uffd_pager_hybrid_cohort_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_phase_policy") == 0) {
+        return mode_uffd_pager_phase_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_hinted_policy") == 0) {
+        return mode_uffd_pager_hinted_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_hybrid_cross_record_cohort_policy") == 0) {
+        return mode_uffd_pager_hybrid_cross_record_cohort_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_hybrid_cross_record_cohort_async_policy") == 0) {
+        return mode_uffd_pager_hybrid_cross_record_cohort_async_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_markov_cohort_pressure_cold_start_policy") == 0) {
+        return mode_uffd_pager_markov_cohort_pressure_cold_start_policy();
+    }
+    if (strcmp(argv[1], "uffd_pager_markov_cohort_free_releases_lease") == 0) {
+        return mode_uffd_pager_markov_cohort_free_releases_lease();
+    }
+    if (strcmp(argv[1], "uffd_pager_hybrid_default_low_window") == 0) {
+        return mode_uffd_pager_hybrid_default_low_window();
+    }
+    if (strcmp(argv[1], "uffd_pager_spatial_mask_policy") == 0) {
+        return mode_uffd_pager_spatial_mask_policy();
     }
     if (strcmp(argv[1], "uffd_pager_concurrent_stress") == 0) {
         return mode_uffd_pager_concurrent_stress();

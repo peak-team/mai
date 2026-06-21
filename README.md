@@ -188,6 +188,12 @@ that `MAI_BACKEND=auto` would otherwise demote under pressure; `required`
 turns an unavailable pager into a configuration error. `MAI_UFFD_PREFETCH_CHUNKS`
 is the total number of adjacent chunks to populate per missing fault, including
 the faulting chunk. Set it to `1` to disable spatial prefetch.
+`MAI_UFFD_CLEAN_SHADOW=1` is an opt-in UFFD mode that preserves valid storage
+shadows after a chunk is restored and uses write-protect faults to invalidate
+the shadow on the first write. Clean demotion can then skip the storage write;
+tracking only activates when the kernel can restore the chunk write-protected
+atomically. Write-heavy reuse pays the extra write-protect fault and should
+benchmark this mode explicitly before enabling it.
 
 `MAI_ALLOCATOR_HOOKS` controls whether MAI also patches libc allocator entry
 points with Frida/Gum:
@@ -322,11 +328,12 @@ GitHub Actions separates correctness from performance:
 
 - `.github/workflows/ci.yml` runs the correctness suite on pushes, pull
   requests, and manual dispatch.
-- `.github/workflows/benchmarks.yml` runs non-gating overhead and pressure
-  benchmark matrices on a weekly schedule or manual dispatch and uploads the
-  measurements as artifacts.
+- `.github/workflows/benchmarks.yml` runs non-gating benchmark jobs on a
+  weekly schedule or manual dispatch and uploads measurements as workflow
+  artifacts. Retained benchmark results, detailed protocols, and future
+  strategy plans are kept in the companion `mai_benchmark` workspace.
 
-See `benchmarks/README.md` for the benchmark design and tuning knobs.
+See `benchmarks/README.md` for the in-tree benchmark harness entry points.
 
 ## Use
 
@@ -338,10 +345,3 @@ MAI_ARENA_SIZE=64G \
 LD_PRELOAD=/path/to/libmai.so \
 ./target_application
 ```
-
-## Development Direction
-
-The next major direction is richer optional runtime-specific extensions where
-they do not compromise the core allocator model, including better reporting for
-which library or call site caused an exclusion and broader coverage of runtime
-APIs that privately pin or register user buffers.

@@ -87,6 +87,176 @@ typedef struct {
     size_t uffd_evictions;
     size_t uffd_resident_bytes;
     size_t uffd_fallbacks;
+    size_t migration_policy;
+    size_t policy_prefetch_requests;
+    size_t policy_prefetch_admitted;
+    size_t policy_prefetch_completed;
+    size_t policy_prefetch_useful;
+    size_t policy_prefetch_late;
+    size_t policy_prefetch_unused_evictions;
+    size_t policy_prefetch_bytes;
+    size_t policy_prefetch_useful_bytes;
+    size_t policy_prefetch_unused_evicted_bytes;
+    size_t policy_admission_requests;
+    size_t policy_admission_rejected;
+    size_t policy_demotions;
+    size_t policy_promotions;
+    size_t policy_evicted_hot_bytes;
+    size_t policy_migration_read_bytes;
+    size_t policy_migration_write_bytes;
+    size_t policy_demand_faults;
+    size_t policy_demand_fault_stall_ns;
+    size_t policy_throttle_events;
+    size_t policy_throttle_slept_ns;
+    size_t policy_prefetch_observation;
+    size_t policy_demand_fault_stall_samples;
+    size_t policy_demand_fault_stall_p50_ns;
+    size_t policy_demand_fault_stall_p90_ns;
+    size_t policy_demand_fault_stall_p99_ns;
+    size_t policy_demand_fault_stall_max_ns;
+    size_t policy_async_prefetch_enqueued;
+    size_t policy_async_prefetch_completed;
+    size_t policy_async_prefetch_dropped;
+    size_t policy_adaptive_windows;
+    size_t policy_adaptive_level;
+    size_t policy_adaptive_level_changes;
+    size_t policy_adaptive_prefetch_capped;
+    size_t policy_adaptive_admission_rejected;
+    size_t policy_clean_shadow_tracked_chunks;
+    size_t policy_clean_shadow_protect_failures;
+    size_t policy_clean_shadow_write_skipped_bytes;
+    size_t policy_clean_shadow_write_skipped_chunks;
+    size_t policy_clean_shadow_write_faults;
+    size_t policy_car_recent_chunks;
+    size_t policy_car_frequent_chunks;
+    size_t policy_car_recent_ghost_chunks;
+    size_t policy_car_frequent_ghost_chunks;
+    size_t policy_car_target_recent_chunks;
+    size_t policy_car_recent_ghost_hits;
+    size_t policy_car_frequent_ghost_hits;
+    size_t policy_car_target_increases;
+    size_t policy_car_target_decreases;
+    size_t policy_car_second_chances;
+    size_t policy_tinylfu_sketch_updates;
+    size_t policy_tinylfu_sketch_decays;
+    size_t policy_tinylfu_admission_rejected;
+    size_t policy_tinylfu_min_score;
+    size_t policy_bestoffset_train_samples;
+    size_t policy_bestoffset_train_hits;
+    size_t policy_bestoffset_slots_created;
+    size_t policy_bestoffset_score_decays;
+    size_t policy_bestoffset_candidates;
+    size_t policy_bestoffset_pressure_rejected;
+    size_t policy_bestoffset_unused_penalties;
+    size_t policy_bestoffset_top_offset_magnitude;
+    size_t policy_bestoffset_top_offset_sign;
+    size_t policy_bestoffset_top_score;
+    size_t policy_wtinylfu_window_chunks;
+    size_t policy_wtinylfu_probation_chunks;
+    size_t policy_wtinylfu_protected_chunks;
+    size_t policy_wtinylfu_window_evictions;
+    size_t policy_wtinylfu_main_admission_rejected;
+    size_t policy_wtinylfu_victim_score_rejected;
+    size_t policy_successor_chain_candidates;
+    size_t policy_successor_chain_rejected;
+    size_t policy_successor_chain_depth;
+    size_t policy_signature_train_samples;
+    size_t policy_signature_train_hits;
+    size_t policy_signature_slots_created;
+    size_t policy_signature_score_decays;
+    size_t policy_signature_candidates;
+    size_t policy_signature_pressure_rejected;
+    size_t policy_signature_unused_penalties;
+    size_t policy_signature_chain_candidates;
+    size_t policy_signature_chain_rejected;
+    size_t policy_signature_chain_depth;
+    size_t policy_signature_top_delta_magnitude;
+    size_t policy_signature_top_delta_sign;
+    size_t policy_signature_top_score;
+    size_t policy_hybrid_signature_candidates;
+    size_t policy_hybrid_successor_candidates;
+    size_t policy_hybrid_stream_candidates;
+    size_t policy_hybrid_admission_rejected;
+    size_t policy_hybrid_signature_admitted;
+    size_t policy_hybrid_successor_admitted;
+    size_t policy_hybrid_stream_admitted;
+    size_t policy_hybrid_signature_completed;
+    size_t policy_hybrid_successor_completed;
+    size_t policy_hybrid_stream_completed;
+    size_t policy_hybrid_signature_useful;
+    size_t policy_hybrid_successor_useful;
+    size_t policy_hybrid_stream_useful;
+    size_t policy_hybrid_cohort_candidates;
+    size_t policy_hybrid_cohort_admitted;
+    size_t policy_hybrid_cohort_completed;
+    size_t policy_hybrid_cohort_useful;
+    size_t policy_adaptive_budget_gate;
+    size_t policy_adaptive_budget_bytes;
+    size_t policy_adaptive_window_migration_bytes;
+    size_t policy_markov_lead_candidates;
+    size_t policy_markov_lead_admitted;
+    size_t policy_markov_lead_completed;
+    size_t policy_markov_lead_useful;
+    size_t policy_phase_candidates;
+    size_t policy_phase_admitted;
+    size_t policy_phase_completed;
+    size_t policy_phase_useful;
+    size_t policy_phase_conflicts;
+    size_t policy_phase_confidence_rejected;
+    size_t policy_phase_budget_rejected;
+    size_t policy_phase_safe_victim_rejected;
+    size_t policy_phase_victim_rejected;
+    size_t policy_phase_duplicate_candidates;
+    size_t policy_phase_target_hot_skipped;
+    size_t policy_phase_active_slots;
+    size_t policy_phase_top_score;
+    size_t policy_phase_unused_evictions;
+    size_t policy_phase_boundary_prefetches;
+    size_t policy_phase_hold_activations;
+    size_t policy_phase_shadow_candidates;
+    size_t policy_phase_shadow_useful;
+    size_t policy_phase_shadow_late;
+    size_t policy_phase_shadow_expired;
+    size_t policy_phase_shadow_overwritten;
+    size_t policy_phase_shadow_probe_candidates;
+    size_t policy_phase_shadow_edge_rejected;
+    size_t policy_phase_shadow_edge_confirmed;
+    size_t policy_phase_shadow_top_late;
+    size_t policy_phase_shadow_max_late;
+    size_t policy_hint_candidates;
+    size_t policy_hint_admitted;
+    size_t policy_hint_completed;
+    size_t policy_hint_useful;
+    size_t policy_hint_rejected;
+    size_t policy_arc_t1_chunks;
+    size_t policy_arc_t2_chunks;
+    size_t policy_arc_b1_chunks;
+    size_t policy_arc_b2_chunks;
+    size_t policy_arc_p_chunks;
+    size_t policy_arc_b1_hits;
+    size_t policy_arc_b2_hits;
+    size_t policy_arc_target_increases;
+    size_t policy_arc_target_decreases;
+    size_t policy_arc_t1_hits;
+    size_t policy_arc_t2_hits;
+    size_t policy_arc_t1_to_t2_promotions;
+    size_t policy_arc_replace_t1;
+    size_t policy_arc_replace_t2;
+    size_t policy_arc_b1_pruned;
+    size_t policy_arc_b2_pruned;
+    size_t policy_arc_prefetch_admitted_t1;
+    size_t policy_arc_prefetch_rejected_pressure;
+    size_t policy_arc_prefetch_promoted_to_t2;
+    size_t policy_irr_resident_chunks;
+    size_t policy_irr_protected_chunks;
+    size_t policy_irr_ghost_chunks;
+    size_t policy_irr_target_protected_chunks;
+    size_t policy_irr_ghost_hits;
+    size_t policy_irr_promotions;
+    size_t policy_irr_demotions;
+    size_t policy_irr_pressure_rejected;
+    size_t policy_irr_immature_rejected;
+    size_t policy_irr_max_interval_epochs;
 } MaiStats;
 
 /**
@@ -106,11 +276,12 @@ typedef enum {
 /**
  * Versioned options for mai_hint_range().
  *
- * Set size to sizeof(MaiHintOptions). All fields are advisory and best-effort:
- * flags are currently recorded but not interpreted, hotset_bytes can describe
- * the expected protected working set for MAI_HINT_RANDOM_HOTSET, and
- * window_bytes can describe an expected sequential or sparse access window.
- * Reserved fields must not be used for correctness.
+ * Set size to sizeof(MaiHintOptions). All fields are advisory and best-effort.
+ * The experimental "hinted" migration policy can use MAI_HINT_SEQUENTIAL plus
+ * window_bytes to bound forward prefetch candidates. Other policies may record
+ * or ignore hints. hotset_bytes can describe the expected protected working
+ * set for MAI_HINT_RANDOM_HOTSET. Reserved fields must not be used for
+ * correctness.
  */
 typedef struct {
     size_t size;

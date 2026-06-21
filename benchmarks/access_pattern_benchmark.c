@@ -17,8 +17,13 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifndef TMPFS_MAGIC
+#define TMPFS_MAGIC 0x01021994
+#endif
 
 typedef int (*get_stats_fn)(MaiStats*);
 typedef int (*get_stats_sized_fn)(MaiStats*, size_t);
@@ -28,6 +33,7 @@ typedef int (*get_access_trace_fn)(void*, MaiAccessTraceSnapshot*);
 typedef int (*stop_access_trace_fn)(void*);
 typedef int (*heartbeat_fn)(const MaiHeartbeatOptions*, MaiHeartbeatSnapshot*);
 typedef int (*range_op_fn)(void*, size_t);
+typedef int (*hint_range_fn)(void*, size_t, uint32_t, const MaiHintOptions*);
 
 static size_t page_size_bytes = 4096;
 static get_stats_fn get_stats = NULL;
@@ -40,6 +46,7 @@ static heartbeat_fn heartbeat = NULL;
 static range_op_fn prefetch_range = NULL;
 static range_op_fn prepare_write_range = NULL;
 static range_op_fn reclaim_range = NULL;
+static hint_range_fn hint_range = NULL;
 static size_t heartbeat_calls = 0;
 static size_t heartbeat_busy_ticks = 0;
 static size_t heartbeat_migrate_bytes = 0;
@@ -69,6 +76,30 @@ static long mprotect_voluntary_ctxt_delta = 0;
 static long mprotect_involuntary_ctxt_delta = 0;
 static long mprotect_user_cpu_us_delta = 0;
 static long mprotect_sys_cpu_us_delta = 0;
+static long run_minor_faults_delta = 0;
+static long run_major_faults_delta = 0;
+static long run_inblock_delta = 0;
+static long run_oublock_delta = 0;
+static long run_voluntary_ctxt_delta = 0;
+static long run_involuntary_ctxt_delta = 0;
+static long run_user_cpu_us_delta = 0;
+static long run_sys_cpu_us_delta = 0;
+static long run_maxrss_kib = 0;
+static size_t cgroup_memory_max_bytes = 0;
+static int cgroup_memory_max_available = 0;
+static int cgroup_memory_max_unbounded = 0;
+static int cgroup_memory_max_is_max_token = 0;
+static size_t cgroup_memory_current_before = 0;
+static size_t cgroup_memory_current_after = 0;
+static size_t cgroup_memory_events_high_delta = 0;
+static size_t cgroup_memory_events_max_delta = 0;
+static size_t cgroup_memory_events_oom_delta = 0;
+static size_t cgroup_swap_max_bytes = 0;
+static int cgroup_swap_max_available = 0;
+static int cgroup_swap_max_unbounded = 0;
+static int cgroup_swap_max_is_max_token = 0;
+static size_t cgroup_swap_current_before = 0;
+static size_t cgroup_swap_current_after = 0;
 static uint64_t heartbeat_total_ns = 0;
 static const char* chunk_touch_position_label = "none";
 static double stream_copy_mib_per_sec = 0.0;
@@ -106,6 +137,96 @@ static const char* stream_pipeline_order_recorded = "sequential";
 static const char* stream_pipeline_prediction_recorded = "entry";
 static size_t stream_pipeline_reclaim_lag_recorded = 0;
 static size_t stream_pipeline_reclaim_horizon_recorded = 0;
+static size_t stream_pipeline_unique_cold_visits_recorded = 0;
+static size_t stream_pipeline_max_cycle_policy_demand_faults = 0;
+static size_t stream_pipeline_max_cycle_policy_read_bytes = 0;
+static size_t stream_pipeline_max_cycle_policy_write_bytes = 0;
+static size_t stream_pipeline_max_cycle_policy_stall_ns = 0;
+static size_t stream_pipeline_max_cycle_policy_demotions = 0;
+static size_t stream_pipeline_max_cycle_policy_hot_evicted_bytes = 0;
+static size_t stream_pipeline_cycle_policy_demand_faults_p50 = 0;
+static size_t stream_pipeline_cycle_policy_demand_faults_p90 = 0;
+static size_t stream_pipeline_cycle_policy_demand_faults_p99 = 0;
+static size_t stream_pipeline_cycle_policy_read_bytes_p50 = 0;
+static size_t stream_pipeline_cycle_policy_read_bytes_p90 = 0;
+static size_t stream_pipeline_cycle_policy_read_bytes_p99 = 0;
+static size_t stream_pipeline_cycle_policy_write_bytes_p50 = 0;
+static size_t stream_pipeline_cycle_policy_write_bytes_p90 = 0;
+static size_t stream_pipeline_cycle_policy_write_bytes_p99 = 0;
+static size_t stream_pipeline_cycle_policy_stall_ns_p50 = 0;
+static size_t stream_pipeline_cycle_policy_stall_ns_p90 = 0;
+static size_t stream_pipeline_cycle_policy_stall_ns_p99 = 0;
+static size_t stream_pipeline_cycle_policy_unused_prefetch_evictions_p50 = 0;
+static size_t stream_pipeline_cycle_policy_unused_prefetch_evictions_p90 = 0;
+static size_t stream_pipeline_cycle_policy_unused_prefetch_evictions_p99 = 0;
+static size_t stream_pipeline_group_visit_0_recorded = 0;
+static size_t stream_pipeline_group_visit_1_recorded = 0;
+static size_t stream_pipeline_group_visit_2_recorded = 0;
+static size_t stream_pipeline_transition_00_recorded = 0;
+static size_t stream_pipeline_transition_01_recorded = 0;
+static size_t stream_pipeline_transition_02_recorded = 0;
+static size_t stream_pipeline_transition_10_recorded = 0;
+static size_t stream_pipeline_transition_11_recorded = 0;
+static size_t stream_pipeline_transition_12_recorded = 0;
+static size_t stream_pipeline_transition_20_recorded = 0;
+static size_t stream_pipeline_transition_21_recorded = 0;
+static size_t stream_pipeline_transition_22_recorded = 0;
+static size_t stream_pipeline_unique_transitions_recorded = 0;
+static size_t stream_pipeline_worst_cycle_index_recorded = 0;
+static size_t stream_pipeline_worst_cycle_group_recorded = 0;
+static size_t stream_pipeline_worst_cycle_prev_group_recorded = 0;
+static char stream_pipeline_order_sequence_recorded[128] = "none";
+static size_t stream_pipeline_phase_chunks_recorded = 0;
+static size_t stream_pipeline_phase_return_cycles_recorded = 0;
+static size_t stream_pipeline_phase_return_policy_demand_faults = 0;
+static size_t stream_pipeline_phase_return_policy_read_bytes = 0;
+static size_t stream_pipeline_phase_return_policy_write_bytes = 0;
+static size_t stream_pipeline_phase_return_policy_stall_ns = 0;
+static size_t stream_pipeline_phase_return_policy_hot_evicted_bytes = 0;
+static size_t stream_pipeline_phase_return_policy_unused_prefetch_evictions = 0;
+static size_t stream_pipeline_phase_return_estimated_hits = 0;
+static double stream_pipeline_phase_return_estimated_hit_ratio = 0.0;
+static size_t stream_pipeline_phase_warm_return_cycles_recorded = 0;
+static size_t stream_pipeline_phase_warm_return_policy_demand_faults = 0;
+static size_t stream_pipeline_phase_warm_return_policy_read_bytes = 0;
+static size_t stream_pipeline_phase_warm_return_policy_write_bytes = 0;
+static size_t stream_pipeline_phase_warm_return_policy_stall_ns = 0;
+static size_t stream_pipeline_phase_warm_return_policy_hot_evicted_bytes = 0;
+static size_t stream_pipeline_phase_warm_return_policy_unused_prefetch_evictions = 0;
+static size_t stream_pipeline_phase_warm_return_estimated_hits = 0;
+static double stream_pipeline_phase_warm_return_estimated_hit_ratio = 0.0;
+static size_t stream_pipeline_phase_decoy_cycles_recorded = 0;
+static size_t stream_pipeline_phase_decoy_policy_demand_faults = 0;
+static size_t stream_pipeline_phase_decoy_policy_read_bytes = 0;
+static size_t stream_pipeline_phase_decoy_policy_write_bytes = 0;
+static size_t stream_pipeline_phase_decoy_policy_stall_ns = 0;
+static size_t stream_pipeline_phase_decoy_policy_hot_evicted_bytes = 0;
+static size_t stream_pipeline_phase_decoy_policy_unused_prefetch_evictions = 0;
+static size_t policy_pivot_return_faults_recorded = 0;
+static size_t policy_pivot_return_touches_recorded = 0;
+static size_t policy_pivot_return_hits_recorded = 0;
+static double policy_pivot_hot_return_hit_ratio_recorded = 0.0;
+static size_t policy_pivot_adaptation_lag_touches_recorded = 0;
+static size_t policy_irr_hot_return_faults_recorded = 0;
+static size_t policy_irr_hot_return_touches_recorded = 0;
+static size_t policy_irr_hot_return_hits_recorded = 0;
+static double policy_irr_hot_return_hit_ratio_recorded = 0.0;
+static size_t policy_irr_decoy_return_faults_recorded = 0;
+static size_t policy_irr_decoy_return_touches_recorded = 0;
+static size_t policy_irr_decoy_return_hits_recorded = 0;
+static double policy_irr_decoy_return_hit_ratio_recorded = 0.0;
+static double policy_irr_discrimination_score_recorded = 0.0;
+static size_t policy_irr_adaptation_lag_touches_recorded = 0;
+static size_t policy_irr_scan_faults_recorded = 0;
+static size_t policy_irr_scan_read_bytes_recorded = 0;
+static size_t policy_irr_scan_write_bytes_recorded = 0;
+static size_t policy_irr_scan_hot_evicted_bytes_recorded = 0;
+static size_t policy_irr_scan_unused_prefetch_evictions_recorded = 0;
+static size_t policy_irr_scan_stall_ns_recorded = 0;
+static const char* stream_mapping_kind_recorded = "malloc";
+static char stream_backing_path_recorded[PATH_MAX] = "none";
+static unsigned long long stream_backing_fs_type = 0;
+static int stream_backing_is_tmpfs = 0;
 static size_t stream_passes_recorded = 0;
 
 typedef enum {
@@ -159,10 +280,27 @@ static int compare_u64(const void* left, const void* right) {
     return (a > b) - (a < b);
 }
 
+static uint64_t percentile_u64(uint64_t* values, size_t count,
+                               size_t percentile) {
+    if (!values || count == 0) {
+        return 0;
+    }
+    qsort(values, count, sizeof(*values), compare_u64);
+    size_t index = ((count - 1) * percentile + 50) / 100;
+    if (index >= count) {
+        index = count - 1;
+    }
+    return values[index];
+}
+
 static int compare_double(const void* left, const void* right) {
     double a = *(const double*)left;
     double b = *(const double*)right;
     return (a > b) - (a < b);
+}
+
+static size_t size_delta(size_t after, size_t before) {
+    return after >= before ? after - before : 0;
 }
 
 static double seconds_since(const struct timespec* start, const struct timespec* end) {
@@ -189,6 +327,54 @@ static int mul_size(size_t a, size_t b, size_t* out) {
     }
     *out = a * b;
     return 0;
+}
+
+static size_t gcd_size(size_t a, size_t b) {
+    while (b != 0) {
+        size_t rem = a % b;
+        a = b;
+        b = rem;
+    }
+    return a;
+}
+
+static size_t coprime_stride(size_t units, size_t salt) {
+    if (units <= 1) {
+        return 1;
+    }
+
+    size_t stride = salt % units;
+    if (stride == 0) {
+        stride = 1;
+    }
+    if ((stride & 1U) == 0) {
+        stride++;
+    }
+    if (stride >= units) {
+        stride = 1;
+    }
+
+    while (gcd_size(stride, units) != 1) {
+        stride += 2;
+        if (stride >= units) {
+            stride = 1;
+        }
+    }
+    return stride;
+}
+
+static void shuffle_size_order(size_t* order, size_t count, uint64_t seed) {
+    for (size_t i = 0; i < count; i++) {
+        order[i] = i;
+    }
+    uint64_t state = seed == 0 ? 0x9e3779b97f4a7c15ULL : seed;
+    for (size_t i = count; i > 1; i--) {
+        state = state * 2862933555777941757ULL + 3037000493ULL;
+        size_t j = (size_t)(state % i);
+        size_t tmp = order[i - 1];
+        order[i - 1] = order[j];
+        order[j] = tmp;
+    }
 }
 
 static int parse_size_value(const char* value, size_t* out) {
@@ -259,6 +445,22 @@ static size_t env_count(const char* name, size_t fallback) {
     return parsed;
 }
 
+static int env_flag(const char* name, int fallback) {
+    const char* value = getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallback;
+    }
+    if (strcmp(value, "0") == 0 || strcmp(value, "false") == 0 ||
+        strcmp(value, "off") == 0 || strcmp(value, "no") == 0) {
+        return 0;
+    }
+    if (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 ||
+        strcmp(value, "on") == 0 || strcmp(value, "yes") == 0) {
+        return 1;
+    }
+    return fallback;
+}
+
 static const char* env_value_compat(const char* primary, const char* legacy) {
     const char* value = getenv(primary);
     if (value && value[0] != '\0') {
@@ -316,6 +518,251 @@ static double env_double(const char* name, double fallback) {
     return parsed;
 }
 
+static int read_text_file(const char* path, char* buffer, size_t buffer_size) {
+    if (!path || !buffer || buffer_size == 0) {
+        return -1;
+    }
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    ssize_t bytes = read(fd, buffer, buffer_size - 1);
+    close(fd);
+    if (bytes <= 0) {
+        return -1;
+    }
+    buffer[bytes] = '\0';
+    return 0;
+}
+
+typedef struct {
+    size_t bytes;
+    int available;
+    int max_token;
+} CgroupSizeSample;
+
+static int cgroup_token_is_max(const char* cursor) {
+    return cursor && strncmp(cursor, "max", 3) == 0 &&
+           (cursor[3] == '\0' || isspace((unsigned char)cursor[3]));
+}
+
+static int parse_cgroup_size_text(const char* text, CgroupSizeSample* out) {
+    if (!text || !out) {
+        return -1;
+    }
+    char* end = NULL;
+    while (*text && isspace((unsigned char)*text)) {
+        text++;
+    }
+    if (cgroup_token_is_max(text)) {
+        out->bytes = 0;
+        out->available = 1;
+        out->max_token = 1;
+        return 0;
+    }
+    errno = 0;
+    unsigned long long parsed = strtoull(text, &end, 10);
+    if (errno != 0 || end == text || parsed > (unsigned long long)SIZE_MAX) {
+        return -1;
+    }
+    out->bytes = (size_t)parsed;
+    out->available = 1;
+    out->max_token = 0;
+    return 0;
+}
+
+static int read_size_file_token(const char* path, CgroupSizeSample* out) {
+    char buffer[128];
+    if (!out || read_text_file(path, buffer, sizeof(buffer)) != 0) {
+        return -1;
+    }
+    return parse_cgroup_size_text(buffer, out);
+}
+
+static int cgroup_controller_list_has_memory(const char* controllers) {
+    const char* cursor = controllers;
+    while (cursor && *cursor) {
+        const char* comma = strchr(cursor, ',');
+        size_t length = comma ? (size_t)(comma - cursor) : strlen(cursor);
+        if (length == strlen("memory") &&
+            strncmp(cursor, "memory", length) == 0) {
+            return 1;
+        }
+        if (!comma) {
+            break;
+        }
+        cursor = comma + 1;
+    }
+    return 0;
+}
+
+static int build_cgroup_metric_path(char* buffer, size_t buffer_size,
+                                    const char* mount_root,
+                                    const char* relative_path,
+                                    const char* file_name) {
+    if (!buffer || buffer_size == 0 || !mount_root ||
+        !relative_path || !file_name) {
+        return -1;
+    }
+    while (*relative_path == '/') {
+        relative_path++;
+    }
+    if (strstr(relative_path, "..")) {
+        return -1;
+    }
+    int written = *relative_path ?
+        snprintf(buffer, buffer_size, "%s/%s/%s", mount_root,
+                 relative_path, file_name) :
+        snprintf(buffer, buffer_size, "%s/%s", mount_root, file_name);
+    return written >= 0 && (size_t)written < buffer_size ? 0 : -1;
+}
+
+static int read_process_cgroup_text(const char* v2_file,
+                                    const char* v1_file,
+                                    char* out,
+                                    size_t out_size) {
+    char buffer[4096];
+    if (!v2_file || !v1_file || !out || out_size == 0 ||
+        read_text_file("/proc/self/cgroup", buffer, sizeof(buffer)) != 0) {
+        return -1;
+    }
+
+    for (char* line = buffer; line && *line;) {
+        char* next = strchr(line, '\n');
+        if (next) {
+            *next = '\0';
+            next++;
+        }
+        char* first_colon = strchr(line, ':');
+        char* second_colon = first_colon ? strchr(first_colon + 1, ':') : NULL;
+        if (!first_colon || !second_colon) {
+            line = next;
+            continue;
+        }
+        *first_colon = '\0';
+        *second_colon = '\0';
+        const char* hierarchy = line;
+        const char* controllers = first_colon + 1;
+        const char* relative_path = second_colon + 1;
+        char path[PATH_MAX];
+
+        if (strcmp(hierarchy, "0") == 0 && controllers[0] == '\0') {
+            if (build_cgroup_metric_path(path, sizeof(path), "/sys/fs/cgroup",
+                                         relative_path, v2_file) == 0 &&
+                read_text_file(path, out, out_size) == 0) {
+                return 0;
+            }
+        } else if (cgroup_controller_list_has_memory(controllers)) {
+            if (build_cgroup_metric_path(path, sizeof(path),
+                                         "/sys/fs/cgroup/memory",
+                                         relative_path, v1_file) == 0 &&
+                read_text_file(path, out, out_size) == 0) {
+                return 0;
+            }
+        }
+        line = next;
+    }
+    return -1;
+}
+
+static int read_process_cgroup_size(const char* v2_file,
+                                    const char* v1_file,
+                                    CgroupSizeSample* out) {
+    char buffer[128];
+    if (!out ||
+        read_process_cgroup_text(v2_file, v1_file, buffer,
+                                 sizeof(buffer)) != 0) {
+        return -1;
+    }
+    return parse_cgroup_size_text(buffer, out);
+}
+
+static CgroupSizeSample sample_cgroup_size(const char* v2_file,
+                                           const char* v1_file,
+                                           const char* fallback_v2,
+                                           const char* fallback_v1) {
+    CgroupSizeSample sample = {0};
+    if (read_process_cgroup_size(v2_file, v1_file, &sample) == 0 ||
+        read_size_file_token(fallback_v2, &sample) == 0 ||
+        read_size_file_token(fallback_v1, &sample) == 0) {
+        return sample;
+    }
+    return sample;
+}
+
+typedef struct {
+    size_t high;
+    size_t max;
+    size_t oom;
+} CgroupMemoryEvents;
+
+static void parse_cgroup_memory_events(const char* text,
+                                       CgroupMemoryEvents* out) {
+    if (!text || !out) {
+        return;
+    }
+    for (const char* line = text; *line;) {
+        while (*line == '\n') {
+            line++;
+        }
+        const char* end_line = strchr(line, '\n');
+        size_t length = end_line ? (size_t)(end_line - line) : strlen(line);
+        if (length == 0) {
+            break;
+        }
+        char key[32];
+        unsigned long long value = 0;
+        if (sscanf(line, "%31s %llu", key, &value) == 2 &&
+            value <= (unsigned long long)SIZE_MAX) {
+            if (strcmp(key, "high") == 0) {
+                out->high = (size_t)value;
+            } else if (strcmp(key, "max") == 0) {
+                out->max = (size_t)value;
+            } else if (strcmp(key, "oom") == 0) {
+                out->oom = (size_t)value;
+            }
+        } else if (sscanf(line, "%llu", &value) == 1 &&
+                   value <= (unsigned long long)SIZE_MAX) {
+            out->max = (size_t)value;
+        }
+        if (!end_line) {
+            break;
+        }
+        line = end_line + 1;
+    }
+}
+
+static CgroupMemoryEvents sample_cgroup_memory_events(void) {
+    CgroupMemoryEvents events = {0};
+    char buffer[512];
+    if (read_process_cgroup_text("memory.events", "memory.failcnt",
+                                 buffer, sizeof(buffer)) == 0 ||
+        read_text_file("/sys/fs/cgroup/memory.events", buffer,
+                       sizeof(buffer)) == 0) {
+        parse_cgroup_memory_events(buffer, &events);
+    }
+    return events;
+}
+
+static size_t delta_size_t(size_t before, size_t after) {
+    return after >= before ? after - before : 0;
+}
+
+static int cgroup_limit_is_unbounded(CgroupSizeSample sample) {
+    if (!sample.available) {
+        return 0;
+    }
+    if (sample.max_token) {
+        return 1;
+    }
+#if SIZE_MAX > 0xffffffffu
+    if (sample.bytes >= ((size_t)1 << 60)) {
+        return 1;
+    }
+#endif
+    return 0;
+}
+
 static int mode_uses_stream_kernel(const char* mode) {
     return strcmp(mode, "stream_bandwidth") == 0 ||
            strcmp(mode, "stream_tiled_bandwidth") == 0 ||
@@ -325,7 +772,9 @@ static int mode_uses_stream_kernel(const char* mode) {
 }
 
 static int mode_uses_stream_pipeline(const char* mode) {
-    return strcmp(mode, "stream_kernel_pipeline") == 0 ||
+    return strcmp(mode, "policy_stream_pipeline") == 0 ||
+           strcmp(mode, "policy_stream_pipeline_phase_decoy") == 0 ||
+           strcmp(mode, "stream_kernel_pipeline") == 0 ||
            strcmp(mode, "stream_kernel_pipeline_anon_mmap") == 0 ||
            strcmp(mode, "stream_kernel_pipeline_shared_file") == 0 ||
            strcmp(mode, "stream_kernel_pipeline_private_file") == 0;
@@ -357,6 +806,17 @@ static int allocate_file_mapping(size_t size, int shared, unsigned char** out) {
     int fd = mkstemp(filename);
     if (fd < 0) {
         return -1;
+    }
+    stream_mapping_kind_recorded = shared ? "shared_file" : "private_file";
+    snprintf(stream_backing_path_recorded, sizeof(stream_backing_path_recorded),
+             "%s", filename);
+    struct statfs fs_info;
+    if (fstatfs(fd, &fs_info) == 0) {
+        stream_backing_fs_type = (unsigned long long)fs_info.f_type;
+        stream_backing_is_tmpfs = fs_info.f_type == TMPFS_MAGIC ? 1 : 0;
+    } else {
+        stream_backing_fs_type = 0;
+        stream_backing_is_tmpfs = 0;
     }
     int saved_errno = 0;
     if (unlink(filename) != 0 || ftruncate(fd, (off_t)size) != 0) {
@@ -395,6 +855,11 @@ static int allocate_benchmark_buffer(const char* mode, size_t size,
 
     if (strcmp(mode, "stream_anon_mmap") == 0 ||
         strcmp(mode, "stream_kernel_pipeline_anon_mmap") == 0) {
+        stream_mapping_kind_recorded = "anon_mmap";
+        snprintf(stream_backing_path_recorded, sizeof(stream_backing_path_recorded),
+                 "%s", "none");
+        stream_backing_fs_type = 0;
+        stream_backing_is_tmpfs = 0;
         void* ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (ptr == MAP_FAILED) {
@@ -418,6 +883,11 @@ static int allocate_benchmark_buffer(const char* mode, size_t size,
         return 0;
     }
 
+    stream_mapping_kind_recorded = "malloc";
+    snprintf(stream_backing_path_recorded, sizeof(stream_backing_path_recorded),
+             "%s", "none");
+    stream_backing_fs_type = 0;
+    stream_backing_is_tmpfs = 0;
     *buffer = malloc(size);
     return *buffer ? 0 : -1;
 }
@@ -477,6 +947,9 @@ static void load_range_ops_optional(void) {
     }
     if (!reclaim_range) {
         reclaim_range = (range_op_fn)dlsym(RTLD_DEFAULT, "mai_reclaim_range");
+    }
+    if (!hint_range) {
+        hint_range = (hint_range_fn)dlsym(RTLD_DEFAULT, "mai_hint_range");
     }
 }
 
@@ -1123,6 +1596,1585 @@ static int run_random_hotset(unsigned char* buffer, size_t size,
         *checksum += buffer[offset];
         (*touches)++;
     }
+
+    free(expected);
+    return 0;
+}
+
+static int run_policy_hotset_scan(unsigned char* buffer, size_t size,
+                                  uint64_t* checksum, size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_HOTSET_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t hotset_bytes =
+        env_size("MAI_BENCH_POLICY_HOTSET", 8ULL * 1024ULL * 1024ULL);
+    size_t hot_rounds = env_count("MAI_BENCH_POLICY_HOT_ROUNDS", 4);
+    size_t scan_passes = env_count("MAI_BENCH_POLICY_SCAN_PASSES", 3);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    size_t units = size / unit_bytes;
+    if (units < 2) {
+        return -1;
+    }
+    hotset_bytes -= hotset_bytes % unit_bytes;
+    size_t hot_units = hotset_bytes / unit_bytes;
+    if (hot_units == 0) {
+        hot_units = 1;
+    }
+    if (hot_units >= units) {
+        hot_units = units / 2;
+    }
+    if (hot_units == 0 || hot_units >= units) {
+        return -1;
+    }
+    if (hot_rounds == 0) {
+        hot_rounds = 1;
+    }
+    if (scan_passes == 0) {
+        scan_passes = 1;
+    }
+
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t pass = 0; pass < scan_passes; pass++) {
+        for (size_t round = 0; round < hot_rounds; round++) {
+            for (size_t unit = 0; unit < hot_units; unit++) {
+                size_t offset = unit * unit_bytes;
+                expected[unit]++;
+                buffer[offset] = expected[unit];
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+        for (size_t unit = hot_units; unit < units; unit++) {
+            size_t offset = unit * unit_bytes;
+            expected[unit]++;
+            buffer[offset] = expected[unit];
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t offset = unit * unit_bytes;
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "hotset_scan";
+    stream_pipeline_prediction_recorded = "admission_lfu";
+    stream_pipeline_groups_recorded = hot_units;
+    stream_pipeline_group_visits_recorded = units - hot_units;
+    stream_pipeline_group_iterations_recorded = scan_passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+
+    free(expected);
+    return 0;
+}
+
+static int run_policy_phase_shift_hotset(unsigned char* buffer, size_t size,
+                                         uint64_t* checksum,
+                                         size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_PHASE_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t hotset_bytes =
+        env_size("MAI_BENCH_POLICY_PHASE_HOTSET", 8ULL * 1024ULL * 1024ULL);
+    size_t warm_rounds = env_count("MAI_BENCH_POLICY_PHASE_WARM_ROUNDS", 8);
+    size_t active_rounds =
+        env_count("MAI_BENCH_POLICY_PHASE_ACTIVE_ROUNDS", 4);
+    size_t scan_passes = env_count("MAI_BENCH_POLICY_PHASE_SCAN_PASSES", 3);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    hotset_bytes -= hotset_bytes % unit_bytes;
+    size_t hot_units = hotset_bytes / unit_bytes;
+    if (hot_units == 0) {
+        hot_units = 1;
+    }
+    size_t units = size / unit_bytes;
+    if (units < hot_units * 2 + 1) {
+        return -1;
+    }
+    if (warm_rounds == 0) {
+        warm_rounds = 1;
+    }
+    if (active_rounds == 0) {
+        active_rounds = 1;
+    }
+    if (scan_passes == 0) {
+        scan_passes = 1;
+    }
+
+    size_t phase_a = 0;
+    size_t phase_b = hot_units;
+    size_t scan_start = hot_units * 2;
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t round = 0; round < warm_rounds; round++) {
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = phase_a + unit;
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    for (size_t pass = 0; pass < scan_passes; pass++) {
+        for (size_t round = 0; round < active_rounds; round++) {
+            for (size_t unit = 0; unit < hot_units; unit++) {
+                size_t index = phase_b + unit;
+                size_t offset = index * unit_bytes;
+                expected[index]++;
+                buffer[offset] = expected[index];
+                if (buffer[offset] != expected[index]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+        for (size_t index = scan_start; index < units; index++) {
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = phase_b + unit;
+            size_t offset = index * unit_bytes;
+            if (buffer[offset] != expected[index]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "phase_shift_hotset";
+    stream_pipeline_prediction_recorded = "reuse_distance";
+    stream_pipeline_groups_recorded = hot_units;
+    stream_pipeline_group_visits_recorded = units - scan_start;
+    stream_pipeline_group_iterations_recorded = scan_passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_lag_recorded = warm_rounds;
+    stream_pipeline_reclaim_horizon_recorded = active_rounds;
+
+    free(expected);
+    return 0;
+}
+
+static int run_policy_irr_scan_return(unsigned char* buffer, size_t size,
+                                      uint64_t* checksum,
+                                      size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_IRR_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t hotset_bytes =
+        env_size("MAI_BENCH_POLICY_IRR_HOTSET", 8ULL * 1024ULL * 1024ULL);
+    size_t decoy_bytes =
+        env_size("MAI_BENCH_POLICY_IRR_DECOY", 8ULL * 1024ULL * 1024ULL);
+    size_t epochs = env_count("MAI_BENCH_POLICY_IRR_EPOCHS", 6);
+    size_t hot_rounds = env_count("MAI_BENCH_POLICY_IRR_HOT_ROUNDS", 4);
+    size_t decoy_rounds = env_count("MAI_BENCH_POLICY_IRR_DECOY_ROUNDS", 2);
+    size_t decoy_bands = env_count("MAI_BENCH_POLICY_IRR_DECOY_BANDS", 3);
+    size_t seed = env_count("MAI_BENCH_POLICY_IRR_SEED", 23);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    hotset_bytes -= hotset_bytes % unit_bytes;
+    decoy_bytes -= decoy_bytes % unit_bytes;
+    size_t hot_units = hotset_bytes / unit_bytes;
+    size_t decoy_units = decoy_bytes / unit_bytes;
+    if (hot_units == 0) {
+        hot_units = 1;
+    }
+    if (decoy_units == 0) {
+        decoy_units = 1;
+    }
+    if (epochs < 2) {
+        epochs = 2;
+    }
+    if (hot_rounds == 0) {
+        hot_rounds = 1;
+    }
+    if (decoy_rounds == 0) {
+        decoy_rounds = 1;
+    }
+    if (decoy_bands == 0) {
+        decoy_bands = 1;
+    }
+
+    size_t units = size / unit_bytes;
+    if (units < hot_units * 2 + decoy_units + 1) {
+        return -1;
+    }
+    while (decoy_bands > 1 &&
+           hot_units * 2 + decoy_bands * decoy_units >= units) {
+        decoy_bands--;
+    }
+    size_t phase_a = 0;
+    size_t phase_b = hot_units;
+    size_t decoy_start = hot_units * 2;
+    size_t cold_start = decoy_start + decoy_bands * decoy_units;
+    if (cold_start >= units) {
+        return -1;
+    }
+    size_t cold_units = units - cold_start;
+
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    size_t* cold_order = malloc(cold_units * sizeof(*cold_order));
+    if (!expected || !cold_order) {
+        free(expected);
+        free(cold_order);
+        return -1;
+    }
+
+    int adapted_to_phase_b = 0;
+    size_t switch_epoch = epochs / 2;
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (size_t epoch = 0; epoch < epochs; epoch++) {
+        size_t hot_base = epoch < switch_epoch ? phase_a : phase_b;
+        size_t decoy_base =
+            decoy_start + (epoch % decoy_bands) * decoy_units;
+
+        for (size_t round = 0; round < hot_rounds; round++) {
+            for (size_t unit = 0; unit < hot_units; unit++) {
+                size_t index = hot_base + unit;
+                size_t offset = index * unit_bytes;
+                expected[index]++;
+                buffer[offset] = expected[index];
+                if (buffer[offset] != expected[index]) {
+                    free(expected);
+                    free(cold_order);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+
+        for (size_t round = 0; round < decoy_rounds; round++) {
+            for (size_t unit = 0; unit < decoy_units; unit++) {
+                size_t index = decoy_base + unit;
+                size_t offset = index * unit_bytes;
+                expected[index]++;
+                buffer[offset] = expected[index];
+                if (buffer[offset] != expected[index]) {
+                    free(expected);
+                    free(cold_order);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+
+        shuffle_size_order(cold_order, cold_units,
+                           seed + epoch * 11400714819323198485ULL);
+        MaiStats scan_before;
+        int scan_before_available = 0;
+        if (load_stats_optional(&scan_before, &scan_before_available) != 0) {
+            free(expected);
+            free(cold_order);
+            return -1;
+        }
+        for (size_t pos = 0; pos < cold_units; pos++) {
+            size_t index = cold_start + cold_order[pos];
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(expected);
+                free(cold_order);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        if (scan_before_available) {
+            MaiStats scan_after;
+            int scan_after_available = 0;
+            if (load_stats_optional(&scan_after, &scan_after_available) != 0) {
+                free(expected);
+                free(cold_order);
+                return -1;
+            }
+            if (scan_after_available) {
+                policy_irr_scan_faults_recorded +=
+                    scan_after.policy_demand_faults -
+                    scan_before.policy_demand_faults;
+                policy_irr_scan_read_bytes_recorded +=
+                    scan_after.policy_migration_read_bytes -
+                    scan_before.policy_migration_read_bytes;
+                policy_irr_scan_write_bytes_recorded +=
+                    scan_after.policy_migration_write_bytes -
+                    scan_before.policy_migration_write_bytes;
+                policy_irr_scan_hot_evicted_bytes_recorded +=
+                    scan_after.policy_evicted_hot_bytes -
+                    scan_before.policy_evicted_hot_bytes;
+                policy_irr_scan_unused_prefetch_evictions_recorded +=
+                    scan_after.policy_prefetch_unused_evictions -
+                    scan_before.policy_prefetch_unused_evictions;
+                policy_irr_scan_stall_ns_recorded +=
+                    scan_after.policy_demand_fault_stall_ns -
+                    scan_before.policy_demand_fault_stall_ns;
+            }
+        }
+
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            MaiStats return_before;
+            int return_before_available = 0;
+            if (load_stats_optional(&return_before,
+                                    &return_before_available) != 0) {
+                free(expected);
+                free(cold_order);
+                return -1;
+            }
+            size_t index = hot_base + unit;
+            size_t offset = index * unit_bytes;
+            if (buffer[offset] != expected[index]) {
+                free(expected);
+                free(cold_order);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+            policy_irr_hot_return_touches_recorded++;
+            if (return_before_available) {
+                MaiStats return_after;
+                int return_after_available = 0;
+                if (load_stats_optional(&return_after,
+                                        &return_after_available) != 0) {
+                    free(expected);
+                    free(cold_order);
+                    return -1;
+                }
+                if (return_after_available) {
+                    size_t faults =
+                        return_after.policy_demand_faults -
+                        return_before.policy_demand_faults;
+                    if (faults == 0) {
+                        policy_irr_hot_return_hits_recorded++;
+                        if (epoch >= switch_epoch && !adapted_to_phase_b) {
+                            policy_irr_adaptation_lag_touches_recorded++;
+                            adapted_to_phase_b = 1;
+                        }
+                    } else {
+                        policy_irr_hot_return_faults_recorded += faults;
+                        if (epoch >= switch_epoch && !adapted_to_phase_b) {
+                            policy_irr_adaptation_lag_touches_recorded++;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (size_t unit = 0; unit < decoy_units; unit++) {
+            MaiStats return_before;
+            int return_before_available = 0;
+            if (load_stats_optional(&return_before,
+                                    &return_before_available) != 0) {
+                free(expected);
+                free(cold_order);
+                return -1;
+            }
+            size_t index = decoy_base + unit;
+            size_t offset = index * unit_bytes;
+            if (buffer[offset] != expected[index]) {
+                free(expected);
+                free(cold_order);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+            policy_irr_decoy_return_touches_recorded++;
+            if (return_before_available) {
+                MaiStats return_after;
+                int return_after_available = 0;
+                if (load_stats_optional(&return_after,
+                                        &return_after_available) != 0) {
+                    free(expected);
+                    free(cold_order);
+                    return -1;
+                }
+                if (return_after_available) {
+                    size_t faults =
+                        return_after.policy_demand_faults -
+                        return_before.policy_demand_faults;
+                    if (faults == 0) {
+                        policy_irr_decoy_return_hits_recorded++;
+                    } else {
+                        policy_irr_decoy_return_faults_recorded += faults;
+                    }
+                }
+            }
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        free(cold_order);
+        return -1;
+    }
+    if (policy_irr_hot_return_touches_recorded != 0) {
+        policy_irr_hot_return_hit_ratio_recorded =
+            (double)policy_irr_hot_return_hits_recorded /
+            (double)policy_irr_hot_return_touches_recorded;
+    }
+    if (policy_irr_decoy_return_touches_recorded != 0) {
+        policy_irr_decoy_return_hit_ratio_recorded =
+            (double)policy_irr_decoy_return_hits_recorded /
+            (double)policy_irr_decoy_return_touches_recorded;
+    }
+    policy_irr_discrimination_score_recorded =
+        policy_irr_hot_return_hit_ratio_recorded -
+        policy_irr_decoy_return_hit_ratio_recorded;
+    if (!adapted_to_phase_b && policy_irr_adaptation_lag_touches_recorded == 0) {
+        policy_irr_adaptation_lag_touches_recorded =
+            policy_irr_hot_return_touches_recorded;
+    }
+    stream_pipeline_order_recorded = "irr_scan_return";
+    stream_pipeline_prediction_recorded = "irr_discrimination";
+    stream_pipeline_groups_recorded = 2 + decoy_bands;
+    stream_pipeline_group_visits_recorded = epochs;
+    stream_pipeline_group_iterations_recorded = hot_rounds;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_group_bytes_recorded = hot_units * unit_bytes;
+    stream_pipeline_reclaim_lag_recorded = decoy_rounds;
+    stream_pipeline_reclaim_horizon_recorded = cold_units;
+    stream_pipeline_unique_cold_visits_recorded = cold_units;
+    stream_pipeline_seed_recorded = seed;
+
+    free(expected);
+    free(cold_order);
+    return 0;
+}
+
+static int run_policy_recency_frequency_pivot(unsigned char* buffer,
+                                              size_t size,
+                                              uint64_t* checksum,
+                                              size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_PIVOT_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t hotset_bytes =
+        env_size("MAI_BENCH_POLICY_PIVOT_HOTSET", 8ULL * 1024ULL * 1024ULL);
+    size_t warm_rounds =
+        env_count("MAI_BENCH_POLICY_PIVOT_WARM_ROUNDS", 8);
+    size_t burst_groups =
+        env_count("MAI_BENCH_POLICY_PIVOT_BURST_GROUPS", 3);
+    size_t burst_rounds =
+        env_count("MAI_BENCH_POLICY_PIVOT_BURST_ROUNDS", 3);
+    size_t return_rounds =
+        env_count("MAI_BENCH_POLICY_PIVOT_RETURN_ROUNDS", 4);
+    size_t scan_passes =
+        env_count("MAI_BENCH_POLICY_PIVOT_SCAN_PASSES", 2);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    hotset_bytes -= hotset_bytes % unit_bytes;
+    size_t hot_units = hotset_bytes / unit_bytes;
+    if (hot_units == 0) {
+        hot_units = 1;
+    }
+    if (burst_groups == 0) {
+        burst_groups = 1;
+    }
+    if (warm_rounds == 0) {
+        warm_rounds = 1;
+    }
+    if (burst_rounds == 0) {
+        burst_rounds = 1;
+    }
+    if (return_rounds == 0) {
+        return_rounds = 1;
+    }
+    if (scan_passes == 0) {
+        scan_passes = 1;
+    }
+
+    size_t units = size / unit_bytes;
+    size_t active_groups = burst_groups + 1;
+    if (active_groups > SIZE_MAX / hot_units) {
+        return -1;
+    }
+    size_t scan_start = active_groups * hot_units;
+    if (units <= scan_start) {
+        return -1;
+    }
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (size_t round = 0; round < warm_rounds; round++) {
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t offset = unit * unit_bytes;
+            expected[unit]++;
+            buffer[offset] = expected[unit];
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    for (size_t pass = 0; pass < scan_passes; pass++) {
+        for (size_t group = 0; group < burst_groups; group++) {
+            size_t base = (group + 1) * hot_units;
+            for (size_t round = 0; round < burst_rounds; round++) {
+                for (size_t unit = 0; unit < hot_units; unit++) {
+                    size_t index = base + unit;
+                    size_t offset = index * unit_bytes;
+                    expected[index]++;
+                    buffer[offset] = expected[index];
+                    if (buffer[offset] != expected[index]) {
+                        free(expected);
+                        return -1;
+                    }
+                    *checksum += buffer[offset];
+                    (*touches)++;
+                }
+            }
+            for (size_t index = scan_start; index < units; index++) {
+                size_t offset = index * unit_bytes;
+                expected[index]++;
+                buffer[offset] = expected[index];
+                if (buffer[offset] != expected[index]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+            for (size_t unit = 0; unit < hot_units; unit++) {
+                size_t index = base + unit;
+                size_t offset = index * unit_bytes;
+                if (buffer[offset] != expected[index]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+
+        for (size_t round = 0; round < return_rounds; round++) {
+            for (size_t unit = 0; unit < hot_units; unit++) {
+                MaiStats return_before;
+                int return_before_available = 0;
+                if (load_stats_optional(&return_before,
+                                        &return_before_available) != 0) {
+                    free(expected);
+                    return -1;
+                }
+                size_t offset = unit * unit_bytes;
+                expected[unit]++;
+                buffer[offset] = expected[unit];
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+                policy_pivot_return_touches_recorded++;
+                if (return_before_available) {
+                    MaiStats return_after;
+                    int return_after_available = 0;
+                    if (load_stats_optional(&return_after,
+                                            &return_after_available) != 0) {
+                        free(expected);
+                        return -1;
+                    }
+                    if (return_after_available) {
+                        size_t faults =
+                            return_after.policy_demand_faults -
+                            return_before.policy_demand_faults;
+                        if (faults == 0) {
+                            policy_pivot_return_hits_recorded++;
+                        } else {
+                            policy_pivot_return_faults_recorded += faults;
+                            if (policy_pivot_adaptation_lag_touches_recorded ==
+                                0) {
+                                policy_pivot_adaptation_lag_touches_recorded =
+                                    policy_pivot_return_touches_recorded;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (size_t index = scan_start; index < units; index++) {
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t offset = unit * unit_bytes;
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "recency_frequency_pivot";
+    stream_pipeline_prediction_recorded = "car_adaptive";
+    stream_pipeline_groups_recorded = active_groups;
+    stream_pipeline_group_visits_recorded = active_groups * scan_passes;
+    stream_pipeline_group_iterations_recorded = burst_rounds;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_lag_recorded = warm_rounds;
+    stream_pipeline_reclaim_horizon_recorded = return_rounds;
+    if (policy_pivot_return_touches_recorded != 0) {
+        policy_pivot_hot_return_hit_ratio_recorded =
+            (double)policy_pivot_return_hits_recorded /
+            (double)policy_pivot_return_touches_recorded;
+    }
+
+    free(expected);
+    return 0;
+}
+
+static int run_policy_long_tail_admission(unsigned char* buffer, size_t size,
+                                          uint64_t* checksum,
+                                          size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_LONGTAIL_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t hotset_bytes =
+        env_size("MAI_BENCH_POLICY_LONGTAIL_HOTSET", 8ULL * 1024ULL * 1024ULL);
+    size_t medium_bytes =
+        env_size("MAI_BENCH_POLICY_LONGTAIL_MEDIUM", 8ULL * 1024ULL * 1024ULL);
+    size_t warm_rounds =
+        env_count("MAI_BENCH_POLICY_LONGTAIL_WARM_ROUNDS", 8);
+    size_t medium_rounds =
+        env_count("MAI_BENCH_POLICY_LONGTAIL_MEDIUM_ROUNDS", 2);
+    size_t cold_passes =
+        env_count("MAI_BENCH_POLICY_LONGTAIL_COLD_PASSES", 3);
+    size_t phase_rounds =
+        env_count("MAI_BENCH_POLICY_LONGTAIL_PHASE_ROUNDS", 3);
+    size_t seed = env_count("MAI_BENCH_POLICY_LONGTAIL_SEED", 17);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    hotset_bytes -= hotset_bytes % unit_bytes;
+    medium_bytes -= medium_bytes % unit_bytes;
+    size_t hot_units = hotset_bytes / unit_bytes;
+    size_t medium_units = medium_bytes / unit_bytes;
+    if (hot_units == 0) {
+        hot_units = 1;
+    }
+    if (medium_units == 0) {
+        medium_units = 1;
+    }
+    size_t units = size / unit_bytes;
+    if (units < hot_units * 2 + medium_units + 1) {
+        return -1;
+    }
+    if (warm_rounds == 0) {
+        warm_rounds = 1;
+    }
+    if (medium_rounds == 0) {
+        medium_rounds = 1;
+    }
+    if (cold_passes == 0) {
+        cold_passes = 1;
+    }
+    if (phase_rounds == 0) {
+        phase_rounds = 1;
+    }
+
+    size_t hot_a = 0;
+    size_t hot_b = hot_units;
+    size_t medium_start = hot_units * 2;
+    size_t cold_start = medium_start + medium_units;
+    size_t cold_units = units - cold_start;
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+    unsigned char* visited = calloc(cold_units, sizeof(*visited));
+    if (!visited) {
+        free(expected);
+        return -1;
+    }
+    size_t unique_cold_visits = 0;
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (size_t round = 0; round < warm_rounds; round++) {
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = hot_a + unit;
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    for (size_t pass = 0; pass < cold_passes; pass++) {
+        for (size_t round = 0; round < medium_rounds; round++) {
+            for (size_t unit = 0; unit < medium_units; unit++) {
+                size_t index = medium_start + unit;
+                size_t offset = index * unit_bytes;
+                expected[index]++;
+                buffer[offset] = expected[index];
+                if (buffer[offset] != expected[index]) {
+                    free(visited);
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+        size_t salt = seed + pass * 2654435761ULL;
+        size_t start_unit = salt % cold_units;
+        size_t stride = coprime_stride(cold_units, salt ^ 1103515245ULL);
+        memset(visited, 0, cold_units * sizeof(*visited));
+        size_t pass_unique = 0;
+        for (size_t step = 0; step < cold_units; step++) {
+            size_t cold_unit = (start_unit + step * stride) % cold_units;
+            if (visited[cold_unit]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            visited[cold_unit] = 1;
+            pass_unique++;
+            size_t index = cold_start + cold_unit;
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        if (pass_unique != cold_units) {
+            free(visited);
+            free(expected);
+            return -1;
+        }
+        unique_cold_visits += pass_unique;
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = hot_a + unit;
+            size_t offset = index * unit_bytes;
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    for (size_t round = 0; round < phase_rounds; round++) {
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = hot_b + unit;
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        size_t salt = seed + round * 1013904223ULL;
+        size_t start_unit = salt % cold_units;
+        size_t stride = coprime_stride(cold_units, salt ^ 1664525ULL);
+        memset(visited, 0, cold_units * sizeof(*visited));
+        size_t pass_unique = 0;
+        for (size_t step = 0; step < cold_units; step++) {
+            size_t cold_unit = (start_unit + step * stride) % cold_units;
+            if (visited[cold_unit]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            visited[cold_unit] = 1;
+            pass_unique++;
+            size_t index = cold_start + cold_unit;
+            size_t offset = index * unit_bytes;
+            expected[index]++;
+            buffer[offset] = expected[index];
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+        if (pass_unique != cold_units) {
+            free(visited);
+            free(expected);
+            return -1;
+        }
+        unique_cold_visits += pass_unique;
+        for (size_t unit = 0; unit < hot_units; unit++) {
+            size_t index = hot_b + unit;
+            size_t offset = index * unit_bytes;
+            if (buffer[offset] != expected[index]) {
+                free(visited);
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(visited);
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "long_tail_admission";
+    stream_pipeline_prediction_recorded = "tinylfu_admission";
+    stream_pipeline_groups_recorded = 3;
+    stream_pipeline_group_visits_recorded = cold_units;
+    stream_pipeline_group_iterations_recorded = cold_passes + phase_rounds;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_lag_recorded = warm_rounds;
+    stream_pipeline_reclaim_horizon_recorded = phase_rounds;
+    stream_pipeline_unique_cold_visits_recorded = unique_cold_visits;
+    stream_pipeline_seed_recorded = seed;
+
+    free(visited);
+    free(expected);
+    return 0;
+}
+
+static int run_policy_best_offset_lag(unsigned char* buffer, size_t size,
+                                      uint64_t* checksum, size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_OFFSET_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t offset_chunks =
+        env_count("MAI_BENCH_POLICY_OFFSET_CHUNKS", 8);
+    size_t lookahead =
+        env_count("MAI_BENCH_POLICY_OFFSET_LOOKAHEAD", 4);
+    size_t passes = env_count("MAI_BENCH_POLICY_OFFSET_PASSES", 3);
+    size_t seed = env_count("MAI_BENCH_POLICY_OFFSET_SEED", 11);
+    size_t noise = env_count("MAI_BENCH_POLICY_OFFSET_NOISE", 0);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    size_t units = size / unit_bytes;
+    if (units < 4) {
+        return -1;
+    }
+    if (offset_chunks == 0) {
+        offset_chunks = 2;
+    }
+    if (offset_chunks == 1 && units > 3) {
+        offset_chunks = 2;
+    }
+    if (offset_chunks >= units) {
+        offset_chunks = units / 2;
+    }
+    if (offset_chunks == 0 || offset_chunks >= units) {
+        return -1;
+    }
+    if (lookahead == 0) {
+        lookahead = 1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+
+    size_t pair_count = offset_chunks;
+    if (pair_count > units - offset_chunks) {
+        pair_count = units - offset_chunks;
+    }
+    if (pair_count == 0) {
+        return -1;
+    }
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+    size_t* order = malloc(pair_count * sizeof(*order));
+    if (!order) {
+        free(expected);
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        size_t salt = seed + pass * 2654435761ULL;
+        shuffle_size_order(order, pair_count, salt ^ 1103515245ULL);
+        size_t steps = pair_count + lookahead;
+        for (size_t step = 0; step < steps; step++) {
+            if (step < pair_count) {
+                size_t anchor = order[step];
+                size_t offset = anchor * unit_bytes;
+                expected[anchor]++;
+                buffer[offset] = expected[anchor];
+                if (buffer[offset] != expected[anchor]) {
+                    free(order);
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+            if (noise != 0 && step < pair_count) {
+                size_t noise_index =
+                    (salt + step * 1664525ULL + 1013904223ULL) % units;
+                size_t offset = noise_index * unit_bytes;
+                expected[noise_index]++;
+                buffer[offset] = expected[noise_index];
+                if (buffer[offset] != expected[noise_index]) {
+                    free(order);
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+            if (step >= lookahead &&
+                step - lookahead < pair_count) {
+                size_t delayed = step - lookahead;
+                size_t anchor = order[delayed];
+                size_t target = anchor + offset_chunks;
+                size_t offset = target * unit_bytes;
+                expected[target]++;
+                buffer[offset] = expected[target];
+                if (buffer[offset] != expected[target]) {
+                    free(order);
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(order);
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "best_offset_lag";
+    stream_pipeline_prediction_recorded = "best_offset";
+    stream_pipeline_groups_recorded = pair_count;
+    stream_pipeline_group_visits_recorded = pair_count;
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_lag_recorded = lookahead;
+    stream_pipeline_reclaim_horizon_recorded = offset_chunks;
+    stream_pipeline_seed_recorded = seed;
+
+    free(order);
+    free(expected);
+    return 0;
+}
+
+static int run_policy_successor_cycle(unsigned char* buffer, size_t size,
+                                      uint64_t* checksum,
+                                      size_t* touches) {
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_SUCCESSOR_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t passes = env_count_compat("MAI_BENCH_POLICY_PASSES",
+                                     "MAI_BENCH_STREAM_PASSES", 3);
+    size_t multiplier = env_count("MAI_BENCH_POLICY_SUCCESSOR_MULTIPLIER", 5);
+    size_t addend = env_count("MAI_BENCH_POLICY_SUCCESSOR_ADDEND", 3);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    size_t units = size / unit_bytes;
+    if (units < 4) {
+        return -1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+    if (multiplier == 0) {
+        multiplier = 5;
+    }
+    if (addend == 0) {
+        addend = 3;
+    }
+    if ((multiplier % units) == 0) {
+        multiplier++;
+    }
+    if ((addend % units) == 0) {
+        addend++;
+    }
+
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+    unsigned char* visited = calloc(units, sizeof(*visited));
+    if (!visited) {
+        free(expected);
+        return -1;
+    }
+    size_t cycle_index = 0;
+    for (size_t step = 0; step < units; step++) {
+        if (visited[cycle_index]) {
+            free(visited);
+            free(expected);
+            return -1;
+        }
+        visited[cycle_index] = 1;
+        cycle_index = (multiplier * cycle_index + addend) % units;
+    }
+    if (cycle_index != 0) {
+        free(visited);
+        free(expected);
+        return -1;
+    }
+    free(visited);
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t pass = 0; pass < passes; pass++) {
+        size_t unit = 0;
+        for (size_t step = 0; step < units; step++) {
+            size_t offset = unit * unit_bytes;
+            expected[unit]++;
+            buffer[offset] = expected[unit];
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+            unit = (multiplier * unit + addend) % units;
+        }
+        unit = 0;
+        for (size_t step = 0; step < units; step++) {
+            size_t offset = unit * unit_bytes;
+            if (buffer[offset] != expected[unit]) {
+                free(expected);
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+            unit = (multiplier * unit + addend) % units;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "successor_cycle";
+    stream_pipeline_prediction_recorded = "successor";
+    stream_pipeline_groups_recorded = units;
+    stream_pipeline_group_visits_recorded = passes;
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_scalar_recorded = (double)multiplier;
+    stream_pipeline_reclaim_horizon_recorded = addend;
+
+    free(expected);
+    return 0;
+}
+
+static int run_policy_hinted_sequential(unsigned char* buffer, size_t size,
+                                        uint64_t* checksum,
+                                        size_t* touches) {
+    load_range_ops_optional();
+
+    MaiHintOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.size = sizeof(opts);
+    opts.window_bytes =
+        env_size("MAI_BENCH_HINT_WINDOW", 8ULL * 1024ULL * 1024ULL);
+    opts.hotset_bytes = env_size("MAI_BENCH_HINT_HOTSET", 0);
+    if (env_flag("MAI_BENCH_HINT_ENABLE", 1) && hint_range &&
+        hint_range(buffer, size, MAI_HINT_SEQUENTIAL, &opts) != 0) {
+        return -1;
+    }
+
+    size_t passes = env_count("MAI_ACCESS_PASSES", 1);
+    if (passes == 0) {
+        passes = 1;
+    }
+    size_t pages = size / page_size_bytes;
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t page = 0; page < pages; page++) {
+            size_t offset = page * page_size_bytes;
+            unsigned char value = expected_byte(page, pass);
+            buffer[offset] = value;
+            *checksum += value;
+            (*touches)++;
+        }
+        for (size_t page = 0; page < pages; page++) {
+            size_t offset = page * page_size_bytes;
+            unsigned char expected = expected_byte(page, pass);
+            if (buffer[offset] != expected) {
+                return -1;
+            }
+            *checksum += buffer[offset];
+            (*touches)++;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, page_size_bytes, &logical_bytes) != 0) {
+        return -1;
+    }
+    stream_pipeline_order_recorded = "hinted_sequential";
+    stream_pipeline_prediction_recorded = "application_hint";
+    stream_pipeline_matrix_bytes_recorded = size;
+    stream_pipeline_total_matrix_bytes_recorded = size;
+    stream_pipeline_group_iterations_recorded = passes;
+    return 0;
+}
+
+static int run_policy_signature_context_cycle(unsigned char* buffer,
+                                              size_t size,
+                                              uint64_t* checksum,
+                                              size_t* touches) {
+    static const size_t context_a[] = {0, 2, 3, 5, 7};
+    static const size_t context_b[] = {1, 4, 3, 6, 4};
+    const size_t context_len = sizeof(context_a) / sizeof(context_a[0]);
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_SIGNATURE_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t region_units =
+        env_count("MAI_BENCH_POLICY_SIGNATURE_REGION_UNITS", 8);
+    size_t passes =
+        env_count("MAI_BENCH_POLICY_SIGNATURE_PASSES", 4);
+    size_t seed = env_count("MAI_BENCH_POLICY_SIGNATURE_SEED", 7);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    if (region_units < 8) {
+        region_units = 8;
+    }
+    size_t units = size / unit_bytes;
+    if (units < region_units || units % region_units != 0) {
+        return -1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+    size_t regions = units / region_units;
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    size_t* order = calloc(regions, sizeof(*order));
+    if (!expected || !order) {
+        free(order);
+        free(expected);
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t pass = 0; pass < passes; pass++) {
+        shuffle_size_order(order, regions, (uint64_t)seed +
+                           pass * 2654435761ULL);
+        for (size_t order_index = 0; order_index < regions; order_index++) {
+            size_t region = order[order_index];
+            size_t region_base = region * region_units;
+            for (size_t context = 0; context < 2; context++) {
+                const size_t* pattern =
+                    ((pass + order_index + context) & 1u) == 0 ?
+                    context_a : context_b;
+                for (size_t pos = 0; pos < context_len; pos++) {
+                    size_t unit = region_base + pattern[pos];
+                    size_t offset = unit * unit_bytes;
+                    expected[unit]++;
+                    buffer[offset] = expected[unit];
+                    if (buffer[offset] != expected[unit]) {
+                        free(order);
+                        free(expected);
+                        return -1;
+                    }
+                    *checksum += buffer[offset];
+                    (*touches)++;
+                }
+            }
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(order);
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "signature_context_cycle";
+    stream_pipeline_prediction_recorded = "signature_history";
+    stream_pipeline_groups_recorded = regions;
+    stream_pipeline_group_visits_recorded = regions * passes;
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_horizon_recorded = region_units;
+    stream_pipeline_seed_recorded = seed;
+
+    free(order);
+    free(expected);
+    return 0;
+}
+
+static size_t spatial_region_units_env(void) {
+    return env_count("MAI_BENCH_POLICY_SPATIAL_REGION_UNITS", 8);
+}
+
+static size_t spatial_mask_units(size_t region_units) {
+    return region_units < 3 ? region_units : 3;
+}
+
+static size_t spatial_pattern_offset(size_t position, size_t pass,
+                                     size_t region, size_t region_units,
+                                     int mixed_masks) {
+    static const size_t offsets_a[] = {0, 3, 5};
+    static const size_t offsets_b[] = {1, 4, 7};
+    const size_t* offsets = offsets_a;
+    size_t count = sizeof(offsets_a) / sizeof(offsets_a[0]);
+    if (region_units >= 8 && mixed_masks && (region & 1u) != 0) {
+        offsets = offsets_b;
+    }
+    if (region_units < 8) {
+        count = spatial_mask_units(region_units);
+    }
+    size_t rotated = count == 0 ? 0 : (position + pass + region) % count;
+    if (((pass + region) & 1u) != 0) {
+        rotated = count - 1 - rotated;
+    }
+    if (region_units >= 8) {
+        return offsets[rotated];
+    }
+    if (mixed_masks && (region & 1u) != 0 && region_units > count) {
+        return (rotated + 1) % region_units;
+    }
+    return rotated;
+}
+
+static int run_policy_spatial_region_mask(unsigned char* buffer, size_t size,
+                                          uint64_t* checksum,
+                                          size_t* touches) {
+    const size_t region_units = spatial_region_units_env();
+    const size_t mask_units = spatial_mask_units(region_units);
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_SPATIAL_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t passes = env_count_compat("MAI_BENCH_POLICY_PASSES",
+                                     "MAI_BENCH_STREAM_PASSES", 3);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    size_t units = size / unit_bytes;
+    if (region_units < 2 || mask_units == 0 || units < region_units ||
+        units % region_units != 0) {
+        return -1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+    size_t regions = units / region_units;
+
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t region = 0; region < regions; region++) {
+            size_t region_base = region * region_units;
+            for (size_t position = 0; position < mask_units; position++) {
+                size_t unit = region_base +
+                    spatial_pattern_offset(position, pass, region,
+                                           region_units, 0);
+                size_t offset = unit * unit_bytes;
+                expected[unit]++;
+                buffer[offset] = expected[unit];
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+        for (size_t region = 0; region < regions; region++) {
+            size_t region_base = region * region_units;
+            for (size_t position = 0; position < mask_units; position++) {
+                size_t unit = region_base +
+                    spatial_pattern_offset(position, pass + 1, region,
+                                           region_units, 0);
+                size_t offset = unit * unit_bytes;
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "spatial_region_mask";
+    stream_pipeline_prediction_recorded = "spatial";
+    stream_pipeline_groups_recorded = regions;
+    stream_pipeline_group_visits_recorded = mask_units;
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_horizon_recorded = region_units;
+
+    free(expected);
+    return 0;
+}
+
+static int run_policy_spatial_interleaved_mask(unsigned char* buffer,
+                                               size_t size,
+                                               uint64_t* checksum,
+                                               size_t* touches) {
+    const size_t region_units = spatial_region_units_env();
+    const size_t mask_units = spatial_mask_units(region_units);
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_SPATIAL_UNIT", 2ULL * 1024ULL * 1024ULL);
+    size_t passes = env_count_compat("MAI_BENCH_POLICY_PASSES",
+                                     "MAI_BENCH_STREAM_PASSES", 3);
+
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+    size_t units = size / unit_bytes;
+    if (region_units < 2 || mask_units == 0 || units < region_units ||
+        units % region_units != 0) {
+        return -1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+    size_t regions = units / region_units;
+
+    unsigned char* expected = calloc(units, sizeof(*expected));
+    if (!expected) {
+        return -1;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t position = 0; position < mask_units; position++) {
+            for (size_t region = 0; region < regions; region++) {
+                size_t region_base = region * region_units;
+                size_t unit = region_base +
+                    spatial_pattern_offset(position, pass, region,
+                                           region_units, 1);
+                size_t offset = unit * unit_bytes;
+                expected[unit]++;
+                buffer[offset] = expected[unit];
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+        for (size_t position = 0; position < mask_units; position++) {
+            for (size_t region = 0; region < regions; region++) {
+                size_t region_base = region * region_units;
+                size_t unit = region_base +
+                    spatial_pattern_offset(position, pass + 1, region,
+                                           region_units, 1);
+                size_t offset = unit * unit_bytes;
+                if (buffer[offset] != expected[unit]) {
+                    free(expected);
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        free(expected);
+        return -1;
+    }
+    stream_pipeline_order_recorded = "spatial_interleaved_mask";
+    stream_pipeline_prediction_recorded = "spatial";
+    stream_pipeline_groups_recorded = regions;
+    stream_pipeline_group_visits_recorded = mask_units;
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_reclaim_horizon_recorded = region_units;
 
     free(expected);
     return 0;
@@ -2256,6 +4308,13 @@ static uint64_t stream_pipeline_rng_next(uint64_t* state) {
     return *state;
 }
 
+static size_t stream_pipeline_rng_mod(uint64_t* state, size_t modulo) {
+    if (modulo == 0) {
+        return 0;
+    }
+    return (size_t)((stream_pipeline_rng_next(state) >> 32) % modulo);
+}
+
 static int stream_pipeline_build_order(size_t* order, size_t cycles) {
     const char* mode = env_value_compat("MAI_BENCH_STREAM_PIPELINE_ORDER",
                                         "MAI_STREAM_PIPELINE_ORDER");
@@ -2267,6 +4326,18 @@ static int stream_pipeline_build_order(size_t* order, size_t cycles) {
         stream_pipeline_order_recorded = "sequential";
         for (size_t cycle = 0; cycle < cycles; cycle++) {
             order[cycle] = cycle % STREAM_PIPELINE_GROUPS;
+        }
+        return 0;
+    }
+
+    if (strcmp(mode, "phase_decoy") == 0) {
+        static const size_t phase_decoy_pattern[] = {0, 1, 0, 2};
+        stream_pipeline_order_recorded = "phase_decoy";
+        for (size_t cycle = 0; cycle < cycles; cycle++) {
+            order[cycle] =
+                phase_decoy_pattern[cycle %
+                                    (sizeof(phase_decoy_pattern) /
+                                     sizeof(phase_decoy_pattern[0]))];
         }
         return 0;
     }
@@ -2285,19 +4356,48 @@ static int stream_pipeline_build_order(size_t* order, size_t cycles) {
         strcmp(mode, "random_no_repeat") == 0 ? "random_no_repeat" : "random";
 
     uint64_t state = (uint64_t)seed;
-    size_t current = stream_pipeline_rng_next(&state) % STREAM_PIPELINE_GROUPS;
+    size_t current = stream_pipeline_rng_mod(&state, STREAM_PIPELINE_GROUPS);
     for (size_t cycle = 0; cycle < cycles; cycle++) {
         order[cycle] = current;
         if (strcmp(mode, "random_no_repeat") == 0) {
-            current = (current + 1 +
-                       (stream_pipeline_rng_next(&state) %
-                        (STREAM_PIPELINE_GROUPS - 1))) %
+            current = (current + 1 + stream_pipeline_rng_mod(
+                           &state, STREAM_PIPELINE_GROUPS - 1)) %
                 STREAM_PIPELINE_GROUPS;
         } else {
-            current = stream_pipeline_rng_next(&state) % STREAM_PIPELINE_GROUPS;
+            current = stream_pipeline_rng_mod(&state, STREAM_PIPELINE_GROUPS);
         }
     }
     return 0;
+}
+
+static void stream_pipeline_record_order_sequence(const size_t* order,
+                                                  size_t cycles) {
+    if (!order || cycles == 0) {
+        snprintf(stream_pipeline_order_sequence_recorded,
+                 sizeof(stream_pipeline_order_sequence_recorded), "none");
+        return;
+    }
+
+    size_t offset = 0;
+    for (size_t cycle = 0; cycle < cycles; cycle++) {
+        int written = snprintf(stream_pipeline_order_sequence_recorded + offset,
+                               sizeof(stream_pipeline_order_sequence_recorded) -
+                                   offset,
+                               "%s%zu", cycle == 0 ? "" : ",", order[cycle]);
+        if (written < 0) {
+            break;
+        }
+        size_t used = (size_t)written;
+        if (used >= sizeof(stream_pipeline_order_sequence_recorded) - offset) {
+            size_t length = sizeof(stream_pipeline_order_sequence_recorded);
+            if (length > 4) {
+                memcpy(stream_pipeline_order_sequence_recorded + length - 4,
+                       "...", 4);
+            }
+            break;
+        }
+        offset += used;
+    }
 }
 
 static int stream_pipeline_process_group_phase(double** matrices, size_t group,
@@ -2379,6 +4479,93 @@ static int stream_pipeline_check_index(double** matrices, size_t group,
     return 0;
 }
 
+static int run_policy_multistream_stride(unsigned char* buffer, size_t size,
+                                         uint64_t* checksum,
+                                         size_t* touches) {
+    size_t streams = env_count("MAI_BENCH_POLICY_STREAMS", 4);
+    size_t active_streams =
+        env_count("MAI_BENCH_POLICY_ACTIVE_STREAMS", streams);
+    size_t passes = env_count_compat("MAI_BENCH_POLICY_PASSES",
+                                     "MAI_BENCH_STREAM_PASSES", 3);
+    size_t unit_bytes =
+        env_size("MAI_BENCH_POLICY_STRIDE_UNIT", 2ULL * 1024ULL * 1024ULL);
+
+    if (streams == 0) {
+        streams = 1;
+    }
+    if (passes == 0) {
+        passes = 1;
+    }
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    unit_bytes -= unit_bytes % page_size_bytes;
+    if (unit_bytes == 0 || unit_bytes > size) {
+        return -1;
+    }
+
+    size_t units = size / unit_bytes;
+    if (units == 0) {
+        return -1;
+    }
+    if (streams > units) {
+        streams = units;
+    }
+    if (active_streams == 0 || active_streams > streams) {
+        active_streams = streams;
+    }
+
+    struct timespec start;
+    struct timespec end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (size_t pass = 0; pass < passes; pass++) {
+        for (size_t stream = 0; stream < active_streams; stream++) {
+            for (size_t step = 0; step < units; step++) {
+                size_t unit = stream + step * streams;
+                if (unit >= units) {
+                    continue;
+                }
+                size_t offset = unit * unit_bytes;
+                unsigned char value = expected_byte(unit, pass);
+                buffer[offset] = value;
+                *checksum += value;
+                (*touches)++;
+            }
+        }
+        for (size_t stream = 0; stream < active_streams; stream++) {
+            for (size_t step = 0; step < units; step++) {
+                size_t unit = stream + step * streams;
+                if (unit >= units) {
+                    continue;
+                }
+                size_t offset = unit * unit_bytes;
+                unsigned char expected = expected_byte(unit, pass);
+                if (buffer[offset] != expected) {
+                    return -1;
+                }
+                *checksum += buffer[offset];
+                (*touches)++;
+            }
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    measured_access_seconds = seconds_since(&start, &end);
+    if (mul_size(*touches, unit_bytes, &logical_bytes) != 0 ||
+        mul_size(units, unit_bytes,
+                 &stream_pipeline_total_matrix_bytes_recorded) != 0) {
+        return -1;
+    }
+    stream_pipeline_prediction_recorded = "stride";
+    stream_pipeline_groups_recorded = streams;
+    stream_pipeline_group_visits_recorded = active_streams;
+    stream_pipeline_order_recorded = "strided_streams";
+    stream_pipeline_group_iterations_recorded = passes;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    return 0;
+}
+
 static int run_stream_kernel_pipeline(const char* mode, unsigned char* buffer,
                                       size_t size, uint64_t* checksum,
                                       size_t* touches) {
@@ -2418,6 +4605,11 @@ static int run_stream_kernel_pipeline(const char* mode, unsigned char* buffer,
     unsigned char* matrix_buffers[STREAM_PIPELINE_MATRICES] = {0};
     int matrix_munmap[STREAM_PIPELINE_MATRICES] = {0};
     double* cycle_rates = NULL;
+    uint64_t* cycle_demand_faults = NULL;
+    uint64_t* cycle_read_bytes = NULL;
+    uint64_t* cycle_write_bytes = NULL;
+    uint64_t* cycle_stall_ns = NULL;
+    uint64_t* cycle_unused_prefetch_evictions = NULL;
     size_t* group_order = NULL;
     int rc = -1;
     matrices[0] = (double*)buffer;
@@ -2432,13 +4624,22 @@ static int run_stream_kernel_pipeline(const char* mode, unsigned char* buffer,
     }
 
     cycle_rates = calloc(cycles, sizeof(*cycle_rates));
-    if (!cycle_rates) {
+    cycle_demand_faults = calloc(cycles, sizeof(*cycle_demand_faults));
+    cycle_read_bytes = calloc(cycles, sizeof(*cycle_read_bytes));
+    cycle_write_bytes = calloc(cycles, sizeof(*cycle_write_bytes));
+    cycle_stall_ns = calloc(cycles, sizeof(*cycle_stall_ns));
+    cycle_unused_prefetch_evictions =
+        calloc(cycles, sizeof(*cycle_unused_prefetch_evictions));
+    if (!cycle_rates || !cycle_demand_faults || !cycle_read_bytes ||
+        !cycle_write_bytes || !cycle_stall_ns ||
+        !cycle_unused_prefetch_evictions) {
         goto cleanup;
     }
     group_order = calloc(cycles, sizeof(*group_order));
     if (!group_order || stream_pipeline_build_order(group_order, cycles) != 0) {
         goto cleanup;
     }
+    stream_pipeline_record_order_sequence(group_order, cycles);
 
     size_t tile_bytes = env_size_compat("MAI_BENCH_STREAM_TILE",
                                         "MAI_STREAM_TILE",
@@ -2472,6 +4673,17 @@ static int run_stream_kernel_pipeline(const char* mode, unsigned char* buffer,
     stream_pipeline_total_matrix_bytes_recorded = total_matrix_bytes;
     stream_pipeline_reclaim_lag_recorded = 0;
     stream_pipeline_reclaim_horizon_recorded = 0;
+    size_t migration_chunk =
+        env_size("MAI_MIGRATION_CHUNK", 2ULL * 1024ULL * 1024ULL);
+    if (migration_chunk < page_size_bytes) {
+        migration_chunk = page_size_bytes;
+    }
+    if (align_size_to_page(&migration_chunk) != 0 || migration_chunk == 0) {
+        goto cleanup;
+    }
+    stream_pipeline_phase_chunks_recorded =
+        total_group_bytes / migration_chunk +
+        (total_group_bytes % migration_chunk != 0 ? 1 : 0);
 
     const double scalar =
         env_double_compat("MAI_BENCH_STREAM_PIPELINE_SCALAR",
@@ -2507,6 +4719,14 @@ static int run_stream_kernel_pipeline(const char* mode, unsigned char* buffer,
     }
 
     size_t group_visits[STREAM_PIPELINE_GROUPS] = {0};
+    size_t transition_counts[STREAM_PIPELINE_GROUPS][STREAM_PIPELINE_GROUPS] = {{0}};
+    unsigned char transition_seen[STREAM_PIPELINE_GROUPS][STREAM_PIPELINE_GROUPS] = {{0}};
+    size_t cycle_delta_samples = 0;
+    MaiStats previous_cycle_stats;
+    int cycle_stats_available = 0;
+    if (load_stats_optional(&previous_cycle_stats, &cycle_stats_available) != 0) {
+        cycle_stats_available = 0;
+    }
 
     for (size_t cycle = 0; cycle < cycles; cycle++) {
         uint64_t cycle_copy_ns = 0;
@@ -2514,6 +4734,35 @@ static int run_stream_kernel_pipeline(const char* mode, unsigned char* buffer,
         uint64_t cycle_add_ns = 0;
         uint64_t cycle_triad_ns = 0;
         size_t group = group_order[cycle];
+        size_t previous_group = cycle == 0 ? group : group_order[cycle - 1];
+        int phase_decoy_order =
+            strcmp(stream_pipeline_order_recorded, "phase_decoy") == 0;
+        int phase_return_cycle =
+            phase_decoy_order && cycle > 0 && group == 0 && previous_group != 0;
+        int phase_decoy_cycle = phase_decoy_order && group != 0;
+        size_t transition_count_after = 0;
+        if (phase_return_cycle) {
+            stream_pipeline_phase_return_cycles_recorded++;
+        } else if (phase_decoy_cycle) {
+            stream_pipeline_phase_decoy_cycles_recorded++;
+        }
+        if (group < STREAM_PIPELINE_GROUPS) {
+            group_visits[group]++;
+            if (cycle > 0 && previous_group < STREAM_PIPELINE_GROUPS) {
+                transition_counts[previous_group][group]++;
+                transition_count_after =
+                    transition_counts[previous_group][group];
+                if (!transition_seen[previous_group][group]) {
+                    transition_seen[previous_group][group] = 1;
+                    stream_pipeline_unique_transitions_recorded++;
+                }
+            }
+        }
+        int phase_warm_return_cycle =
+            phase_return_cycle && transition_count_after > 1;
+        if (phase_warm_return_cycle) {
+            stream_pipeline_phase_warm_return_cycles_recorded++;
+        }
 
         for (size_t iteration = 0; iteration < group_iterations; iteration++) {
             if (stream_pipeline_process_group_phase(
@@ -2544,8 +4793,202 @@ static int run_stream_kernel_pipeline(const char* mode, unsigned char* buffer,
             (1024.0 * 1024.0);
         cycle_rates[cycle] = cycle_ns != 0 ?
             cycle_mib / ((double)cycle_ns / 1000000000.0) : 0.0;
-        group_visits[group]++;
+        if (cycle_stats_available) {
+            MaiStats cycle_stats;
+            int current_stats_available = 0;
+            if (load_stats_optional(&cycle_stats, &current_stats_available) == 0 &&
+                current_stats_available) {
+                size_t demand_delta =
+                    size_delta(cycle_stats.policy_demand_faults,
+                               previous_cycle_stats.policy_demand_faults);
+                size_t read_delta =
+                    size_delta(cycle_stats.policy_migration_read_bytes,
+                               previous_cycle_stats.policy_migration_read_bytes);
+                size_t write_delta =
+                    size_delta(cycle_stats.policy_migration_write_bytes,
+                               previous_cycle_stats.policy_migration_write_bytes);
+                size_t stall_delta =
+                    size_delta(cycle_stats.policy_demand_fault_stall_ns,
+                               previous_cycle_stats.policy_demand_fault_stall_ns);
+                size_t demotion_delta =
+                    size_delta(cycle_stats.policy_demotions,
+                               previous_cycle_stats.policy_demotions);
+                size_t hot_evicted_delta =
+                    size_delta(cycle_stats.policy_evicted_hot_bytes,
+                               previous_cycle_stats.policy_evicted_hot_bytes);
+                size_t unused_prefetch_delta =
+                    size_delta(cycle_stats.policy_prefetch_unused_evictions,
+                               previous_cycle_stats.policy_prefetch_unused_evictions);
+
+                cycle_demand_faults[cycle_delta_samples] = demand_delta;
+                if (demand_delta >
+                    stream_pipeline_max_cycle_policy_demand_faults) {
+                    stream_pipeline_max_cycle_policy_demand_faults =
+                        demand_delta;
+                }
+                cycle_read_bytes[cycle_delta_samples] = read_delta;
+                if (read_delta > stream_pipeline_max_cycle_policy_read_bytes) {
+                    stream_pipeline_max_cycle_policy_read_bytes = read_delta;
+                }
+                cycle_write_bytes[cycle_delta_samples] = write_delta;
+                if (write_delta > stream_pipeline_max_cycle_policy_write_bytes) {
+                    stream_pipeline_max_cycle_policy_write_bytes = write_delta;
+                }
+                cycle_stall_ns[cycle_delta_samples] = stall_delta;
+                if (stall_delta > stream_pipeline_max_cycle_policy_stall_ns) {
+                    stream_pipeline_max_cycle_policy_stall_ns = stall_delta;
+                    stream_pipeline_worst_cycle_index_recorded = cycle;
+                    stream_pipeline_worst_cycle_group_recorded = group;
+                    stream_pipeline_worst_cycle_prev_group_recorded =
+                        previous_group;
+                }
+                if (demotion_delta > stream_pipeline_max_cycle_policy_demotions) {
+                    stream_pipeline_max_cycle_policy_demotions = demotion_delta;
+                }
+                if (hot_evicted_delta >
+                    stream_pipeline_max_cycle_policy_hot_evicted_bytes) {
+                    stream_pipeline_max_cycle_policy_hot_evicted_bytes =
+                        hot_evicted_delta;
+                }
+                cycle_unused_prefetch_evictions[cycle_delta_samples] =
+                    unused_prefetch_delta;
+                if (phase_decoy_order) {
+                    if (phase_return_cycle) {
+                        stream_pipeline_phase_return_policy_demand_faults +=
+                            demand_delta;
+                        stream_pipeline_phase_return_policy_read_bytes +=
+                            read_delta;
+                        stream_pipeline_phase_return_policy_write_bytes +=
+                            write_delta;
+                        stream_pipeline_phase_return_policy_stall_ns +=
+                            stall_delta;
+                        stream_pipeline_phase_return_policy_hot_evicted_bytes +=
+                            hot_evicted_delta;
+                        stream_pipeline_phase_return_policy_unused_prefetch_evictions +=
+                            unused_prefetch_delta;
+                        if (phase_warm_return_cycle) {
+                            stream_pipeline_phase_warm_return_policy_demand_faults +=
+                                demand_delta;
+                            stream_pipeline_phase_warm_return_policy_read_bytes +=
+                                read_delta;
+                            stream_pipeline_phase_warm_return_policy_write_bytes +=
+                                write_delta;
+                            stream_pipeline_phase_warm_return_policy_stall_ns +=
+                                stall_delta;
+                            stream_pipeline_phase_warm_return_policy_hot_evicted_bytes +=
+                                hot_evicted_delta;
+                            stream_pipeline_phase_warm_return_policy_unused_prefetch_evictions +=
+                                unused_prefetch_delta;
+                        }
+                    } else if (phase_decoy_cycle) {
+                        stream_pipeline_phase_decoy_policy_demand_faults +=
+                            demand_delta;
+                        stream_pipeline_phase_decoy_policy_read_bytes +=
+                            read_delta;
+                        stream_pipeline_phase_decoy_policy_write_bytes +=
+                            write_delta;
+                        stream_pipeline_phase_decoy_policy_stall_ns +=
+                            stall_delta;
+                        stream_pipeline_phase_decoy_policy_hot_evicted_bytes +=
+                            hot_evicted_delta;
+                        stream_pipeline_phase_decoy_policy_unused_prefetch_evictions +=
+                            unused_prefetch_delta;
+                    }
+                }
+                cycle_delta_samples++;
+                previous_cycle_stats = cycle_stats;
+            } else {
+                cycle_stats_available = 0;
+            }
+        }
     }
+
+    stream_pipeline_group_visit_0_recorded = group_visits[0];
+    stream_pipeline_group_visit_1_recorded = group_visits[1];
+    stream_pipeline_group_visit_2_recorded = group_visits[2];
+    stream_pipeline_transition_00_recorded = transition_counts[0][0];
+    stream_pipeline_transition_01_recorded = transition_counts[0][1];
+    stream_pipeline_transition_02_recorded = transition_counts[0][2];
+    stream_pipeline_transition_10_recorded = transition_counts[1][0];
+    stream_pipeline_transition_11_recorded = transition_counts[1][1];
+    stream_pipeline_transition_12_recorded = transition_counts[1][2];
+    stream_pipeline_transition_20_recorded = transition_counts[2][0];
+    stream_pipeline_transition_21_recorded = transition_counts[2][1];
+    stream_pipeline_transition_22_recorded = transition_counts[2][2];
+
+    if (cycle_delta_samples != 0) {
+        stream_pipeline_cycle_policy_demand_faults_p50 =
+            (size_t)percentile_u64(cycle_demand_faults, cycle_delta_samples, 50);
+        stream_pipeline_cycle_policy_demand_faults_p90 =
+            (size_t)percentile_u64(cycle_demand_faults, cycle_delta_samples, 90);
+        stream_pipeline_cycle_policy_demand_faults_p99 =
+            (size_t)percentile_u64(cycle_demand_faults, cycle_delta_samples, 99);
+        stream_pipeline_cycle_policy_read_bytes_p50 =
+            (size_t)percentile_u64(cycle_read_bytes, cycle_delta_samples, 50);
+        stream_pipeline_cycle_policy_read_bytes_p90 =
+            (size_t)percentile_u64(cycle_read_bytes, cycle_delta_samples, 90);
+        stream_pipeline_cycle_policy_read_bytes_p99 =
+            (size_t)percentile_u64(cycle_read_bytes, cycle_delta_samples, 99);
+        stream_pipeline_cycle_policy_write_bytes_p50 =
+            (size_t)percentile_u64(cycle_write_bytes, cycle_delta_samples, 50);
+        stream_pipeline_cycle_policy_write_bytes_p90 =
+            (size_t)percentile_u64(cycle_write_bytes, cycle_delta_samples, 90);
+        stream_pipeline_cycle_policy_write_bytes_p99 =
+            (size_t)percentile_u64(cycle_write_bytes, cycle_delta_samples, 99);
+        stream_pipeline_cycle_policy_stall_ns_p50 =
+            (size_t)percentile_u64(cycle_stall_ns, cycle_delta_samples, 50);
+        stream_pipeline_cycle_policy_stall_ns_p90 =
+            (size_t)percentile_u64(cycle_stall_ns, cycle_delta_samples, 90);
+        stream_pipeline_cycle_policy_stall_ns_p99 =
+            (size_t)percentile_u64(cycle_stall_ns, cycle_delta_samples, 99);
+        stream_pipeline_cycle_policy_unused_prefetch_evictions_p50 =
+            (size_t)percentile_u64(cycle_unused_prefetch_evictions,
+                                   cycle_delta_samples, 50);
+        stream_pipeline_cycle_policy_unused_prefetch_evictions_p90 =
+            (size_t)percentile_u64(cycle_unused_prefetch_evictions,
+                                   cycle_delta_samples, 90);
+        stream_pipeline_cycle_policy_unused_prefetch_evictions_p99 =
+            (size_t)percentile_u64(cycle_unused_prefetch_evictions,
+                                   cycle_delta_samples, 99);
+    }
+    size_t phase_return_expected_chunks = 0;
+    if (stream_pipeline_phase_chunks_recorded != 0 &&
+        stream_pipeline_phase_return_cycles_recorded <=
+            SIZE_MAX / stream_pipeline_phase_chunks_recorded) {
+        phase_return_expected_chunks =
+            stream_pipeline_phase_return_cycles_recorded *
+            stream_pipeline_phase_chunks_recorded;
+    }
+    if (phase_return_expected_chunks >
+        stream_pipeline_phase_return_policy_demand_faults) {
+        stream_pipeline_phase_return_estimated_hits =
+            phase_return_expected_chunks -
+            stream_pipeline_phase_return_policy_demand_faults;
+    }
+    stream_pipeline_phase_return_estimated_hit_ratio =
+        phase_return_expected_chunks != 0 ?
+        (double)stream_pipeline_phase_return_estimated_hits /
+            (double)phase_return_expected_chunks :
+        0.0;
+    size_t phase_warm_return_expected_chunks = 0;
+    if (stream_pipeline_phase_chunks_recorded != 0 &&
+        stream_pipeline_phase_warm_return_cycles_recorded <=
+            SIZE_MAX / stream_pipeline_phase_chunks_recorded) {
+        phase_warm_return_expected_chunks =
+            stream_pipeline_phase_warm_return_cycles_recorded *
+            stream_pipeline_phase_chunks_recorded;
+    }
+    if (phase_warm_return_expected_chunks >
+        stream_pipeline_phase_warm_return_policy_demand_faults) {
+        stream_pipeline_phase_warm_return_estimated_hits =
+            phase_warm_return_expected_chunks -
+            stream_pipeline_phase_warm_return_policy_demand_faults;
+    }
+    stream_pipeline_phase_warm_return_estimated_hit_ratio =
+        phase_warm_return_expected_chunks != 0 ?
+        (double)stream_pipeline_phase_warm_return_estimated_hits /
+            (double)phase_warm_return_expected_chunks :
+        0.0;
 
     double copy_mib =
         2.0 * (double)bytes * (double)total_iterations / (1024.0 * 1024.0);
@@ -2636,6 +5079,11 @@ static int run_stream_kernel_pipeline(const char* mode, unsigned char* buffer,
     rc = 0;
 
 cleanup:
+    free(cycle_unused_prefetch_evictions);
+    free(cycle_stall_ns);
+    free(cycle_write_bytes);
+    free(cycle_read_bytes);
+    free(cycle_demand_faults);
     for (size_t matrix = 1; matrix < STREAM_PIPELINE_MATRICES; matrix++) {
         free_benchmark_buffer(matrix_buffers[matrix], bytes,
                               matrix_munmap[matrix]);
@@ -2653,7 +5101,20 @@ int main(int argc, char** argv) {
                 "mprotect_overhead|heartbeat_idle|chunk_position|"
                 "heartbeat_concurrent|stream_bandwidth|stream_anon_mmap|"
                 "stream_shared_file|stream_private_file|"
-                "stream_tiled_bandwidth|stream_kernel_pipeline|"
+                "stream_tiled_bandwidth|policy_stream_pipeline|"
+                "policy_stream_pipeline_phase_decoy|"
+                "policy_multistream_stride|policy_hotset_scan|"
+                "policy_phase_shift_hotset|"
+                "policy_irr_scan_return|"
+                "policy_recency_frequency_pivot|"
+                "policy_arc_adaptation_pivot|"
+                "policy_long_tail_admission|"
+                "policy_best_offset_lag|"
+                "policy_successor_cycle|policy_signature_context_cycle|"
+                "policy_hinted_sequential|"
+                "policy_spatial_region_mask|"
+                "policy_spatial_interleaved_mask|"
+                "stream_kernel_pipeline|"
                 "stream_kernel_pipeline_anon_mmap|"
                 "stream_kernel_pipeline_shared_file|"
                 "stream_kernel_pipeline_private_file <size>\n",
@@ -2686,6 +5147,37 @@ int main(int argc, char** argv) {
         (expect_managed && !before_stats_available)) {
         return fail("mai_get_stats is unavailable; run with libmai preloaded");
     }
+
+    struct rusage run_usage_before;
+    struct rusage run_usage_after;
+    int run_usage_available = getrusage(RUSAGE_SELF, &run_usage_before) == 0;
+    CgroupSizeSample cgroup_memory_max = sample_cgroup_size(
+        "memory.max", "memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes");
+    cgroup_memory_max_bytes = cgroup_memory_max.bytes;
+    cgroup_memory_max_available = cgroup_memory_max.available;
+    cgroup_memory_max_is_max_token = cgroup_memory_max.max_token;
+    cgroup_memory_max_unbounded =
+        cgroup_limit_is_unbounded(cgroup_memory_max);
+    cgroup_memory_current_before = sample_cgroup_size(
+        "memory.current", "memory.usage_in_bytes",
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes").bytes;
+    CgroupSizeSample cgroup_swap_max = sample_cgroup_size(
+        "memory.swap.max", "memory.memsw.limit_in_bytes",
+        "/sys/fs/cgroup/memory.swap.max",
+        "/sys/fs/cgroup/memory/memory.memsw.limit_in_bytes");
+    cgroup_swap_max_bytes = cgroup_swap_max.bytes;
+    cgroup_swap_max_available = cgroup_swap_max.available;
+    cgroup_swap_max_is_max_token = cgroup_swap_max.max_token;
+    cgroup_swap_max_unbounded =
+        cgroup_limit_is_unbounded(cgroup_swap_max);
+    cgroup_swap_current_before = sample_cgroup_size(
+        "memory.swap.current", "memory.memsw.usage_in_bytes",
+        "/sys/fs/cgroup/memory.swap.current",
+        "/sys/fs/cgroup/memory/memory.memsw.usage_in_bytes").bytes;
+    CgroupMemoryEvents cgroup_events_before = sample_cgroup_memory_events();
 
     unsigned char* buffer = NULL;
     int free_with_munmap = 0;
@@ -2732,6 +5224,35 @@ int main(int argc, char** argv) {
     } else if (mode_uses_stream_pipeline(argv[1])) {
         rc = run_stream_kernel_pipeline(argv[1], buffer, size, &checksum,
                                         &touches);
+    } else if (strcmp(argv[1], "policy_multistream_stride") == 0) {
+        rc = run_policy_multistream_stride(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_hotset_scan") == 0) {
+        rc = run_policy_hotset_scan(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_phase_shift_hotset") == 0) {
+        rc = run_policy_phase_shift_hotset(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_irr_scan_return") == 0) {
+        rc = run_policy_irr_scan_return(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_recency_frequency_pivot") == 0 ||
+               strcmp(argv[1], "policy_arc_adaptation_pivot") == 0) {
+        rc = run_policy_recency_frequency_pivot(buffer, size, &checksum,
+                                                &touches);
+    } else if (strcmp(argv[1], "policy_long_tail_admission") == 0) {
+        rc = run_policy_long_tail_admission(buffer, size, &checksum,
+                                            &touches);
+    } else if (strcmp(argv[1], "policy_best_offset_lag") == 0) {
+        rc = run_policy_best_offset_lag(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_successor_cycle") == 0) {
+        rc = run_policy_successor_cycle(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_hinted_sequential") == 0) {
+        rc = run_policy_hinted_sequential(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_signature_context_cycle") == 0) {
+        rc = run_policy_signature_context_cycle(buffer, size, &checksum,
+                                                &touches);
+    } else if (strcmp(argv[1], "policy_spatial_region_mask") == 0) {
+        rc = run_policy_spatial_region_mask(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "policy_spatial_interleaved_mask") == 0) {
+        rc = run_policy_spatial_interleaved_mask(buffer, size, &checksum,
+                                                &touches);
     } else if (mode_uses_stream_kernel(argv[1])) {
         rc = run_stream_bandwidth(argv[1], buffer, size, &checksum, &touches);
     } else {
@@ -2750,6 +5271,42 @@ int main(int argc, char** argv) {
         free_benchmark_buffer(buffer, size, free_with_munmap);
         return fail("mai_get_stats failed after access pattern");
     }
+    if (run_usage_available && getrusage(RUSAGE_SELF, &run_usage_after) == 0) {
+        run_minor_faults_delta =
+            run_usage_after.ru_minflt - run_usage_before.ru_minflt;
+        run_major_faults_delta =
+            run_usage_after.ru_majflt - run_usage_before.ru_majflt;
+        run_inblock_delta =
+            run_usage_after.ru_inblock - run_usage_before.ru_inblock;
+        run_oublock_delta =
+            run_usage_after.ru_oublock - run_usage_before.ru_oublock;
+        run_voluntary_ctxt_delta =
+            run_usage_after.ru_nvcsw - run_usage_before.ru_nvcsw;
+        run_involuntary_ctxt_delta =
+            run_usage_after.ru_nivcsw - run_usage_before.ru_nivcsw;
+        run_user_cpu_us_delta =
+            timeval_delta_us(&run_usage_before.ru_utime,
+                             &run_usage_after.ru_utime);
+        run_sys_cpu_us_delta =
+            timeval_delta_us(&run_usage_before.ru_stime,
+                             &run_usage_after.ru_stime);
+        run_maxrss_kib = run_usage_after.ru_maxrss;
+    }
+    cgroup_memory_current_after = sample_cgroup_size(
+        "memory.current", "memory.usage_in_bytes",
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes").bytes;
+    cgroup_swap_current_after = sample_cgroup_size(
+        "memory.swap.current", "memory.memsw.usage_in_bytes",
+        "/sys/fs/cgroup/memory.swap.current",
+        "/sys/fs/cgroup/memory/memory.memsw.usage_in_bytes").bytes;
+    CgroupMemoryEvents cgroup_events_after = sample_cgroup_memory_events();
+    cgroup_memory_events_high_delta =
+        delta_size_t(cgroup_events_before.high, cgroup_events_after.high);
+    cgroup_memory_events_max_delta =
+        delta_size_t(cgroup_events_before.max, cgroup_events_after.max);
+    cgroup_memory_events_oom_delta =
+        delta_size_t(cgroup_events_before.oom, cgroup_events_after.oom);
 
     size_t managed_delta = after_stats_available ?
         after.managed_allocations - before.managed_allocations : 0;
@@ -2773,6 +5330,439 @@ int main(int argc, char** argv) {
         after.uffd_evictions - before.uffd_evictions : 0;
     size_t uffd_fallback_delta = after_stats_available ?
         after.uffd_fallbacks - before.uffd_fallbacks : 0;
+    size_t migration_policy = after_stats_available ? after.migration_policy : 0;
+    size_t policy_prefetch_requests = after_stats_available ?
+        after.policy_prefetch_requests - before.policy_prefetch_requests : 0;
+    size_t policy_prefetch_admitted = after_stats_available ?
+        after.policy_prefetch_admitted - before.policy_prefetch_admitted : 0;
+    size_t policy_prefetch_completed = after_stats_available ?
+        after.policy_prefetch_completed - before.policy_prefetch_completed : 0;
+    size_t policy_prefetch_useful = after_stats_available ?
+        after.policy_prefetch_useful - before.policy_prefetch_useful : 0;
+    size_t policy_prefetch_late = after_stats_available ?
+        after.policy_prefetch_late - before.policy_prefetch_late : 0;
+    size_t policy_prefetch_unused_evictions = after_stats_available ?
+        after.policy_prefetch_unused_evictions -
+        before.policy_prefetch_unused_evictions : 0;
+    size_t policy_prefetch_bytes = after_stats_available ?
+        after.policy_prefetch_bytes - before.policy_prefetch_bytes : 0;
+    size_t policy_prefetch_useful_bytes = after_stats_available ?
+        after.policy_prefetch_useful_bytes -
+        before.policy_prefetch_useful_bytes : 0;
+    size_t policy_prefetch_unused_evicted_bytes = after_stats_available ?
+        after.policy_prefetch_unused_evicted_bytes -
+        before.policy_prefetch_unused_evicted_bytes : 0;
+    size_t policy_admission_requests = after_stats_available ?
+        after.policy_admission_requests - before.policy_admission_requests : 0;
+    size_t policy_admission_rejected = after_stats_available ?
+        after.policy_admission_rejected - before.policy_admission_rejected : 0;
+    size_t policy_demotions = after_stats_available ?
+        after.policy_demotions - before.policy_demotions : 0;
+    size_t policy_promotions = after_stats_available ?
+        after.policy_promotions - before.policy_promotions : 0;
+    size_t policy_evicted_hot_bytes = after_stats_available ?
+        after.policy_evicted_hot_bytes - before.policy_evicted_hot_bytes : 0;
+    size_t policy_migration_read_bytes = after_stats_available ?
+        after.policy_migration_read_bytes -
+        before.policy_migration_read_bytes : 0;
+    size_t policy_migration_write_bytes = after_stats_available ?
+        after.policy_migration_write_bytes -
+        before.policy_migration_write_bytes : 0;
+    size_t policy_demand_faults = after_stats_available ?
+        after.policy_demand_faults - before.policy_demand_faults : 0;
+    size_t policy_demand_fault_stall_ns = after_stats_available ?
+        after.policy_demand_fault_stall_ns -
+        before.policy_demand_fault_stall_ns : 0;
+    size_t policy_demand_fault_stall_samples = after_stats_available ?
+        after.policy_demand_fault_stall_samples -
+        before.policy_demand_fault_stall_samples : 0;
+    size_t policy_throttle_events = after_stats_available ?
+        after.policy_throttle_events - before.policy_throttle_events : 0;
+    size_t policy_throttle_slept_ns = after_stats_available ?
+        after.policy_throttle_slept_ns - before.policy_throttle_slept_ns : 0;
+    size_t policy_async_prefetch_enqueued = after_stats_available ?
+        after.policy_async_prefetch_enqueued -
+        before.policy_async_prefetch_enqueued : 0;
+    size_t policy_async_prefetch_completed = after_stats_available ?
+        after.policy_async_prefetch_completed -
+        before.policy_async_prefetch_completed : 0;
+    size_t policy_async_prefetch_dropped = after_stats_available ?
+        after.policy_async_prefetch_dropped -
+        before.policy_async_prefetch_dropped : 0;
+    size_t policy_async_completed_without_prefetch =
+        policy_async_prefetch_completed > policy_prefetch_completed ?
+        policy_async_prefetch_completed - policy_prefetch_completed : 0;
+    size_t policy_adaptive_windows = after_stats_available ?
+        after.policy_adaptive_windows - before.policy_adaptive_windows : 0;
+    size_t policy_adaptive_level = after_stats_available ?
+        after.policy_adaptive_level : 0;
+    size_t policy_adaptive_level_changes = after_stats_available ?
+        after.policy_adaptive_level_changes -
+        before.policy_adaptive_level_changes : 0;
+    size_t policy_adaptive_prefetch_capped = after_stats_available ?
+        after.policy_adaptive_prefetch_capped -
+        before.policy_adaptive_prefetch_capped : 0;
+    size_t policy_adaptive_admission_rejected = after_stats_available ?
+        after.policy_adaptive_admission_rejected -
+        before.policy_adaptive_admission_rejected : 0;
+    size_t policy_adaptive_budget_gate = after_stats_available ?
+        after.policy_adaptive_budget_gate : 0;
+    size_t policy_adaptive_budget_bytes = after_stats_available ?
+        after.policy_adaptive_budget_bytes : 0;
+    size_t policy_adaptive_window_migration_bytes = after_stats_available ?
+        after.policy_adaptive_window_migration_bytes : 0;
+    size_t policy_clean_shadow_tracked_chunks = after_stats_available ?
+        after.policy_clean_shadow_tracked_chunks -
+        before.policy_clean_shadow_tracked_chunks : 0;
+    size_t policy_clean_shadow_protect_failures = after_stats_available ?
+        after.policy_clean_shadow_protect_failures -
+        before.policy_clean_shadow_protect_failures : 0;
+    size_t policy_clean_shadow_write_skipped_bytes = after_stats_available ?
+        after.policy_clean_shadow_write_skipped_bytes -
+        before.policy_clean_shadow_write_skipped_bytes : 0;
+    size_t policy_clean_shadow_write_skipped_chunks = after_stats_available ?
+        after.policy_clean_shadow_write_skipped_chunks -
+        before.policy_clean_shadow_write_skipped_chunks : 0;
+    size_t policy_clean_shadow_write_faults = after_stats_available ?
+        after.policy_clean_shadow_write_faults -
+        before.policy_clean_shadow_write_faults : 0;
+    size_t policy_car_recent_chunks = after_stats_available ?
+        after.policy_car_recent_chunks : 0;
+    size_t policy_car_frequent_chunks = after_stats_available ?
+        after.policy_car_frequent_chunks : 0;
+    size_t policy_car_recent_ghost_chunks = after_stats_available ?
+        after.policy_car_recent_ghost_chunks : 0;
+    size_t policy_car_frequent_ghost_chunks = after_stats_available ?
+        after.policy_car_frequent_ghost_chunks : 0;
+    size_t policy_car_target_recent_chunks = after_stats_available ?
+        after.policy_car_target_recent_chunks : 0;
+    size_t policy_car_recent_ghost_hits = after_stats_available ?
+        after.policy_car_recent_ghost_hits -
+        before.policy_car_recent_ghost_hits : 0;
+    size_t policy_car_frequent_ghost_hits = after_stats_available ?
+        after.policy_car_frequent_ghost_hits -
+        before.policy_car_frequent_ghost_hits : 0;
+    size_t policy_car_target_increases = after_stats_available ?
+        after.policy_car_target_increases -
+        before.policy_car_target_increases : 0;
+    size_t policy_car_target_decreases = after_stats_available ?
+        after.policy_car_target_decreases -
+        before.policy_car_target_decreases : 0;
+    size_t policy_car_second_chances = after_stats_available ?
+        after.policy_car_second_chances -
+        before.policy_car_second_chances : 0;
+    size_t policy_tinylfu_sketch_updates = after_stats_available ?
+        after.policy_tinylfu_sketch_updates -
+        before.policy_tinylfu_sketch_updates : 0;
+    size_t policy_tinylfu_sketch_decays = after_stats_available ?
+        after.policy_tinylfu_sketch_decays -
+        before.policy_tinylfu_sketch_decays : 0;
+    size_t policy_tinylfu_admission_rejected = after_stats_available ?
+        after.policy_tinylfu_admission_rejected -
+        before.policy_tinylfu_admission_rejected : 0;
+    size_t policy_tinylfu_min_score = after_stats_available ?
+        after.policy_tinylfu_min_score : 0;
+    size_t policy_bestoffset_train_samples = after_stats_available ?
+        after.policy_bestoffset_train_samples -
+        before.policy_bestoffset_train_samples : 0;
+    size_t policy_bestoffset_train_hits = after_stats_available ?
+        after.policy_bestoffset_train_hits -
+        before.policy_bestoffset_train_hits : 0;
+    size_t policy_bestoffset_slots_created = after_stats_available ?
+        after.policy_bestoffset_slots_created -
+        before.policy_bestoffset_slots_created : 0;
+    size_t policy_bestoffset_score_decays = after_stats_available ?
+        after.policy_bestoffset_score_decays -
+        before.policy_bestoffset_score_decays : 0;
+    size_t policy_bestoffset_candidates = after_stats_available ?
+        after.policy_bestoffset_candidates -
+        before.policy_bestoffset_candidates : 0;
+    size_t policy_bestoffset_pressure_rejected = after_stats_available ?
+        after.policy_bestoffset_pressure_rejected -
+        before.policy_bestoffset_pressure_rejected : 0;
+    size_t policy_bestoffset_unused_penalties = after_stats_available ?
+        after.policy_bestoffset_unused_penalties -
+        before.policy_bestoffset_unused_penalties : 0;
+    size_t policy_bestoffset_top_offset_magnitude = after_stats_available ?
+        after.policy_bestoffset_top_offset_magnitude : 0;
+    size_t policy_bestoffset_top_offset_sign = after_stats_available ?
+        after.policy_bestoffset_top_offset_sign : 0;
+    size_t policy_bestoffset_top_score = after_stats_available ?
+        after.policy_bestoffset_top_score : 0;
+    size_t policy_wtinylfu_window_chunks = after_stats_available ?
+        after.policy_wtinylfu_window_chunks : 0;
+    size_t policy_wtinylfu_probation_chunks = after_stats_available ?
+        after.policy_wtinylfu_probation_chunks : 0;
+    size_t policy_wtinylfu_protected_chunks = after_stats_available ?
+        after.policy_wtinylfu_protected_chunks : 0;
+    size_t policy_wtinylfu_window_evictions = after_stats_available ?
+        after.policy_wtinylfu_window_evictions -
+        before.policy_wtinylfu_window_evictions : 0;
+    size_t policy_wtinylfu_main_admission_rejected = after_stats_available ?
+        after.policy_wtinylfu_main_admission_rejected -
+        before.policy_wtinylfu_main_admission_rejected : 0;
+    size_t policy_wtinylfu_victim_score_rejected = after_stats_available ?
+        after.policy_wtinylfu_victim_score_rejected -
+        before.policy_wtinylfu_victim_score_rejected : 0;
+    size_t policy_successor_chain_candidates = after_stats_available ?
+        after.policy_successor_chain_candidates -
+        before.policy_successor_chain_candidates : 0;
+    size_t policy_successor_chain_rejected = after_stats_available ?
+        after.policy_successor_chain_rejected -
+        before.policy_successor_chain_rejected : 0;
+    size_t policy_successor_chain_depth = after_stats_available ?
+        after.policy_successor_chain_depth : 0;
+    size_t policy_markov_lead_candidates = after_stats_available ?
+        after.policy_markov_lead_candidates -
+        before.policy_markov_lead_candidates : 0;
+    size_t policy_markov_lead_admitted = after_stats_available ?
+        after.policy_markov_lead_admitted -
+        before.policy_markov_lead_admitted : 0;
+    size_t policy_markov_lead_completed = after_stats_available ?
+        after.policy_markov_lead_completed -
+        before.policy_markov_lead_completed : 0;
+    size_t policy_markov_lead_useful = after_stats_available ?
+        after.policy_markov_lead_useful -
+        before.policy_markov_lead_useful : 0;
+    size_t policy_phase_candidates = after_stats_available ?
+        after.policy_phase_candidates -
+        before.policy_phase_candidates : 0;
+    size_t policy_phase_admitted = after_stats_available ?
+        after.policy_phase_admitted -
+        before.policy_phase_admitted : 0;
+    size_t policy_phase_completed = after_stats_available ?
+        after.policy_phase_completed -
+        before.policy_phase_completed : 0;
+    size_t policy_phase_useful = after_stats_available ?
+        after.policy_phase_useful -
+        before.policy_phase_useful : 0;
+    size_t policy_phase_conflicts = after_stats_available ?
+        after.policy_phase_conflicts -
+        before.policy_phase_conflicts : 0;
+    size_t policy_phase_confidence_rejected = after_stats_available ?
+        after.policy_phase_confidence_rejected -
+        before.policy_phase_confidence_rejected : 0;
+    size_t policy_phase_budget_rejected = after_stats_available ?
+        after.policy_phase_budget_rejected -
+        before.policy_phase_budget_rejected : 0;
+    size_t policy_phase_safe_victim_rejected = after_stats_available ?
+        after.policy_phase_safe_victim_rejected -
+        before.policy_phase_safe_victim_rejected : 0;
+    size_t policy_phase_victim_rejected = after_stats_available ?
+        after.policy_phase_victim_rejected -
+        before.policy_phase_victim_rejected : 0;
+    size_t policy_phase_duplicate_candidates = after_stats_available ?
+        after.policy_phase_duplicate_candidates -
+        before.policy_phase_duplicate_candidates : 0;
+    size_t policy_phase_target_hot_skipped = after_stats_available ?
+        after.policy_phase_target_hot_skipped -
+        before.policy_phase_target_hot_skipped : 0;
+    size_t policy_phase_active_slots = after_stats_available ?
+        after.policy_phase_active_slots : 0;
+    size_t policy_phase_top_score = after_stats_available ?
+        after.policy_phase_top_score : 0;
+    size_t policy_phase_unused_evictions = after_stats_available ?
+        after.policy_phase_unused_evictions -
+        before.policy_phase_unused_evictions : 0;
+    size_t policy_phase_boundary_prefetches = after_stats_available ?
+        after.policy_phase_boundary_prefetches -
+        before.policy_phase_boundary_prefetches : 0;
+    size_t policy_phase_hold_activations = after_stats_available ?
+        after.policy_phase_hold_activations -
+        before.policy_phase_hold_activations : 0;
+    size_t policy_phase_shadow_candidates = after_stats_available ?
+        after.policy_phase_shadow_candidates -
+        before.policy_phase_shadow_candidates : 0;
+    size_t policy_phase_shadow_useful = after_stats_available ?
+        after.policy_phase_shadow_useful -
+        before.policy_phase_shadow_useful : 0;
+    size_t policy_phase_shadow_late = after_stats_available ?
+        after.policy_phase_shadow_late -
+        before.policy_phase_shadow_late : 0;
+    size_t policy_phase_shadow_expired = after_stats_available ?
+        after.policy_phase_shadow_expired -
+        before.policy_phase_shadow_expired : 0;
+    size_t policy_phase_shadow_overwritten = after_stats_available ?
+        after.policy_phase_shadow_overwritten -
+        before.policy_phase_shadow_overwritten : 0;
+    size_t policy_phase_shadow_probe_candidates = after_stats_available ?
+        after.policy_phase_shadow_probe_candidates -
+        before.policy_phase_shadow_probe_candidates : 0;
+    size_t policy_phase_shadow_edge_rejected = after_stats_available ?
+        after.policy_phase_shadow_edge_rejected -
+        before.policy_phase_shadow_edge_rejected : 0;
+    size_t policy_phase_shadow_edge_confirmed = after_stats_available ?
+        after.policy_phase_shadow_edge_confirmed -
+        before.policy_phase_shadow_edge_confirmed : 0;
+    size_t policy_phase_shadow_top_late = after_stats_available ?
+        after.policy_phase_shadow_top_late : 0;
+    size_t policy_phase_shadow_max_late = after_stats_available ?
+        after.policy_phase_shadow_max_late : 0;
+    size_t policy_hint_candidates = after_stats_available ?
+        after.policy_hint_candidates - before.policy_hint_candidates : 0;
+    size_t policy_hint_admitted = after_stats_available ?
+        after.policy_hint_admitted - before.policy_hint_admitted : 0;
+    size_t policy_hint_completed = after_stats_available ?
+        after.policy_hint_completed - before.policy_hint_completed : 0;
+    size_t policy_hint_useful = after_stats_available ?
+        after.policy_hint_useful - before.policy_hint_useful : 0;
+    size_t policy_hint_rejected = after_stats_available ?
+        after.policy_hint_rejected - before.policy_hint_rejected : 0;
+    size_t policy_arc_t1_chunks = after_stats_available ?
+        after.policy_arc_t1_chunks : 0;
+    size_t policy_arc_t2_chunks = after_stats_available ?
+        after.policy_arc_t2_chunks : 0;
+    size_t policy_arc_b1_chunks = after_stats_available ?
+        after.policy_arc_b1_chunks : 0;
+    size_t policy_arc_b2_chunks = after_stats_available ?
+        after.policy_arc_b2_chunks : 0;
+    size_t policy_arc_p_chunks = after_stats_available ?
+        after.policy_arc_p_chunks : 0;
+    size_t policy_arc_b1_hits = after_stats_available ?
+        after.policy_arc_b1_hits - before.policy_arc_b1_hits : 0;
+    size_t policy_arc_b2_hits = after_stats_available ?
+        after.policy_arc_b2_hits - before.policy_arc_b2_hits : 0;
+    size_t policy_arc_target_increases = after_stats_available ?
+        after.policy_arc_target_increases -
+        before.policy_arc_target_increases : 0;
+    size_t policy_arc_target_decreases = after_stats_available ?
+        after.policy_arc_target_decreases -
+        before.policy_arc_target_decreases : 0;
+    size_t policy_arc_t1_hits = after_stats_available ?
+        after.policy_arc_t1_hits - before.policy_arc_t1_hits : 0;
+    size_t policy_arc_t2_hits = after_stats_available ?
+        after.policy_arc_t2_hits - before.policy_arc_t2_hits : 0;
+    size_t policy_arc_t1_to_t2_promotions = after_stats_available ?
+        after.policy_arc_t1_to_t2_promotions -
+        before.policy_arc_t1_to_t2_promotions : 0;
+    size_t policy_arc_replace_t1 = after_stats_available ?
+        after.policy_arc_replace_t1 - before.policy_arc_replace_t1 : 0;
+    size_t policy_arc_replace_t2 = after_stats_available ?
+        after.policy_arc_replace_t2 - before.policy_arc_replace_t2 : 0;
+    size_t policy_arc_b1_pruned = after_stats_available ?
+        after.policy_arc_b1_pruned - before.policy_arc_b1_pruned : 0;
+    size_t policy_arc_b2_pruned = after_stats_available ?
+        after.policy_arc_b2_pruned - before.policy_arc_b2_pruned : 0;
+    size_t policy_arc_prefetch_admitted_t1 = after_stats_available ?
+        after.policy_arc_prefetch_admitted_t1 -
+        before.policy_arc_prefetch_admitted_t1 : 0;
+    size_t policy_arc_prefetch_rejected_pressure = after_stats_available ?
+        after.policy_arc_prefetch_rejected_pressure -
+        before.policy_arc_prefetch_rejected_pressure : 0;
+    size_t policy_arc_prefetch_promoted_to_t2 = after_stats_available ?
+        after.policy_arc_prefetch_promoted_to_t2 -
+        before.policy_arc_prefetch_promoted_to_t2 : 0;
+    size_t policy_irr_resident_chunks = after_stats_available ?
+        after.policy_irr_resident_chunks : 0;
+    size_t policy_irr_protected_chunks = after_stats_available ?
+        after.policy_irr_protected_chunks : 0;
+    size_t policy_irr_ghost_chunks = after_stats_available ?
+        after.policy_irr_ghost_chunks : 0;
+    size_t policy_irr_target_protected_chunks = after_stats_available ?
+        after.policy_irr_target_protected_chunks : 0;
+    size_t policy_irr_ghost_hits = after_stats_available ?
+        after.policy_irr_ghost_hits - before.policy_irr_ghost_hits : 0;
+    size_t policy_irr_promotions = after_stats_available ?
+        after.policy_irr_promotions - before.policy_irr_promotions : 0;
+    size_t policy_irr_demotions = after_stats_available ?
+        after.policy_irr_demotions - before.policy_irr_demotions : 0;
+    size_t policy_irr_pressure_rejected = after_stats_available ?
+        after.policy_irr_pressure_rejected -
+        before.policy_irr_pressure_rejected : 0;
+    size_t policy_irr_immature_rejected = after_stats_available ?
+        after.policy_irr_immature_rejected -
+        before.policy_irr_immature_rejected : 0;
+    size_t policy_irr_max_interval_epochs = after_stats_available ?
+        after.policy_irr_max_interval_epochs : 0;
+    size_t policy_signature_train_samples = after_stats_available ?
+        after.policy_signature_train_samples -
+        before.policy_signature_train_samples : 0;
+    size_t policy_signature_train_hits = after_stats_available ?
+        after.policy_signature_train_hits -
+        before.policy_signature_train_hits : 0;
+    size_t policy_signature_slots_created = after_stats_available ?
+        after.policy_signature_slots_created -
+        before.policy_signature_slots_created : 0;
+    size_t policy_signature_score_decays = after_stats_available ?
+        after.policy_signature_score_decays -
+        before.policy_signature_score_decays : 0;
+    size_t policy_signature_candidates = after_stats_available ?
+        after.policy_signature_candidates -
+        before.policy_signature_candidates : 0;
+    size_t policy_signature_pressure_rejected = after_stats_available ?
+        after.policy_signature_pressure_rejected -
+        before.policy_signature_pressure_rejected : 0;
+    size_t policy_signature_unused_penalties = after_stats_available ?
+        after.policy_signature_unused_penalties -
+        before.policy_signature_unused_penalties : 0;
+    size_t policy_signature_chain_candidates = after_stats_available ?
+        after.policy_signature_chain_candidates -
+        before.policy_signature_chain_candidates : 0;
+    size_t policy_signature_chain_rejected = after_stats_available ?
+        after.policy_signature_chain_rejected -
+        before.policy_signature_chain_rejected : 0;
+    size_t policy_signature_chain_depth = after_stats_available ?
+        after.policy_signature_chain_depth : 0;
+    size_t policy_signature_top_delta_magnitude = after_stats_available ?
+        after.policy_signature_top_delta_magnitude : 0;
+    size_t policy_signature_top_delta_sign = after_stats_available ?
+        after.policy_signature_top_delta_sign : 0;
+    size_t policy_signature_top_score = after_stats_available ?
+        after.policy_signature_top_score : 0;
+    size_t policy_hybrid_signature_candidates = after_stats_available ?
+        after.policy_hybrid_signature_candidates -
+        before.policy_hybrid_signature_candidates : 0;
+    size_t policy_hybrid_successor_candidates = after_stats_available ?
+        after.policy_hybrid_successor_candidates -
+        before.policy_hybrid_successor_candidates : 0;
+    size_t policy_hybrid_stream_candidates = after_stats_available ?
+        after.policy_hybrid_stream_candidates -
+        before.policy_hybrid_stream_candidates : 0;
+    size_t policy_hybrid_cohort_candidates = after_stats_available ?
+        after.policy_hybrid_cohort_candidates -
+        before.policy_hybrid_cohort_candidates : 0;
+    size_t policy_hybrid_admission_rejected = after_stats_available ?
+        after.policy_hybrid_admission_rejected -
+        before.policy_hybrid_admission_rejected : 0;
+    size_t policy_hybrid_signature_admitted = after_stats_available ?
+        after.policy_hybrid_signature_admitted -
+        before.policy_hybrid_signature_admitted : 0;
+    size_t policy_hybrid_successor_admitted = after_stats_available ?
+        after.policy_hybrid_successor_admitted -
+        before.policy_hybrid_successor_admitted : 0;
+    size_t policy_hybrid_stream_admitted = after_stats_available ?
+        after.policy_hybrid_stream_admitted -
+        before.policy_hybrid_stream_admitted : 0;
+    size_t policy_hybrid_cohort_admitted = after_stats_available ?
+        after.policy_hybrid_cohort_admitted -
+        before.policy_hybrid_cohort_admitted : 0;
+    size_t policy_hybrid_signature_completed = after_stats_available ?
+        after.policy_hybrid_signature_completed -
+        before.policy_hybrid_signature_completed : 0;
+    size_t policy_hybrid_successor_completed = after_stats_available ?
+        after.policy_hybrid_successor_completed -
+        before.policy_hybrid_successor_completed : 0;
+    size_t policy_hybrid_stream_completed = after_stats_available ?
+        after.policy_hybrid_stream_completed -
+        before.policy_hybrid_stream_completed : 0;
+    size_t policy_hybrid_cohort_completed = after_stats_available ?
+        after.policy_hybrid_cohort_completed -
+        before.policy_hybrid_cohort_completed : 0;
+    size_t policy_hybrid_signature_useful = after_stats_available ?
+        after.policy_hybrid_signature_useful -
+        before.policy_hybrid_signature_useful : 0;
+    size_t policy_hybrid_successor_useful = after_stats_available ?
+        after.policy_hybrid_successor_useful -
+        before.policy_hybrid_successor_useful : 0;
+    size_t policy_hybrid_stream_useful = after_stats_available ?
+        after.policy_hybrid_stream_useful -
+        before.policy_hybrid_stream_useful : 0;
+    size_t policy_hybrid_cohort_useful = after_stats_available ?
+        after.policy_hybrid_cohort_useful -
+        before.policy_hybrid_cohort_useful : 0;
+    const char* policy_prefetch_observation =
+        after_stats_available && after.policy_prefetch_observation != 0 ?
+        "write_protect" : "unobserved";
     double seconds = seconds_since(&start, &end);
     double touched_mib = ((double)touches * (double)page_size_bytes) /
         (1024.0 * 1024.0);
@@ -2782,6 +5772,25 @@ int main(int argc, char** argv) {
         logical_mib / measured_access_seconds : 0.0;
     double end_to_end_logical_mib_per_sec = seconds > 0.0 ?
         logical_mib / seconds : 0.0;
+    double policy_sampled_units_per_sec = seconds > 0.0 ?
+        (double)touches / seconds : 0.0;
+    double policy_prefetch_accuracy_observed = policy_prefetch_completed != 0 ?
+        (double)policy_prefetch_useful / (double)policy_prefetch_completed : 0.0;
+    double policy_prefetch_coverage_observed = policy_demand_faults != 0 ?
+        (double)policy_prefetch_useful / (double)policy_demand_faults : 0.0;
+    double policy_read_amplification = logical_bytes != 0 ?
+        (double)policy_migration_read_bytes / (double)logical_bytes : 0.0;
+    double policy_write_amplification = logical_bytes != 0 ?
+        (double)policy_migration_write_bytes / (double)logical_bytes : 0.0;
+    double policy_migration_mib = (double)(policy_migration_read_bytes +
+        policy_migration_write_bytes) / (1024.0 * 1024.0);
+    double policy_migration_mib_per_sec = seconds > 0.0 ?
+        policy_migration_mib / seconds : 0.0;
+    size_t policy_async_prefetch_attempts =
+        policy_async_prefetch_enqueued + policy_async_prefetch_dropped;
+    double policy_async_drop_rate = policy_async_prefetch_attempts != 0 ?
+        (double)policy_async_prefetch_dropped /
+        (double)policy_async_prefetch_attempts : 0.0;
     double min_mib_per_sec = env_double("MAI_ACCESS_MIN_MIB_PER_SEC", 0.0);
 
     printf("mode=%s size=%zu touches=%zu touched_mib=%.3f seconds=%.6f "
@@ -2790,13 +5799,190 @@ int main(int argc, char** argv) {
            "file_delta=%zu migrated_delta=%zu promoted_delta=%zu "
            "uffd_available=%zu uffd_alloc_delta=%zu uffd_fault_delta=%zu "
            "uffd_eviction_delta=%zu uffd_resident_bytes=%zu "
-           "uffd_fallback_delta=%zu max_rss=%zu "
+           "uffd_fallback_delta=%zu migration_policy=%zu "
+           "policy_prefetch_requests=%zu "
+           "policy_prefetch_admitted=%zu "
+           "policy_prefetch_completed=%zu "
+           "policy_prefetch_useful=%zu policy_prefetch_late=%zu "
+           "policy_prefetch_unused_evictions=%zu "
+           "policy_prefetch_bytes=%zu "
+           "policy_prefetch_useful_bytes=%zu "
+           "policy_prefetch_unused_evicted_bytes=%zu "
+           "policy_prefetch_observation=%s "
+           "policy_prefetch_accuracy_observed=%.6f "
+           "policy_prefetch_coverage_observed=%.6f "
+           "policy_admission_requests=%zu "
+           "policy_admission_rejected=%zu "
+           "policy_demotions=%zu policy_promotions=%zu "
+           "policy_evicted_hot_bytes=%zu "
+           "policy_migration_read_bytes=%zu "
+           "policy_migration_write_bytes=%zu "
+           "policy_read_amplification=%.6f "
+           "policy_write_amplification=%.6f "
+           "policy_migration_mib_per_sec=%.3f "
+           "policy_demand_faults=%zu "
+           "policy_demand_fault_stall_ns=%zu "
+           "policy_demand_fault_stall_samples=%zu "
+           "policy_demand_fault_stall_p50_ns=%zu "
+           "policy_demand_fault_stall_p90_ns=%zu "
+           "policy_demand_fault_stall_p99_ns=%zu "
+           "policy_demand_fault_stall_max_ns=%zu "
+           "policy_throttle_events=%zu "
+           "policy_throttle_slept_ns=%zu "
+           "policy_async_prefetch_enqueued=%zu "
+           "policy_async_prefetch_completed=%zu "
+           "policy_async_prefetch_dropped=%zu "
+           "policy_async_completed_without_prefetch=%zu "
+           "policy_async_drop_rate=%.6f "
+           "policy_adaptive_windows=%zu "
+           "policy_adaptive_level=%zu "
+           "policy_adaptive_level_changes=%zu "
+           "policy_adaptive_prefetch_capped=%zu "
+           "policy_adaptive_admission_rejected=%zu "
+           "policy_adaptive_budget_gate=%zu "
+           "policy_adaptive_budget_bytes=%zu "
+           "policy_adaptive_window_migration_bytes=%zu "
+           "policy_clean_shadow_tracked_chunks=%zu "
+           "policy_clean_shadow_protect_failures=%zu "
+           "policy_clean_shadow_write_skipped_bytes=%zu "
+           "policy_clean_shadow_write_skipped_chunks=%zu "
+           "policy_clean_shadow_write_faults=%zu "
+           "policy_car_recent_chunks=%zu "
+           "policy_car_frequent_chunks=%zu "
+           "policy_car_recent_ghost_chunks=%zu "
+           "policy_car_frequent_ghost_chunks=%zu "
+           "policy_car_target_recent_chunks=%zu "
+           "policy_car_recent_ghost_hits=%zu "
+           "policy_car_frequent_ghost_hits=%zu "
+           "policy_car_target_increases=%zu "
+           "policy_car_target_decreases=%zu "
+           "policy_car_second_chances=%zu "
+           "policy_tinylfu_sketch_updates=%zu "
+           "policy_tinylfu_sketch_decays=%zu "
+           "policy_tinylfu_admission_rejected=%zu "
+           "policy_tinylfu_min_score=%zu "
+           "policy_bestoffset_train_samples=%zu "
+           "policy_bestoffset_train_hits=%zu "
+           "policy_bestoffset_slots_created=%zu "
+           "policy_bestoffset_score_decays=%zu "
+           "policy_bestoffset_candidates=%zu "
+           "policy_bestoffset_pressure_rejected=%zu "
+           "policy_bestoffset_unused_penalties=%zu "
+           "policy_bestoffset_top_offset_magnitude=%zu "
+           "policy_bestoffset_top_offset_sign=%zu "
+           "policy_bestoffset_top_score=%zu "
+           "policy_wtinylfu_window_chunks=%zu "
+           "policy_wtinylfu_probation_chunks=%zu "
+           "policy_wtinylfu_protected_chunks=%zu "
+           "policy_wtinylfu_window_evictions=%zu "
+           "policy_wtinylfu_main_admission_rejected=%zu "
+           "policy_wtinylfu_victim_score_rejected=%zu "
+           "policy_successor_chain_candidates=%zu "
+           "policy_successor_chain_rejected=%zu "
+           "policy_successor_chain_depth=%zu "
+           "policy_markov_lead_candidates=%zu "
+           "policy_markov_lead_admitted=%zu "
+           "policy_markov_lead_completed=%zu "
+           "policy_markov_lead_useful=%zu "
+           "policy_phase_candidates=%zu "
+           "policy_phase_admitted=%zu "
+           "policy_phase_completed=%zu "
+           "policy_phase_useful=%zu "
+           "policy_phase_conflicts=%zu "
+           "policy_phase_confidence_rejected=%zu "
+           "policy_phase_budget_rejected=%zu "
+           "policy_phase_safe_victim_rejected=%zu "
+           "policy_phase_victim_rejected=%zu "
+           "policy_phase_duplicate_candidates=%zu "
+           "policy_phase_target_hot_skipped=%zu "
+           "policy_phase_active_slots=%zu "
+           "policy_phase_top_score=%zu "
+           "policy_phase_unused_evictions=%zu "
+           "policy_phase_boundary_prefetches=%zu "
+           "policy_phase_hold_activations=%zu "
+           "policy_phase_shadow_candidates=%zu "
+           "policy_phase_shadow_useful=%zu "
+           "policy_phase_shadow_late=%zu "
+           "policy_phase_shadow_expired=%zu "
+           "policy_phase_shadow_overwritten=%zu "
+           "policy_phase_shadow_probe_candidates=%zu "
+           "policy_phase_shadow_edge_rejected=%zu "
+           "policy_phase_shadow_edge_confirmed=%zu "
+           "policy_phase_shadow_top_late=%zu "
+           "policy_phase_shadow_max_late=%zu "
+           "policy_hint_candidates=%zu "
+           "policy_hint_admitted=%zu "
+           "policy_hint_completed=%zu "
+           "policy_hint_useful=%zu "
+           "policy_hint_rejected=%zu "
+           "policy_arc_t1_chunks=%zu "
+           "policy_arc_t2_chunks=%zu "
+           "policy_arc_b1_chunks=%zu "
+           "policy_arc_b2_chunks=%zu "
+           "policy_arc_p_chunks=%zu "
+           "policy_arc_b1_hits=%zu "
+           "policy_arc_b2_hits=%zu "
+           "policy_arc_target_increases=%zu "
+           "policy_arc_target_decreases=%zu "
+           "policy_arc_t1_hits=%zu "
+           "policy_arc_t2_hits=%zu "
+           "policy_arc_t1_to_t2_promotions=%zu "
+           "policy_arc_replace_t1=%zu "
+           "policy_arc_replace_t2=%zu "
+           "policy_arc_b1_pruned=%zu "
+           "policy_arc_b2_pruned=%zu "
+           "policy_arc_prefetch_admitted_t1=%zu "
+           "policy_arc_prefetch_rejected_pressure=%zu "
+           "policy_arc_prefetch_promoted_to_t2=%zu "
+           "policy_irr_resident_chunks=%zu "
+           "policy_irr_protected_chunks=%zu "
+           "policy_irr_ghost_chunks=%zu "
+           "policy_irr_target_protected_chunks=%zu "
+           "policy_irr_ghost_hits=%zu "
+           "policy_irr_promotions=%zu "
+           "policy_irr_demotions=%zu "
+           "policy_irr_pressure_rejected=%zu "
+           "policy_irr_immature_rejected=%zu "
+           "policy_irr_max_interval_epochs=%zu "
+           "policy_signature_train_samples=%zu "
+           "policy_signature_train_hits=%zu "
+           "policy_signature_slots_created=%zu "
+           "policy_signature_score_decays=%zu "
+           "policy_signature_candidates=%zu "
+           "policy_signature_pressure_rejected=%zu "
+           "policy_signature_unused_penalties=%zu "
+           "policy_signature_chain_candidates=%zu "
+           "policy_signature_chain_rejected=%zu "
+           "policy_signature_chain_depth=%zu "
+           "policy_signature_top_delta_magnitude=%zu "
+           "policy_signature_top_delta_sign=%zu "
+           "policy_signature_top_score=%zu "
+           "policy_hybrid_signature_candidates=%zu "
+           "policy_hybrid_successor_candidates=%zu "
+           "policy_hybrid_stream_candidates=%zu "
+           "policy_hybrid_cohort_candidates=%zu "
+           "policy_hybrid_admission_rejected=%zu "
+           "policy_hybrid_signature_admitted=%zu "
+           "policy_hybrid_successor_admitted=%zu "
+           "policy_hybrid_stream_admitted=%zu "
+           "policy_hybrid_cohort_admitted=%zu "
+           "policy_hybrid_signature_completed=%zu "
+           "policy_hybrid_successor_completed=%zu "
+           "policy_hybrid_stream_completed=%zu "
+           "policy_hybrid_cohort_completed=%zu "
+           "policy_hybrid_signature_useful=%zu "
+           "policy_hybrid_successor_useful=%zu "
+           "policy_hybrid_stream_useful=%zu "
+           "policy_hybrid_cohort_useful=%zu "
+           "max_rss=%zu "
            "current_rss_before=%zu current_rss_after=%zu "
            "high_water_rss_after=%zu "
            "heartbeat_calls=%zu heartbeat_busy_ticks=%zu "
            "heartbeat_migrate_bytes=%zu heartbeat_reclaimed_bytes=%zu "
            "trace_setup_calls=%zu trace_stop_calls=%zu "
            "trace_faulted_pages=%zu latency_ops=%zu logical_mib=%.3f "
+           "policy_sampled_units=%zu "
+           "policy_sampled_units_per_sec=%.3f "
            "logical_mib_per_sec=%.3f "
            "kernel_logical_mib_per_sec=%.3f "
            "end_to_end_logical_mib_per_sec=%.3f "
@@ -2815,7 +6001,36 @@ int main(int argc, char** argv) {
            "mprotect_voluntary_ctxt_delta=%ld "
            "mprotect_involuntary_ctxt_delta=%ld "
            "mprotect_user_cpu_us_delta=%ld "
-           "mprotect_sys_cpu_us_delta=%ld heartbeat_total_ns=%llu "
+           "mprotect_sys_cpu_us_delta=%ld "
+           "run_minor_faults_delta=%ld "
+           "run_major_faults_delta=%ld "
+           "run_inblock_delta=%ld "
+           "run_oublock_delta=%ld "
+           "run_voluntary_ctxt_delta=%ld "
+           "run_involuntary_ctxt_delta=%ld "
+           "run_user_cpu_us_delta=%ld "
+           "run_sys_cpu_us_delta=%ld "
+           "run_maxrss_kib=%ld "
+           "cgroup_memory_max_bytes=%zu "
+           "cgroup_memory_max_available=%d "
+           "cgroup_memory_max_unbounded=%d "
+           "cgroup_memory_max_is_max_token=%d "
+           "cgroup_memory_current_before=%zu "
+           "cgroup_memory_current_after=%zu "
+           "cgroup_memory_events_high_delta=%zu "
+           "cgroup_memory_events_max_delta=%zu "
+           "cgroup_memory_events_oom_delta=%zu "
+           "cgroup_swap_max_bytes=%zu "
+           "cgroup_swap_max_available=%d "
+           "cgroup_swap_max_unbounded=%d "
+           "cgroup_swap_max_is_max_token=%d "
+           "cgroup_swap_current_before=%zu "
+           "cgroup_swap_current_after=%zu "
+           "stream_mapping_kind=%s "
+           "stream_backing_path=%s "
+           "stream_backing_fs_type=%llu "
+           "stream_backing_is_tmpfs=%d "
+           "heartbeat_total_ns=%llu "
            "chunk_touch_position=%s "
            "stream_copy_mib_per_sec=%.3f "
            "stream_scale_mib_per_sec=%.3f "
@@ -2843,6 +6058,92 @@ int main(int argc, char** argv) {
            "stream_pipeline_prediction=%s "
            "stream_pipeline_reclaim_lag=%zu "
            "stream_pipeline_reclaim_horizon=%zu "
+           "stream_pipeline_unique_cold_visits=%zu "
+           "stream_pipeline_max_cycle_policy_demand_faults=%zu "
+           "stream_pipeline_max_cycle_policy_read_bytes=%zu "
+           "stream_pipeline_max_cycle_policy_write_bytes=%zu "
+           "stream_pipeline_max_cycle_policy_stall_ns=%zu "
+           "stream_pipeline_max_cycle_policy_demotions=%zu "
+           "stream_pipeline_max_cycle_policy_hot_evicted_bytes=%zu "
+           "stream_pipeline_cycle_policy_demand_faults_p50=%zu "
+           "stream_pipeline_cycle_policy_demand_faults_p90=%zu "
+           "stream_pipeline_cycle_policy_demand_faults_p99=%zu "
+           "stream_pipeline_cycle_policy_read_bytes_p50=%zu "
+           "stream_pipeline_cycle_policy_read_bytes_p90=%zu "
+           "stream_pipeline_cycle_policy_read_bytes_p99=%zu "
+           "stream_pipeline_cycle_policy_write_bytes_p50=%zu "
+           "stream_pipeline_cycle_policy_write_bytes_p90=%zu "
+           "stream_pipeline_cycle_policy_write_bytes_p99=%zu "
+           "stream_pipeline_cycle_policy_stall_ns_p50=%zu "
+           "stream_pipeline_cycle_policy_stall_ns_p90=%zu "
+           "stream_pipeline_cycle_policy_stall_ns_p99=%zu "
+           "stream_pipeline_cycle_policy_unused_prefetch_evictions_p50=%zu "
+           "stream_pipeline_cycle_policy_unused_prefetch_evictions_p90=%zu "
+           "stream_pipeline_cycle_policy_unused_prefetch_evictions_p99=%zu "
+           "stream_pipeline_group_visit_0=%zu "
+           "stream_pipeline_group_visit_1=%zu "
+           "stream_pipeline_group_visit_2=%zu "
+           "stream_pipeline_transition_00=%zu "
+           "stream_pipeline_transition_01=%zu "
+           "stream_pipeline_transition_02=%zu "
+           "stream_pipeline_transition_10=%zu "
+           "stream_pipeline_transition_11=%zu "
+           "stream_pipeline_transition_12=%zu "
+           "stream_pipeline_transition_20=%zu "
+           "stream_pipeline_transition_21=%zu "
+           "stream_pipeline_transition_22=%zu "
+           "stream_pipeline_unique_transitions=%zu "
+           "stream_pipeline_worst_cycle_index=%zu "
+           "stream_pipeline_worst_cycle_group=%zu "
+           "stream_pipeline_worst_cycle_prev_group=%zu "
+           "stream_pipeline_order_sequence=%s "
+           "stream_pipeline_phase_chunks=%zu "
+           "stream_pipeline_phase_return_cycles=%zu "
+           "stream_pipeline_phase_return_policy_demand_faults=%zu "
+           "stream_pipeline_phase_return_policy_read_bytes=%zu "
+           "stream_pipeline_phase_return_policy_write_bytes=%zu "
+           "stream_pipeline_phase_return_policy_stall_ns=%zu "
+           "stream_pipeline_phase_return_policy_hot_evicted_bytes=%zu "
+           "stream_pipeline_phase_return_policy_unused_prefetch_evictions=%zu "
+           "stream_pipeline_phase_return_estimated_hits=%zu "
+           "stream_pipeline_phase_return_estimated_hit_ratio=%.6f "
+           "stream_pipeline_phase_warm_return_cycles=%zu "
+           "stream_pipeline_phase_warm_return_policy_demand_faults=%zu "
+           "stream_pipeline_phase_warm_return_policy_read_bytes=%zu "
+           "stream_pipeline_phase_warm_return_policy_write_bytes=%zu "
+           "stream_pipeline_phase_warm_return_policy_stall_ns=%zu "
+           "stream_pipeline_phase_warm_return_policy_hot_evicted_bytes=%zu "
+           "stream_pipeline_phase_warm_return_policy_unused_prefetch_evictions=%zu "
+           "stream_pipeline_phase_warm_return_estimated_hits=%zu "
+           "stream_pipeline_phase_warm_return_estimated_hit_ratio=%.6f "
+           "stream_pipeline_phase_decoy_cycles=%zu "
+           "stream_pipeline_phase_decoy_policy_demand_faults=%zu "
+           "stream_pipeline_phase_decoy_policy_read_bytes=%zu "
+           "stream_pipeline_phase_decoy_policy_write_bytes=%zu "
+           "stream_pipeline_phase_decoy_policy_stall_ns=%zu "
+           "stream_pipeline_phase_decoy_policy_hot_evicted_bytes=%zu "
+           "stream_pipeline_phase_decoy_policy_unused_prefetch_evictions=%zu "
+           "policy_pivot_return_faults=%zu "
+           "policy_pivot_return_touches=%zu "
+           "policy_pivot_return_hits=%zu "
+           "policy_pivot_hot_return_hit_ratio=%.6f "
+           "policy_pivot_adaptation_lag_touches=%zu "
+           "policy_irr_hot_return_faults=%zu "
+           "policy_irr_hot_return_touches=%zu "
+           "policy_irr_hot_return_hits=%zu "
+           "policy_irr_hot_return_hit_ratio=%.6f "
+           "policy_irr_decoy_return_faults=%zu "
+           "policy_irr_decoy_return_touches=%zu "
+           "policy_irr_decoy_return_hits=%zu "
+           "policy_irr_decoy_return_hit_ratio=%.6f "
+           "policy_irr_discrimination_score=%.6f "
+           "policy_irr_adaptation_lag_touches=%zu "
+           "policy_irr_scan_faults=%zu "
+           "policy_irr_scan_read_bytes=%zu "
+           "policy_irr_scan_write_bytes=%zu "
+           "policy_irr_scan_hot_evicted_bytes=%zu "
+           "policy_irr_scan_unused_prefetch_evictions=%zu "
+           "policy_irr_scan_stall_ns=%zu "
            "stream_prefetch_ns=%llu stream_prepare_write_ns=%llu "
            "stream_reclaim_ns=%llu stream_init_ns=%llu "
            "stream_copy_ns=%llu stream_scale_ns=%llu "
@@ -2852,11 +6153,173 @@ int main(int argc, char** argv) {
            reclaimed_delta, anon_delta, file_delta, migrated_delta,
            promoted_delta, after.uffd_pager_available, uffd_alloc_delta,
            uffd_fault_delta, uffd_eviction_delta, after.uffd_resident_bytes,
-           uffd_fallback_delta, after.max_rss, before.current_rss_bytes,
+           uffd_fallback_delta, migration_policy,
+           policy_prefetch_requests, policy_prefetch_admitted,
+           policy_prefetch_completed, policy_prefetch_useful,
+           policy_prefetch_late, policy_prefetch_unused_evictions,
+           policy_prefetch_bytes, policy_prefetch_useful_bytes,
+           policy_prefetch_unused_evicted_bytes,
+           policy_prefetch_observation,
+           policy_prefetch_accuracy_observed,
+           policy_prefetch_coverage_observed, policy_admission_requests,
+           policy_admission_rejected, policy_demotions, policy_promotions,
+           policy_evicted_hot_bytes, policy_migration_read_bytes,
+           policy_migration_write_bytes, policy_read_amplification,
+           policy_write_amplification, policy_migration_mib_per_sec,
+           policy_demand_faults, policy_demand_fault_stall_ns,
+           policy_demand_fault_stall_samples,
+           after.policy_demand_fault_stall_p50_ns,
+           after.policy_demand_fault_stall_p90_ns,
+           after.policy_demand_fault_stall_p99_ns,
+           after.policy_demand_fault_stall_max_ns,
+           policy_throttle_events, policy_throttle_slept_ns,
+           policy_async_prefetch_enqueued,
+           policy_async_prefetch_completed,
+           policy_async_prefetch_dropped,
+           policy_async_completed_without_prefetch,
+           policy_async_drop_rate,
+           policy_adaptive_windows, policy_adaptive_level,
+           policy_adaptive_level_changes, policy_adaptive_prefetch_capped,
+           policy_adaptive_admission_rejected,
+           policy_adaptive_budget_gate, policy_adaptive_budget_bytes,
+           policy_adaptive_window_migration_bytes,
+           policy_clean_shadow_tracked_chunks,
+           policy_clean_shadow_protect_failures,
+           policy_clean_shadow_write_skipped_bytes,
+           policy_clean_shadow_write_skipped_chunks,
+           policy_clean_shadow_write_faults,
+           policy_car_recent_chunks, policy_car_frequent_chunks,
+           policy_car_recent_ghost_chunks,
+           policy_car_frequent_ghost_chunks,
+           policy_car_target_recent_chunks,
+           policy_car_recent_ghost_hits,
+           policy_car_frequent_ghost_hits,
+           policy_car_target_increases,
+           policy_car_target_decreases,
+           policy_car_second_chances,
+           policy_tinylfu_sketch_updates,
+           policy_tinylfu_sketch_decays,
+           policy_tinylfu_admission_rejected,
+           policy_tinylfu_min_score,
+           policy_bestoffset_train_samples,
+           policy_bestoffset_train_hits,
+           policy_bestoffset_slots_created,
+           policy_bestoffset_score_decays,
+           policy_bestoffset_candidates,
+           policy_bestoffset_pressure_rejected,
+           policy_bestoffset_unused_penalties,
+           policy_bestoffset_top_offset_magnitude,
+           policy_bestoffset_top_offset_sign,
+           policy_bestoffset_top_score,
+           policy_wtinylfu_window_chunks,
+           policy_wtinylfu_probation_chunks,
+           policy_wtinylfu_protected_chunks,
+           policy_wtinylfu_window_evictions,
+           policy_wtinylfu_main_admission_rejected,
+           policy_wtinylfu_victim_score_rejected,
+           policy_successor_chain_candidates,
+           policy_successor_chain_rejected,
+           policy_successor_chain_depth,
+           policy_markov_lead_candidates,
+           policy_markov_lead_admitted,
+           policy_markov_lead_completed,
+           policy_markov_lead_useful,
+           policy_phase_candidates,
+           policy_phase_admitted,
+           policy_phase_completed,
+           policy_phase_useful,
+           policy_phase_conflicts,
+           policy_phase_confidence_rejected,
+           policy_phase_budget_rejected,
+           policy_phase_safe_victim_rejected,
+           policy_phase_victim_rejected,
+           policy_phase_duplicate_candidates,
+           policy_phase_target_hot_skipped,
+           policy_phase_active_slots,
+           policy_phase_top_score,
+           policy_phase_unused_evictions,
+           policy_phase_boundary_prefetches,
+           policy_phase_hold_activations,
+           policy_phase_shadow_candidates,
+           policy_phase_shadow_useful,
+           policy_phase_shadow_late,
+           policy_phase_shadow_expired,
+           policy_phase_shadow_overwritten,
+           policy_phase_shadow_probe_candidates,
+           policy_phase_shadow_edge_rejected,
+           policy_phase_shadow_edge_confirmed,
+           policy_phase_shadow_top_late,
+           policy_phase_shadow_max_late,
+           policy_hint_candidates,
+           policy_hint_admitted,
+           policy_hint_completed,
+           policy_hint_useful,
+           policy_hint_rejected,
+           policy_arc_t1_chunks,
+           policy_arc_t2_chunks,
+           policy_arc_b1_chunks,
+           policy_arc_b2_chunks,
+           policy_arc_p_chunks,
+           policy_arc_b1_hits,
+           policy_arc_b2_hits,
+           policy_arc_target_increases,
+           policy_arc_target_decreases,
+           policy_arc_t1_hits,
+           policy_arc_t2_hits,
+           policy_arc_t1_to_t2_promotions,
+           policy_arc_replace_t1,
+           policy_arc_replace_t2,
+           policy_arc_b1_pruned,
+           policy_arc_b2_pruned,
+           policy_arc_prefetch_admitted_t1,
+           policy_arc_prefetch_rejected_pressure,
+           policy_arc_prefetch_promoted_to_t2,
+           policy_irr_resident_chunks,
+           policy_irr_protected_chunks,
+           policy_irr_ghost_chunks,
+           policy_irr_target_protected_chunks,
+           policy_irr_ghost_hits,
+           policy_irr_promotions,
+           policy_irr_demotions,
+           policy_irr_pressure_rejected,
+           policy_irr_immature_rejected,
+           policy_irr_max_interval_epochs,
+           policy_signature_train_samples,
+           policy_signature_train_hits,
+           policy_signature_slots_created,
+           policy_signature_score_decays,
+           policy_signature_candidates,
+           policy_signature_pressure_rejected,
+           policy_signature_unused_penalties,
+           policy_signature_chain_candidates,
+           policy_signature_chain_rejected,
+           policy_signature_chain_depth,
+           policy_signature_top_delta_magnitude,
+           policy_signature_top_delta_sign,
+           policy_signature_top_score,
+           policy_hybrid_signature_candidates,
+           policy_hybrid_successor_candidates,
+           policy_hybrid_stream_candidates,
+           policy_hybrid_cohort_candidates,
+           policy_hybrid_admission_rejected,
+           policy_hybrid_signature_admitted,
+           policy_hybrid_successor_admitted,
+           policy_hybrid_stream_admitted,
+           policy_hybrid_cohort_admitted,
+           policy_hybrid_signature_completed,
+           policy_hybrid_successor_completed,
+           policy_hybrid_stream_completed,
+           policy_hybrid_cohort_completed,
+           policy_hybrid_signature_useful,
+           policy_hybrid_successor_useful,
+           policy_hybrid_stream_useful,
+           policy_hybrid_cohort_useful,
+           after.max_rss, before.current_rss_bytes,
            after.current_rss_bytes, after.high_water_rss_bytes, heartbeat_calls,
            heartbeat_busy_ticks, heartbeat_migrate_bytes,
            heartbeat_reclaimed_bytes, trace_setup_calls, trace_stop_calls,
-           trace_faulted_pages, latency_ops, logical_mib, logical_mib_per_sec,
+           trace_faulted_pages, latency_ops, logical_mib, touches,
+           policy_sampled_units_per_sec, logical_mib_per_sec,
            logical_mib_per_sec, end_to_end_logical_mib_per_sec,
            mprotect_mechanism_label, mprotect_chunk_bytes, mprotect_sample_pages,
            (unsigned long long)mprotect_warmup_ns,
@@ -2871,7 +6334,22 @@ int main(int argc, char** argv) {
            (unsigned long long)mprotect_sweep_ns, mprotect_minor_faults_delta,
            mprotect_major_faults_delta, mprotect_voluntary_ctxt_delta,
            mprotect_involuntary_ctxt_delta, mprotect_user_cpu_us_delta,
-           mprotect_sys_cpu_us_delta, (unsigned long long)heartbeat_total_ns,
+           mprotect_sys_cpu_us_delta, run_minor_faults_delta,
+           run_major_faults_delta, run_inblock_delta, run_oublock_delta,
+           run_voluntary_ctxt_delta, run_involuntary_ctxt_delta,
+           run_user_cpu_us_delta, run_sys_cpu_us_delta, run_maxrss_kib,
+           cgroup_memory_max_bytes, cgroup_memory_max_available,
+           cgroup_memory_max_unbounded, cgroup_memory_max_is_max_token,
+           cgroup_memory_current_before,
+           cgroup_memory_current_after, cgroup_memory_events_high_delta,
+           cgroup_memory_events_max_delta, cgroup_memory_events_oom_delta,
+           cgroup_swap_max_bytes, cgroup_swap_max_available,
+           cgroup_swap_max_unbounded, cgroup_swap_max_is_max_token,
+           cgroup_swap_current_before, cgroup_swap_current_after,
+           stream_mapping_kind_recorded,
+           stream_backing_path_recorded, stream_backing_fs_type,
+           stream_backing_is_tmpfs,
+           (unsigned long long)heartbeat_total_ns,
            chunk_touch_position_label, stream_copy_mib_per_sec,
            stream_scale_mib_per_sec, stream_add_mib_per_sec,
            stream_triad_mib_per_sec, stream_total_mib_per_sec,
@@ -2893,6 +6371,92 @@ int main(int argc, char** argv) {
            stream_pipeline_prediction_recorded,
            stream_pipeline_reclaim_lag_recorded,
            stream_pipeline_reclaim_horizon_recorded,
+           stream_pipeline_unique_cold_visits_recorded,
+           stream_pipeline_max_cycle_policy_demand_faults,
+           stream_pipeline_max_cycle_policy_read_bytes,
+           stream_pipeline_max_cycle_policy_write_bytes,
+           stream_pipeline_max_cycle_policy_stall_ns,
+           stream_pipeline_max_cycle_policy_demotions,
+           stream_pipeline_max_cycle_policy_hot_evicted_bytes,
+           stream_pipeline_cycle_policy_demand_faults_p50,
+           stream_pipeline_cycle_policy_demand_faults_p90,
+           stream_pipeline_cycle_policy_demand_faults_p99,
+           stream_pipeline_cycle_policy_read_bytes_p50,
+           stream_pipeline_cycle_policy_read_bytes_p90,
+           stream_pipeline_cycle_policy_read_bytes_p99,
+           stream_pipeline_cycle_policy_write_bytes_p50,
+           stream_pipeline_cycle_policy_write_bytes_p90,
+           stream_pipeline_cycle_policy_write_bytes_p99,
+           stream_pipeline_cycle_policy_stall_ns_p50,
+           stream_pipeline_cycle_policy_stall_ns_p90,
+           stream_pipeline_cycle_policy_stall_ns_p99,
+           stream_pipeline_cycle_policy_unused_prefetch_evictions_p50,
+           stream_pipeline_cycle_policy_unused_prefetch_evictions_p90,
+           stream_pipeline_cycle_policy_unused_prefetch_evictions_p99,
+           stream_pipeline_group_visit_0_recorded,
+           stream_pipeline_group_visit_1_recorded,
+           stream_pipeline_group_visit_2_recorded,
+           stream_pipeline_transition_00_recorded,
+           stream_pipeline_transition_01_recorded,
+           stream_pipeline_transition_02_recorded,
+           stream_pipeline_transition_10_recorded,
+           stream_pipeline_transition_11_recorded,
+           stream_pipeline_transition_12_recorded,
+           stream_pipeline_transition_20_recorded,
+           stream_pipeline_transition_21_recorded,
+           stream_pipeline_transition_22_recorded,
+           stream_pipeline_unique_transitions_recorded,
+           stream_pipeline_worst_cycle_index_recorded,
+           stream_pipeline_worst_cycle_group_recorded,
+           stream_pipeline_worst_cycle_prev_group_recorded,
+           stream_pipeline_order_sequence_recorded,
+           stream_pipeline_phase_chunks_recorded,
+           stream_pipeline_phase_return_cycles_recorded,
+           stream_pipeline_phase_return_policy_demand_faults,
+           stream_pipeline_phase_return_policy_read_bytes,
+           stream_pipeline_phase_return_policy_write_bytes,
+           stream_pipeline_phase_return_policy_stall_ns,
+           stream_pipeline_phase_return_policy_hot_evicted_bytes,
+           stream_pipeline_phase_return_policy_unused_prefetch_evictions,
+           stream_pipeline_phase_return_estimated_hits,
+           stream_pipeline_phase_return_estimated_hit_ratio,
+           stream_pipeline_phase_warm_return_cycles_recorded,
+           stream_pipeline_phase_warm_return_policy_demand_faults,
+           stream_pipeline_phase_warm_return_policy_read_bytes,
+           stream_pipeline_phase_warm_return_policy_write_bytes,
+           stream_pipeline_phase_warm_return_policy_stall_ns,
+           stream_pipeline_phase_warm_return_policy_hot_evicted_bytes,
+           stream_pipeline_phase_warm_return_policy_unused_prefetch_evictions,
+           stream_pipeline_phase_warm_return_estimated_hits,
+           stream_pipeline_phase_warm_return_estimated_hit_ratio,
+           stream_pipeline_phase_decoy_cycles_recorded,
+           stream_pipeline_phase_decoy_policy_demand_faults,
+           stream_pipeline_phase_decoy_policy_read_bytes,
+           stream_pipeline_phase_decoy_policy_write_bytes,
+           stream_pipeline_phase_decoy_policy_stall_ns,
+           stream_pipeline_phase_decoy_policy_hot_evicted_bytes,
+           stream_pipeline_phase_decoy_policy_unused_prefetch_evictions,
+           policy_pivot_return_faults_recorded,
+           policy_pivot_return_touches_recorded,
+           policy_pivot_return_hits_recorded,
+           policy_pivot_hot_return_hit_ratio_recorded,
+           policy_pivot_adaptation_lag_touches_recorded,
+           policy_irr_hot_return_faults_recorded,
+           policy_irr_hot_return_touches_recorded,
+           policy_irr_hot_return_hits_recorded,
+           policy_irr_hot_return_hit_ratio_recorded,
+           policy_irr_decoy_return_faults_recorded,
+           policy_irr_decoy_return_touches_recorded,
+           policy_irr_decoy_return_hits_recorded,
+           policy_irr_decoy_return_hit_ratio_recorded,
+           policy_irr_discrimination_score_recorded,
+           policy_irr_adaptation_lag_touches_recorded,
+           policy_irr_scan_faults_recorded,
+           policy_irr_scan_read_bytes_recorded,
+           policy_irr_scan_write_bytes_recorded,
+           policy_irr_scan_hot_evicted_bytes_recorded,
+           policy_irr_scan_unused_prefetch_evictions_recorded,
+           policy_irr_scan_stall_ns_recorded,
            (unsigned long long)stream_prefetch_ns,
            (unsigned long long)stream_prepare_write_ns,
            (unsigned long long)stream_reclaim_ns,
