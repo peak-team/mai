@@ -461,6 +461,11 @@ static int env_flag(const char* name, int fallback) {
     return fallback;
 }
 
+static int pure_workload_mode(void) {
+    return env_flag("MAI_BENCH_PURE_WORKLOAD",
+                    env_flag("MAI_BENCH_DISABLE_MAI_STATS_API", 0));
+}
+
 static const char* env_value_compat(const char* primary, const char* legacy) {
     const char* value = getenv(primary);
     if (value && value[0] != '\0') {
@@ -780,6 +785,10 @@ static int mode_uses_stream_pipeline(const char* mode) {
            strcmp(mode, "stream_kernel_pipeline_private_file") == 0;
 }
 
+static int mode_allocates_internally(const char* mode) {
+    return strcmp(mode, "multi_alloc_matrix_pipeline") == 0;
+}
+
 static int build_stream_file_template(char* buffer, size_t buffer_size) {
     const char* dir = env_value_compat("MAI_BENCH_STREAM_BACKING_PATH",
                                        "MAI_STREAM_BACKING_PATH");
@@ -908,6 +917,10 @@ static int load_stats_optional(MaiStats* stats, int* available) {
     memset(stats, 0, sizeof(*stats));
     *available = 0;
 
+    if (pure_workload_mode()) {
+        return 0;
+    }
+
     if (!get_stats_sized) {
         get_stats_sized =
             (get_stats_sized_fn)dlsym(RTLD_DEFAULT, "mai_get_stats_sized");
@@ -929,6 +942,10 @@ static int load_stats_optional(MaiStats* stats, int* available) {
 }
 
 static int reclaim_now(void) {
+    if (pure_workload_mode()) {
+        return 0;
+    }
+
     if (!reclaim_all) {
         reclaim_all = (reclaim_all_fn)dlsym(RTLD_DEFAULT, "mai_reclaim_all");
     }
@@ -939,6 +956,14 @@ static int reclaim_now(void) {
 }
 
 static void load_range_ops_optional(void) {
+    if (pure_workload_mode()) {
+        prefetch_range = NULL;
+        prepare_write_range = NULL;
+        reclaim_range = NULL;
+        hint_range = NULL;
+        return;
+    }
+
     if (!prefetch_range) {
         prefetch_range = (range_op_fn)dlsym(RTLD_DEFAULT, "mai_prefetch");
     }
@@ -4099,13 +4124,17 @@ static int run_stream_tiled_bandwidth(unsigned char* buffer, size_t size,
         return -1;
     }
 
-    int use_prefetch = env_count_compat("MAI_BENCH_STREAM_TILE_PREFETCH",
-                                        "MAI_STREAM_TILE_PREFETCH", 1) != 0;
+    int pure_workload = pure_workload_mode();
+    int use_prefetch = !pure_workload &&
+        env_count_compat("MAI_BENCH_STREAM_TILE_PREFETCH",
+                         "MAI_STREAM_TILE_PREFETCH", 1) != 0;
     int use_prepare_write =
+        !pure_workload &&
         env_count_compat("MAI_BENCH_STREAM_TILE_PREPARE_WRITE",
                          "MAI_STREAM_TILE_PREPARE_WRITE", 1) != 0;
     int use_reclaim = env_count_compat("MAI_BENCH_STREAM_TILE_RECLAIM",
-                                       "MAI_STREAM_TILE_RECLAIM", 1) != 0;
+                                       "MAI_STREAM_TILE_RECLAIM", 1) != 0 &&
+        !pure_workload;
     load_range_ops_optional();
     size_t resident_arrays = choose_stream_resident_arrays(bytes, tile_bytes);
     stream_tile_bytes_recorded = tile_bytes;
@@ -4400,6 +4429,99 @@ static void stream_pipeline_record_order_sequence(const size_t* order,
     }
 }
 
+static int build_submatrix_group_order(size_t* order, size_t cycles,
+                                       size_t groups, size_t* hot_groups_out,
+                                       double* hot_probability_out) {
+    const char* mode = env_value_compat("MAI_BENCH_SUBMATRIX_ORDER",
+                                        "MAI_BENCH_STREAM_PIPELINE_ORDER");
+    if (!mode || mode[0] == '\0') {
+        mode = "sequential";
+    }
+
+    size_t seed = env_count_compat("MAI_BENCH_SUBMATRIX_SEED",
+                                   "MAI_BENCH_STREAM_PIPELINE_SEED", 1);
+    if (seed == 0) {
+        seed = 1;
+    }
+    stream_pipeline_seed_recorded = seed;
+    uint64_t state = (uint64_t)seed;
+
+    if (hot_groups_out) {
+        *hot_groups_out = 0;
+    }
+    if (hot_probability_out) {
+        *hot_probability_out = 0.0;
+    }
+
+    if (strcmp(mode, "sequential") == 0) {
+        stream_pipeline_order_recorded = "submatrix_sequential";
+        stream_pipeline_prediction_recorded = "submatrix";
+        for (size_t cycle = 0; cycle < cycles; cycle++) {
+            order[cycle] = cycle % groups;
+        }
+        return 0;
+    }
+
+    if (strcmp(mode, "random") == 0 ||
+        strcmp(mode, "random_no_repeat") == 0) {
+        int no_repeat = strcmp(mode, "random_no_repeat") == 0;
+        stream_pipeline_order_recorded =
+            no_repeat ? "submatrix_random_no_repeat" : "submatrix_random";
+        stream_pipeline_prediction_recorded = "submatrix_random";
+        size_t current = stream_pipeline_rng_mod(&state, groups);
+        for (size_t cycle = 0; cycle < cycles; cycle++) {
+            order[cycle] = current;
+            if (no_repeat && groups > 1) {
+                current = (current + 1 +
+                           stream_pipeline_rng_mod(&state, groups - 1)) %
+                    groups;
+            } else {
+                current = stream_pipeline_rng_mod(&state, groups);
+            }
+        }
+        return 0;
+    }
+
+    if (strcmp(mode, "hotset") == 0 || strcmp(mode, "hot_cold") == 0) {
+        size_t hot_groups = env_count("MAI_BENCH_SUBMATRIX_HOT_GROUPS", 1);
+        if (hot_groups == 0) {
+            hot_groups = 1;
+        }
+        if (hot_groups > groups) {
+            hot_groups = groups;
+        }
+        double hot_probability =
+            env_double("MAI_BENCH_SUBMATRIX_HOT_PROBABILITY", 0.80);
+        if (hot_probability > 1.0) {
+            hot_probability = 1.0;
+        }
+        stream_pipeline_order_recorded = "submatrix_hotset";
+        stream_pipeline_prediction_recorded = "submatrix_hot_cold";
+        if (hot_groups_out) {
+            *hot_groups_out = hot_groups;
+        }
+        if (hot_probability_out) {
+            *hot_probability_out = hot_probability;
+        }
+
+        for (size_t cycle = 0; cycle < cycles; cycle++) {
+            double draw =
+                (double)(stream_pipeline_rng_next(&state) >> 11) *
+                (1.0 / 9007199254740992.0);
+            if (draw < hot_probability || hot_groups == groups) {
+                order[cycle] = stream_pipeline_rng_mod(&state, hot_groups);
+            } else {
+                size_t cold_groups = groups - hot_groups;
+                order[cycle] = hot_groups +
+                    stream_pipeline_rng_mod(&state, cold_groups);
+            }
+        }
+        return 0;
+    }
+
+    return -1;
+}
+
 static int stream_pipeline_process_group_phase(double** matrices, size_t group,
                                                size_t bytes, size_t tile_bytes,
                                                int phase, double scalar,
@@ -4477,6 +4599,543 @@ static int stream_pipeline_check_index(double** matrices, size_t group,
         (uint64_t)matrices[base + 1][index] +
         (uint64_t)matrices[base + 2][index];
     return 0;
+}
+
+static int run_submatrix_stream_pipeline(const char* mode,
+                                         unsigned char* buffer, size_t size,
+                                         uint64_t* checksum,
+                                         size_t* touches) {
+    int multi_alloc = mode_allocates_internally(mode);
+    size_t cycles =
+        env_count_compat("MAI_BENCH_SUBMATRIX_CYCLES",
+                         "MAI_BENCH_STREAM_PIPELINE_CYCLES",
+                         env_count_compat("MAI_BENCH_STREAM_PASSES",
+                                          "MAI_STREAM_PASSES", 12));
+    if (cycles == 0) {
+        cycles = 1;
+    }
+    size_t group_iterations =
+        env_count_compat("MAI_BENCH_SUBMATRIX_GROUP_ITERATIONS",
+                         "MAI_BENCH_STREAM_PIPELINE_GROUP_ITERATIONS", 1);
+    if (group_iterations == 0) {
+        group_iterations = 1;
+    }
+
+    size_t unit_bytes = multi_alloc ?
+        env_size("MAI_BENCH_MATRIX_ALLOC_SIZE",
+                 env_size("MAI_BENCH_SUBMATRIX_SIZE",
+                          2ULL * 1024ULL * 1024ULL * 1024ULL)) :
+        env_size("MAI_BENCH_SUBMATRIX_SIZE",
+                 2ULL * 1024ULL * 1024ULL * 1024ULL);
+    if (unit_bytes < page_size_bytes) {
+        unit_bytes = page_size_bytes;
+    }
+    if (align_size_to_page(&unit_bytes) != 0 ||
+        unit_bytes > size / STREAM_PIPELINE_GROUP_WIDTH) {
+        return -1;
+    }
+    unit_bytes -= unit_bytes % sizeof(double);
+    if (unit_bytes == 0) {
+        return -1;
+    }
+    if (!multi_alloc && !buffer) {
+        return -1;
+    }
+
+    size_t group_bytes = 0;
+    if (mul_size(unit_bytes, STREAM_PIPELINE_GROUP_WIDTH, &group_bytes) != 0 ||
+        group_bytes == 0) {
+        return -1;
+    }
+    size_t groups = size / group_bytes;
+    if (groups == 0 || groups > 1000000) {
+        return -1;
+    }
+    size_t submatrices = 0;
+    size_t usable_bytes = 0;
+    size_t total_iterations = 0;
+    size_t total_logical_factor = 0;
+    if (mul_size(groups, STREAM_PIPELINE_GROUP_WIDTH, &submatrices) != 0 ||
+        mul_size(groups, group_bytes, &usable_bytes) != 0 ||
+        mul_size(cycles, group_iterations, &total_iterations) != 0 ||
+        mul_size(total_iterations, 10, &total_logical_factor) != 0 ||
+        (unit_bytes != 0 && total_logical_factor > SIZE_MAX / unit_bytes)) {
+        return -1;
+    }
+
+    double** matrices = calloc(submatrices, sizeof(*matrices));
+    unsigned char** matrix_allocs = multi_alloc ?
+        calloc(submatrices, sizeof(*matrix_allocs)) : NULL;
+    uint64_t* cycle_demand_faults = calloc(cycles, sizeof(*cycle_demand_faults));
+    uint64_t* cycle_read_bytes = calloc(cycles, sizeof(*cycle_read_bytes));
+    uint64_t* cycle_write_bytes = calloc(cycles, sizeof(*cycle_write_bytes));
+    uint64_t* cycle_stall_ns = calloc(cycles, sizeof(*cycle_stall_ns));
+    uint64_t* cycle_unused_prefetch_evictions =
+        calloc(cycles, sizeof(*cycle_unused_prefetch_evictions));
+    double* cycle_rates = calloc(cycles, sizeof(*cycle_rates));
+    size_t* group_order = calloc(cycles, sizeof(*group_order));
+    size_t* group_visits = calloc(groups, sizeof(*group_visits));
+    unsigned char* transition_seen = NULL;
+    size_t* transition_counts = NULL;
+    int track_transitions = 0;
+    int* initialized = calloc(groups, sizeof(*initialized));
+    if (!matrices || (multi_alloc && !matrix_allocs) ||
+        !cycle_demand_faults || !cycle_read_bytes ||
+        !cycle_write_bytes || !cycle_stall_ns ||
+        !cycle_unused_prefetch_evictions || !cycle_rates || !group_order ||
+        !group_visits || !initialized) {
+        free(matrices);
+        free(matrix_allocs);
+        free(cycle_demand_faults);
+        free(cycle_read_bytes);
+        free(cycle_write_bytes);
+        free(cycle_stall_ns);
+        free(cycle_unused_prefetch_evictions);
+        free(cycle_rates);
+        free(group_order);
+        free(group_visits);
+        free(initialized);
+        return -1;
+    }
+    const size_t max_transition_cells = 1024 * 1024;
+    if (groups <= SIZE_MAX / groups && groups * groups <= max_transition_cells) {
+        transition_seen = calloc(groups * groups, sizeof(*transition_seen));
+        transition_counts = calloc(groups * groups, sizeof(*transition_counts));
+        if (!transition_seen || !transition_counts) {
+            free(matrices);
+            free(matrix_allocs);
+            free(cycle_demand_faults);
+            free(cycle_read_bytes);
+            free(cycle_write_bytes);
+            free(cycle_stall_ns);
+            free(cycle_unused_prefetch_evictions);
+            free(cycle_rates);
+            free(group_order);
+            free(group_visits);
+            free(initialized);
+            free(transition_seen);
+            free(transition_counts);
+            return -1;
+        }
+        track_transitions = 1;
+    }
+
+    int rc = -1;
+    if (multi_alloc) {
+        stream_mapping_kind_recorded = "multi_malloc";
+        snprintf(stream_backing_path_recorded,
+                 sizeof(stream_backing_path_recorded), "%s", "none");
+        stream_backing_fs_type = 0;
+        stream_backing_is_tmpfs = 0;
+        for (size_t matrix = 0; matrix < submatrices; matrix++) {
+            matrix_allocs[matrix] = malloc(unit_bytes);
+            if (!matrix_allocs[matrix]) {
+                goto cleanup;
+            }
+            matrices[matrix] = (double*)matrix_allocs[matrix];
+        }
+    } else {
+        for (size_t matrix = 0; matrix < submatrices; matrix++) {
+            matrices[matrix] = (double*)(buffer + matrix * unit_bytes);
+        }
+    }
+
+    size_t hot_groups = 0;
+    double hot_probability = 0.0;
+    if (build_submatrix_group_order(group_order, cycles, groups, &hot_groups,
+                                    &hot_probability) != 0) {
+        goto cleanup;
+    }
+    stream_pipeline_record_order_sequence(group_order, cycles);
+
+    size_t tile_bytes = env_size_compat("MAI_BENCH_SUBMATRIX_TILE",
+                                        "MAI_BENCH_STREAM_TILE",
+                                        2ULL * 1024ULL * 1024ULL);
+    if (tile_bytes < page_size_bytes) {
+        tile_bytes = page_size_bytes;
+    }
+    tile_bytes -= tile_bytes % page_size_bytes;
+    if (tile_bytes == 0) {
+        tile_bytes = page_size_bytes;
+    }
+    if (tile_bytes > unit_bytes) {
+        tile_bytes = unit_bytes;
+    }
+    tile_bytes -= tile_bytes % sizeof(double);
+    if (tile_bytes == 0) {
+        goto cleanup;
+    }
+
+    stream_tile_bytes_recorded = tile_bytes;
+    stream_resident_arrays_recorded = STREAM_PIPELINE_GROUP_WIDTH;
+    stream_pipeline_kernels_recorded = 4;
+    stream_pipeline_cycles_recorded = cycles;
+    stream_pipeline_groups_recorded = groups;
+    stream_pipeline_group_iterations_recorded = group_iterations;
+    stream_pipeline_matrix_bytes_recorded = unit_bytes;
+    stream_pipeline_group_bytes_recorded = group_bytes;
+    stream_pipeline_total_matrix_bytes_recorded = usable_bytes;
+    stream_pipeline_unique_cold_visits_recorded = hot_groups;
+    stream_pipeline_reclaim_lag_recorded =
+        (size_t)(hot_probability * 1000000.0);
+    stream_pipeline_reclaim_horizon_recorded =
+        env_flag("MAI_BENCH_SUBMATRIX_INIT_ALL", 1) ? 1 : 0;
+    size_t migration_chunk =
+        env_size("MAI_MIGRATION_CHUNK", 2ULL * 1024ULL * 1024ULL);
+    if (migration_chunk < page_size_bytes) {
+        migration_chunk = page_size_bytes;
+    }
+    if (align_size_to_page(&migration_chunk) != 0 || migration_chunk == 0) {
+        goto cleanup;
+    }
+    stream_pipeline_phase_chunks_recorded =
+        group_bytes / migration_chunk +
+        (group_bytes % migration_chunk != 0 ? 1 : 0);
+
+    const double scalar =
+        env_double_compat("MAI_BENCH_SUBMATRIX_SCALAR",
+                          "MAI_BENCH_STREAM_PIPELINE_SCALAR", 0.25);
+    stream_pipeline_scalar_recorded = scalar;
+
+    struct timespec start;
+    struct timespec end;
+    int init_all = env_flag("MAI_BENCH_SUBMATRIX_INIT_ALL", 1);
+    for (size_t group = 0; group < groups; group++) {
+        if (!init_all) {
+            break;
+        }
+        size_t base = group * STREAM_PIPELINE_GROUP_WIDTH;
+        for (size_t offset = 0; offset < unit_bytes;) {
+            size_t tile_len = unit_bytes - offset;
+            if (tile_len > tile_bytes) {
+                tile_len = tile_bytes;
+            }
+            size_t begin = offset / sizeof(double);
+            size_t count = tile_len / sizeof(double);
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            for (size_t i = 0; i < count; i++) {
+                matrices[base][begin + i] = 1.0;
+                matrices[base + 1][begin + i] = 2.0;
+                matrices[base + 2][begin + i] = 0.0;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            stream_init_ns += timespec_delta_ns(&start, &end);
+            offset += tile_len;
+        }
+        initialized[group] = 1;
+    }
+
+    size_t cycle_delta_samples = 0;
+    MaiStats previous_cycle_stats;
+    int cycle_stats_available = 0;
+    if (load_stats_optional(&previous_cycle_stats, &cycle_stats_available) != 0) {
+        cycle_stats_available = 0;
+    }
+
+    for (size_t cycle = 0; cycle < cycles; cycle++) {
+        uint64_t cycle_copy_ns = 0;
+        uint64_t cycle_scale_ns = 0;
+        uint64_t cycle_add_ns = 0;
+        uint64_t cycle_triad_ns = 0;
+        size_t group = group_order[cycle];
+        size_t previous_group = cycle == 0 ? group : group_order[cycle - 1];
+        if (group >= groups) {
+            goto cleanup;
+        }
+        if (!initialized[group]) {
+            size_t base = group * STREAM_PIPELINE_GROUP_WIDTH;
+            for (size_t offset = 0; offset < unit_bytes;) {
+                size_t tile_len = unit_bytes - offset;
+                if (tile_len > tile_bytes) {
+                    tile_len = tile_bytes;
+                }
+                size_t begin = offset / sizeof(double);
+                size_t count = tile_len / sizeof(double);
+                clock_gettime(CLOCK_MONOTONIC, &start);
+                for (size_t i = 0; i < count; i++) {
+                    matrices[base][begin + i] = 1.0;
+                    matrices[base + 1][begin + i] = 2.0;
+                    matrices[base + 2][begin + i] = 0.0;
+                }
+                clock_gettime(CLOCK_MONOTONIC, &end);
+                stream_init_ns += timespec_delta_ns(&start, &end);
+                offset += tile_len;
+            }
+            initialized[group] = 1;
+        }
+
+        group_visits[group]++;
+        if (track_transitions && cycle > 0) {
+            size_t transition = previous_group * groups + group;
+            transition_counts[transition]++;
+            if (!transition_seen[transition]) {
+                transition_seen[transition] = 1;
+                stream_pipeline_unique_transitions_recorded++;
+            }
+        }
+
+        for (size_t iteration = 0; iteration < group_iterations; iteration++) {
+            if (stream_pipeline_process_group_phase(
+                    matrices, group, unit_bytes, tile_bytes, 0, scalar,
+                    &cycle_copy_ns) != 0 ||
+                stream_pipeline_process_group_phase(
+                    matrices, group, unit_bytes, tile_bytes, 1, scalar,
+                    &cycle_scale_ns) != 0 ||
+                stream_pipeline_process_group_phase(
+                    matrices, group, unit_bytes, tile_bytes, 2, scalar,
+                    &cycle_add_ns) != 0 ||
+                stream_pipeline_process_group_phase(
+                    matrices, group, unit_bytes, tile_bytes, 3, scalar,
+                    &cycle_triad_ns) != 0) {
+                goto cleanup;
+            }
+        }
+
+        stream_copy_ns += cycle_copy_ns;
+        stream_scale_ns += cycle_scale_ns;
+        stream_add_ns += cycle_add_ns;
+        stream_triad_ns += cycle_triad_ns;
+
+        uint64_t cycle_ns = cycle_copy_ns + cycle_scale_ns +
+            cycle_add_ns + cycle_triad_ns;
+        double cycle_mib =
+            10.0 * (double)unit_bytes * (double)group_iterations /
+            (1024.0 * 1024.0);
+        cycle_rates[cycle] = cycle_ns != 0 ?
+            cycle_mib / ((double)cycle_ns / 1000000000.0) : 0.0;
+
+        if (cycle_stats_available) {
+            MaiStats cycle_stats;
+            int current_stats_available = 0;
+            if (load_stats_optional(&cycle_stats,
+                                    &current_stats_available) == 0 &&
+                current_stats_available) {
+                size_t demand_delta =
+                    size_delta(cycle_stats.policy_demand_faults,
+                               previous_cycle_stats.policy_demand_faults);
+                size_t read_delta =
+                    size_delta(cycle_stats.policy_migration_read_bytes,
+                               previous_cycle_stats.policy_migration_read_bytes);
+                size_t write_delta =
+                    size_delta(cycle_stats.policy_migration_write_bytes,
+                               previous_cycle_stats.policy_migration_write_bytes);
+                size_t stall_delta =
+                    size_delta(cycle_stats.policy_demand_fault_stall_ns,
+                               previous_cycle_stats.policy_demand_fault_stall_ns);
+                size_t demotion_delta =
+                    size_delta(cycle_stats.policy_demotions,
+                               previous_cycle_stats.policy_demotions);
+                size_t hot_evicted_delta =
+                    size_delta(cycle_stats.policy_evicted_hot_bytes,
+                               previous_cycle_stats.policy_evicted_hot_bytes);
+                size_t unused_prefetch_delta =
+                    size_delta(cycle_stats.policy_prefetch_unused_evictions,
+                               previous_cycle_stats.policy_prefetch_unused_evictions);
+
+                cycle_demand_faults[cycle_delta_samples] = demand_delta;
+                if (demand_delta >
+                    stream_pipeline_max_cycle_policy_demand_faults) {
+                    stream_pipeline_max_cycle_policy_demand_faults =
+                        demand_delta;
+                }
+                cycle_read_bytes[cycle_delta_samples] = read_delta;
+                if (read_delta > stream_pipeline_max_cycle_policy_read_bytes) {
+                    stream_pipeline_max_cycle_policy_read_bytes = read_delta;
+                }
+                cycle_write_bytes[cycle_delta_samples] = write_delta;
+                if (write_delta > stream_pipeline_max_cycle_policy_write_bytes) {
+                    stream_pipeline_max_cycle_policy_write_bytes = write_delta;
+                }
+                cycle_stall_ns[cycle_delta_samples] = stall_delta;
+                if (stall_delta > stream_pipeline_max_cycle_policy_stall_ns) {
+                    stream_pipeline_max_cycle_policy_stall_ns = stall_delta;
+                    stream_pipeline_worst_cycle_index_recorded = cycle;
+                    stream_pipeline_worst_cycle_group_recorded = group;
+                    stream_pipeline_worst_cycle_prev_group_recorded =
+                        previous_group;
+                }
+                if (demotion_delta > stream_pipeline_max_cycle_policy_demotions) {
+                    stream_pipeline_max_cycle_policy_demotions = demotion_delta;
+                }
+                if (hot_evicted_delta >
+                    stream_pipeline_max_cycle_policy_hot_evicted_bytes) {
+                    stream_pipeline_max_cycle_policy_hot_evicted_bytes =
+                        hot_evicted_delta;
+                }
+                cycle_unused_prefetch_evictions[cycle_delta_samples] =
+                    unused_prefetch_delta;
+                cycle_delta_samples++;
+                previous_cycle_stats = cycle_stats;
+            } else {
+                cycle_stats_available = 0;
+            }
+        }
+    }
+
+    for (size_t group = 0; group < groups; group++) {
+        stream_pipeline_group_visits_recorded += group_visits[group];
+    }
+    stream_pipeline_group_visit_0_recorded = groups > 0 ? group_visits[0] : 0;
+    stream_pipeline_group_visit_1_recorded = groups > 1 ? group_visits[1] : 0;
+    stream_pipeline_group_visit_2_recorded = groups > 2 ? group_visits[2] : 0;
+    stream_pipeline_transition_00_recorded =
+        track_transitions && groups > 0 ? transition_counts[0 * groups + 0] : 0;
+    stream_pipeline_transition_01_recorded =
+        track_transitions && groups > 1 ? transition_counts[0 * groups + 1] : 0;
+    stream_pipeline_transition_02_recorded =
+        track_transitions && groups > 2 ? transition_counts[0 * groups + 2] : 0;
+    stream_pipeline_transition_10_recorded =
+        track_transitions && groups > 1 ? transition_counts[1 * groups + 0] : 0;
+    stream_pipeline_transition_11_recorded =
+        track_transitions && groups > 1 ? transition_counts[1 * groups + 1] : 0;
+    stream_pipeline_transition_12_recorded =
+        track_transitions && groups > 2 ? transition_counts[1 * groups + 2] : 0;
+    stream_pipeline_transition_20_recorded =
+        track_transitions && groups > 2 ? transition_counts[2 * groups + 0] : 0;
+    stream_pipeline_transition_21_recorded =
+        track_transitions && groups > 2 ? transition_counts[2 * groups + 1] : 0;
+    stream_pipeline_transition_22_recorded =
+        track_transitions && groups > 2 ? transition_counts[2 * groups + 2] : 0;
+
+    if (cycle_delta_samples != 0) {
+        stream_pipeline_cycle_policy_demand_faults_p50 =
+            (size_t)percentile_u64(cycle_demand_faults, cycle_delta_samples, 50);
+        stream_pipeline_cycle_policy_demand_faults_p90 =
+            (size_t)percentile_u64(cycle_demand_faults, cycle_delta_samples, 90);
+        stream_pipeline_cycle_policy_demand_faults_p99 =
+            (size_t)percentile_u64(cycle_demand_faults, cycle_delta_samples, 99);
+        stream_pipeline_cycle_policy_read_bytes_p50 =
+            (size_t)percentile_u64(cycle_read_bytes, cycle_delta_samples, 50);
+        stream_pipeline_cycle_policy_read_bytes_p90 =
+            (size_t)percentile_u64(cycle_read_bytes, cycle_delta_samples, 90);
+        stream_pipeline_cycle_policy_read_bytes_p99 =
+            (size_t)percentile_u64(cycle_read_bytes, cycle_delta_samples, 99);
+        stream_pipeline_cycle_policy_write_bytes_p50 =
+            (size_t)percentile_u64(cycle_write_bytes, cycle_delta_samples, 50);
+        stream_pipeline_cycle_policy_write_bytes_p90 =
+            (size_t)percentile_u64(cycle_write_bytes, cycle_delta_samples, 90);
+        stream_pipeline_cycle_policy_write_bytes_p99 =
+            (size_t)percentile_u64(cycle_write_bytes, cycle_delta_samples, 99);
+        stream_pipeline_cycle_policy_stall_ns_p50 =
+            (size_t)percentile_u64(cycle_stall_ns, cycle_delta_samples, 50);
+        stream_pipeline_cycle_policy_stall_ns_p90 =
+            (size_t)percentile_u64(cycle_stall_ns, cycle_delta_samples, 90);
+        stream_pipeline_cycle_policy_stall_ns_p99 =
+            (size_t)percentile_u64(cycle_stall_ns, cycle_delta_samples, 99);
+        stream_pipeline_cycle_policy_unused_prefetch_evictions_p50 =
+            (size_t)percentile_u64(cycle_unused_prefetch_evictions,
+                                   cycle_delta_samples, 50);
+        stream_pipeline_cycle_policy_unused_prefetch_evictions_p90 =
+            (size_t)percentile_u64(cycle_unused_prefetch_evictions,
+                                   cycle_delta_samples, 90);
+        stream_pipeline_cycle_policy_unused_prefetch_evictions_p99 =
+            (size_t)percentile_u64(cycle_unused_prefetch_evictions,
+                                   cycle_delta_samples, 99);
+    }
+
+    double copy_mib =
+        2.0 * (double)unit_bytes * (double)total_iterations /
+        (1024.0 * 1024.0);
+    double scale_mib = copy_mib;
+    double add_mib =
+        3.0 * (double)unit_bytes * (double)total_iterations /
+        (1024.0 * 1024.0);
+    double triad_mib = add_mib;
+    stream_copy_mib_per_sec = stream_copy_ns != 0 ?
+        copy_mib / ((double)stream_copy_ns / 1000000000.0) : 0.0;
+    stream_scale_mib_per_sec = stream_scale_ns != 0 ?
+        scale_mib / ((double)stream_scale_ns / 1000000000.0) : 0.0;
+    stream_add_mib_per_sec = stream_add_ns != 0 ?
+        add_mib / ((double)stream_add_ns / 1000000000.0) : 0.0;
+    stream_triad_mib_per_sec = stream_triad_ns != 0 ?
+        triad_mib / ((double)stream_triad_ns / 1000000000.0) : 0.0;
+
+    uint64_t total_ns = stream_copy_ns + stream_scale_ns +
+        stream_add_ns + stream_triad_ns;
+    double total_mib = copy_mib + scale_mib + add_mib + triad_mib;
+    stream_total_mib_per_sec = total_ns != 0 ?
+        total_mib / ((double)total_ns / 1000000000.0) : 0.0;
+    stream_passes_recorded = cycles;
+    stream_first_pass_mib_per_sec = cycle_rates[0];
+    stream_last_pass_mib_per_sec = cycle_rates[cycles - 1];
+    stream_min_pass_mib_per_sec = cycle_rates[0];
+    stream_max_pass_mib_per_sec = cycle_rates[0];
+    for (size_t i = 1; i < cycles; i++) {
+        if (cycle_rates[i] < stream_min_pass_mib_per_sec) {
+            stream_min_pass_mib_per_sec = cycle_rates[i];
+        }
+        if (cycle_rates[i] > stream_max_pass_mib_per_sec) {
+            stream_max_pass_mib_per_sec = cycle_rates[i];
+        }
+    }
+    qsort(cycle_rates, cycles, sizeof(*cycle_rates), compare_double);
+    if (cycles % 2 == 0) {
+        stream_median_pass_mib_per_sec =
+            (cycle_rates[cycles / 2 - 1] + cycle_rates[cycles / 2]) / 2.0;
+    } else {
+        stream_median_pass_mib_per_sec = cycle_rates[cycles / 2];
+    }
+
+    logical_bytes = total_logical_factor * unit_bytes;
+    *touches += logical_bytes / page_size_bytes;
+    measured_access_seconds = total_ns != 0 ?
+        (double)total_ns / 1000000000.0 : 0.0;
+
+    for (size_t group = 0; group < groups; group++) {
+        if (!initialized[group] || group_visits[group] == 0) {
+            continue;
+        }
+        size_t iterations = group_visits[group] * group_iterations;
+        double expected_a = 1.0;
+        double expected_b = 2.0;
+        double expected_c = 0.0;
+        for (size_t iteration = 0; iteration < iterations; iteration++) {
+            expected_a = expected_b;
+            expected_b = scalar * expected_a;
+            expected_c = expected_a + expected_b;
+            expected_a = expected_b + scalar * expected_c;
+        }
+
+        size_t sample_stride = unit_bytes / sizeof(double) / 4;
+        if (sample_stride == 0) {
+            sample_stride = 1;
+        }
+        for (size_t sample = 0; sample < 4; sample++) {
+            size_t index = sample * sample_stride;
+            size_t elements = unit_bytes / sizeof(double);
+            if (index >= elements) {
+                index = elements - 1;
+            }
+            if (stream_pipeline_check_index(matrices, group, index,
+                                            expected_a, expected_b,
+                                            expected_c, checksum) != 0) {
+                goto cleanup;
+            }
+        }
+    }
+
+    rc = 0;
+
+cleanup:
+    if (matrix_allocs) {
+        for (size_t matrix = 0; matrix < submatrices; matrix++) {
+            free(matrix_allocs[matrix]);
+        }
+    }
+    free(matrices);
+    free(matrix_allocs);
+    free(cycle_demand_faults);
+    free(cycle_read_bytes);
+    free(cycle_write_bytes);
+    free(cycle_stall_ns);
+    free(cycle_unused_prefetch_evictions);
+    free(cycle_rates);
+    free(group_order);
+    free(group_visits);
+    free(transition_seen);
+    free(transition_counts);
+    free(initialized);
+    return rc;
 }
 
 static int run_policy_multistream_stride(unsigned char* buffer, size_t size,
@@ -5103,6 +5762,8 @@ int main(int argc, char** argv) {
                 "stream_shared_file|stream_private_file|"
                 "stream_tiled_bandwidth|policy_stream_pipeline|"
                 "policy_stream_pipeline_phase_decoy|"
+                "submatrix_stream_pipeline|"
+                "multi_alloc_matrix_pipeline|"
                 "policy_multistream_stride|policy_hotset_scan|"
                 "policy_phase_shift_hotset|"
                 "policy_irr_scan_return|"
@@ -5135,7 +5796,8 @@ int main(int argc, char** argv) {
 
     MaiStats before;
     MaiStats after;
-    int expect_managed = 1;
+    int pure_workload = pure_workload_mode();
+    int expect_managed = pure_workload ? 0 : 1;
     const char* expect_managed_env = getenv("MAI_ACCESS_EXPECT_MANAGED");
     if (expect_managed_env && strcmp(expect_managed_env, "0") == 0) {
         expect_managed = 0;
@@ -5181,9 +5843,11 @@ int main(int argc, char** argv) {
 
     unsigned char* buffer = NULL;
     int free_with_munmap = 0;
-    if (allocate_benchmark_buffer(argv[1], size, &buffer, &free_with_munmap) != 0 ||
-        !buffer) {
-        return fail("access-pattern allocation failed");
+    if (!mode_allocates_internally(argv[1])) {
+        if (allocate_benchmark_buffer(argv[1], size, &buffer, &free_with_munmap) != 0 ||
+            !buffer) {
+            return fail("access-pattern allocation failed");
+        }
     }
 
     uint64_t checksum = 0;
@@ -5221,6 +5885,10 @@ int main(int argc, char** argv) {
         rc = run_heartbeat_concurrent(buffer, size, &checksum, &touches);
     } else if (strcmp(argv[1], "stream_tiled_bandwidth") == 0) {
         rc = run_stream_tiled_bandwidth(buffer, size, &checksum, &touches);
+    } else if (strcmp(argv[1], "submatrix_stream_pipeline") == 0 ||
+               strcmp(argv[1], "multi_alloc_matrix_pipeline") == 0) {
+        rc = run_submatrix_stream_pipeline(argv[1], buffer, size, &checksum,
+                                           &touches);
     } else if (mode_uses_stream_pipeline(argv[1])) {
         rc = run_stream_kernel_pipeline(argv[1], buffer, size, &checksum,
                                         &touches);

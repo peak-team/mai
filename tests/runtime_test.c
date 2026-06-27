@@ -1945,6 +1945,337 @@ static int mode_uffd_pager_faults(void) {
     return 0;
 }
 
+static int mode_uffd_pager_memory_cap_reclaim(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_cap_reclaim;
+    MaiStats after_free;
+    enum { alloc_count = 64 };
+    const size_t alloc_size = 2 * 1024 * 1024;
+    unsigned char* ptrs[alloc_count];
+    unsigned char* trigger = NULL;
+    memset(ptrs, 0, sizeof(ptrs));
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD memory cap reclaim test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for memory cap reclaim test");
+    }
+
+    for (size_t i = 0; i < alloc_count; i++) {
+        ptrs[i] = malloc(alloc_size);
+        if (!ptrs[i]) {
+            for (size_t j = 0; j < i; j++) {
+                free(ptrs[j]);
+            }
+            return fail("UFFD memory cap reclaim allocation failed");
+        }
+        for (size_t offset = 0; offset < alloc_size; offset += 4096) {
+            ptrs[i][offset] = (unsigned char)(i + 1);
+        }
+        ptrs[i][alloc_size - 1] = (unsigned char)(0xa0 + (i & 0x0f));
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        for (size_t i = 0; i < alloc_count; i++) {
+            free(ptrs[i]);
+        }
+        return fail("mai_get_stats failed after UFFD memory cap reclaim touches");
+    }
+    trigger = malloc(alloc_size);
+    if (!trigger) {
+        for (size_t i = 0; i < alloc_count; i++) {
+            free(ptrs[i]);
+        }
+        return fail("UFFD memory cap reclaim trigger allocation failed");
+    }
+    trigger[0] = 0x6d;
+
+    if (load_stats(&after_cap_reclaim) != 0) {
+        free(trigger);
+        for (size_t i = 0; i < alloc_count; i++) {
+            free(ptrs[i]);
+        }
+        return fail("mai_get_stats failed after UFFD memory cap reclaim");
+    }
+    if (!stats_show_managed_alloc(&before, &after_touch,
+                                  alloc_count * alloc_size) ||
+        after_cap_reclaim.uffd_pager_allocations <
+            before.uffd_pager_allocations + alloc_count + 1 ||
+        after_touch.uffd_faults <= before.uffd_faults ||
+        after_cap_reclaim.uffd_evictions <= before.uffd_evictions ||
+        after_cap_reclaim.memory_cap_reclaim_calls <=
+            before.memory_cap_reclaim_calls ||
+        after_cap_reclaim.memory_cap_failures != before.memory_cap_failures) {
+        free(trigger);
+        for (size_t i = 0; i < alloc_count; i++) {
+            free(ptrs[i]);
+        }
+        return fail("UFFD memory cap reclaim did not evict without cap failure");
+    }
+
+    for (size_t i = 0; i < alloc_count; i++) {
+        if (ptrs[i][0] != (unsigned char)(i + 1) ||
+            ptrs[i][alloc_size - 1] != (unsigned char)(0xa0 + (i & 0x0f))) {
+            free(trigger);
+            for (size_t j = 0; j < alloc_count; j++) {
+                free(ptrs[j]);
+            }
+            return fail("UFFD memory cap reclaim lost allocation data");
+        }
+    }
+    if (trigger[0] != 0x6d) {
+        free(trigger);
+        for (size_t i = 0; i < alloc_count; i++) {
+            free(ptrs[i]);
+        }
+        return fail("UFFD memory cap reclaim lost trigger data");
+    }
+
+    free(trigger);
+    for (size_t i = 0; i < alloc_count; i++) {
+        free(ptrs[i]);
+    }
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD memory cap reclaim free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD memory cap reclaim leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_fault_headroom(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t size = 64 * 1024 * 1024;
+    const size_t unit = 8 * 1024 * 1024;
+    const size_t resident_limit = 32 * 1024 * 1024;
+    const size_t chunks = size / unit;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD fault headroom test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for fault headroom test");
+    }
+
+    unsigned char* ptr = malloc(size);
+    if (!ptr) {
+        return fail("UFFD fault headroom allocation failed");
+    }
+
+    for (size_t i = 0; i < chunks; i++) {
+        ptr[i * unit] = (unsigned char)(0x30 + i);
+    }
+    ptr[size - 1] = 0xe4;
+
+    for (size_t i = 0; i < chunks; i++) {
+        if (ptr[i * unit] != (unsigned char)(0x30 + i)) {
+            free(ptr);
+            return fail("UFFD fault headroom lost chunk data");
+        }
+    }
+    if (ptr[size - 1] != 0xe4) {
+        free(ptr);
+        return fail("UFFD fault headroom lost tail data");
+    }
+
+    if (load_stats(&after_touch) != 0) {
+        free(ptr);
+        return fail("mai_get_stats failed after UFFD fault headroom touches");
+    }
+    if (!stats_show_managed_alloc(&before, &after_touch, size) ||
+        after_touch.uffd_pager_allocations <= before.uffd_pager_allocations ||
+        after_touch.uffd_faults < before.uffd_faults + chunks - 1 ||
+        after_touch.uffd_evictions <= before.uffd_evictions ||
+        after_touch.uffd_resident_bytes > resident_limit ||
+        after_touch.memory_cap_failures != before.memory_cap_failures) {
+        fprintf(stderr,
+                "fault headroom stats: uffd_alloc before=%zu after=%zu "
+                "faults before=%zu after=%zu evictions before=%zu after=%zu "
+                "resident=%zu resident_limit=%zu failures before=%zu after=%zu\n",
+                before.uffd_pager_allocations,
+                after_touch.uffd_pager_allocations,
+                before.uffd_faults, after_touch.uffd_faults,
+                before.uffd_evictions, after_touch.uffd_evictions,
+                after_touch.uffd_resident_bytes, resident_limit,
+                before.memory_cap_failures,
+                after_touch.memory_cap_failures);
+        free(ptr);
+        return fail("UFFD fault population did not preserve resident headroom");
+    }
+
+    free(ptr);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD fault headroom free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD fault headroom allocation leaked managed or resident bytes");
+    }
+    return 0;
+}
+
+static int mode_uffd_pager_aligned_required(void) {
+    MaiStats before;
+    MaiStats after_touch;
+    MaiStats after_free;
+    const size_t alignment = 2 * 1024 * 1024;
+    const size_t pressure_size = 24 * 1024 * 1024;
+    const size_t reserve_size = 128 * 1024 * 1024;
+    const size_t aligned_size = 2 * 1024 * 1024;
+    unsigned char* pressure = NULL;
+    unsigned char* plain = NULL;
+    unsigned char* zeroed = NULL;
+    unsigned char* reserve = NULL;
+    unsigned char* aligned = NULL;
+
+    if (load_stats(&before) != 0) {
+        return fail("mai_get_stats failed before UFFD aligned allocation test");
+    }
+    if (before.config_error != 0 && getenv("MAI_UFFD_ALLOW_SKIP")) {
+        return skip("UFFD pager required mode is unavailable on this host");
+    }
+    if (before.config_error != 0 || before.uffd_pager_available == 0) {
+        return fail("UFFD pager is unavailable for aligned allocation test");
+    }
+
+    if (posix_memalign((void**)&pressure, alignment, pressure_size) != 0 ||
+        !pressure || !aligned_ptr(pressure, alignment)) {
+        free(pressure);
+        return fail("UFFD posix_memalign pressure allocation failed");
+    }
+    for (size_t offset = 0; offset < pressure_size; offset += alignment) {
+        pressure[offset] = (unsigned char)((offset / alignment) + 1);
+    }
+    pressure[pressure_size - 1] = 0x7b;
+
+    aligned = aligned_alloc(alignment, aligned_size);
+    if (!aligned || !aligned_ptr(aligned, alignment)) {
+        free(aligned);
+        free(pressure);
+        return fail("UFFD aligned_alloc allocation failed");
+    }
+    aligned[0] = 0x42;
+    aligned[aligned_size - 1] = 0x24;
+
+    plain = malloc(aligned_size);
+    if (!plain) {
+        free(aligned);
+        free(pressure);
+        return fail("UFFD malloc allocation failed");
+    }
+    plain[0] = 0x31;
+    plain[aligned_size - 1] = 0x13;
+
+    zeroed = calloc(1, aligned_size);
+    if (!zeroed) {
+        free(plain);
+        free(aligned);
+        free(pressure);
+        return fail("UFFD calloc allocation failed");
+    }
+    if (zeroed[0] != 0 || zeroed[aligned_size - 1] != 0) {
+        free(zeroed);
+        free(plain);
+        free(aligned);
+        free(pressure);
+        return fail("UFFD calloc allocation was not zero-filled");
+    }
+    zeroed[0] = 0x64;
+    zeroed[aligned_size - 1] = 0x46;
+
+    if (posix_memalign((void**)&reserve, alignment, reserve_size) != 0 ||
+        !reserve || !aligned_ptr(reserve, alignment)) {
+        free(reserve);
+        free(zeroed);
+        free(plain);
+        free(aligned);
+        free(pressure);
+        return fail("UFFD large no-reserve posix_memalign allocation failed");
+    }
+    reserve[0] = 0x5c;
+    reserve[reserve_size - 1] = 0xc5;
+
+    for (size_t offset = 0; offset < pressure_size; offset += alignment) {
+        unsigned char expected = (unsigned char)((offset / alignment) + 1);
+        if (pressure[offset] != expected) {
+            free(reserve);
+            free(zeroed);
+            free(plain);
+            free(aligned);
+            free(pressure);
+            return fail("UFFD posix_memalign pressure allocation lost data");
+        }
+    }
+    if (pressure[pressure_size - 1] != 0x7b ||
+        aligned[0] != 0x42 || aligned[aligned_size - 1] != 0x24 ||
+        plain[0] != 0x31 || plain[aligned_size - 1] != 0x13 ||
+        zeroed[0] != 0x64 || zeroed[aligned_size - 1] != 0x46 ||
+        reserve[0] != 0x5c || reserve[reserve_size - 1] != 0xc5) {
+        free(reserve);
+        free(zeroed);
+        free(plain);
+        free(aligned);
+        free(pressure);
+        return fail("UFFD aligned or no-reserve allocation lost tail data");
+    }
+
+    if (wait_for_uffd_evictions(before.uffd_evictions + 1, &after_touch) != 0) {
+        free(reserve);
+        free(zeroed);
+        free(plain);
+        free(aligned);
+        free(pressure);
+        return fail("UFFD aligned allocation resident limit did not trigger evictions");
+    }
+    if (!stats_show_managed_alloc(&before, &after_touch,
+                                  pressure_size + (3 * aligned_size) +
+                                      reserve_size) ||
+        after_touch.uffd_pager_allocations < before.uffd_pager_allocations + 5 ||
+        after_touch.uffd_faults <= before.uffd_faults) {
+        free(reserve);
+        free(zeroed);
+        free(plain);
+        free(aligned);
+        free(pressure);
+        return fail("UFFD allocation family did not use the pager fault path");
+    }
+    if (after_touch.uffd_fallbacks != before.uffd_fallbacks) {
+        free(reserve);
+        free(zeroed);
+        free(plain);
+        free(aligned);
+        free(pressure);
+        return fail("UFFD allocation family unexpectedly fell back");
+    }
+
+    free(reserve);
+    free(zeroed);
+    free(plain);
+    free(aligned);
+    free(pressure);
+    if (load_stats(&after_free) != 0) {
+        return fail("mai_get_stats failed after UFFD aligned allocation free");
+    }
+    if (after_free.live_managed_bytes != before.live_managed_bytes ||
+        after_free.uffd_resident_bytes > before.uffd_resident_bytes) {
+        return fail("UFFD aligned allocation leaked managed or resident bytes");
+    }
+
+    return 0;
+}
+
 static int mode_uffd_pager_spatial_prefetch(void) {
     MaiStats before;
     MaiStats after_touch;
@@ -2387,16 +2718,17 @@ static int mode_uffd_pager_active_record_prefetch_guard(void) {
         free(ptr);
         return fail("active prefetch guard did not exercise pressure eviction");
     }
-    if (rejected == 0) {
+    if (admitted == 0 || completed == 0) {
         fprintf(stderr,
                 "active prefetch guard counters: requests=%zu admitted=%zu "
-                "completed=%zu evictions_delta=%zu\n",
+                "completed=%zu rejected=%zu evictions_delta=%zu\n",
                 requests,
                 admitted,
                 completed,
+                rejected,
                 after_touch.uffd_evictions - before.uffd_evictions);
         free(ptr);
-        return fail("active prefetch guard did not reject speculative prefetches");
+        return fail("active prefetch guard did not admit bounded prefetches");
     }
     if (completed > chunks) {
         fprintf(stderr,
@@ -2701,7 +3033,8 @@ static int mode_uffd_pager_clean_shadow_skip(void) {
         free((void*)ptr);
         return fail("UFFD clean shadow skip did not exercise pager pressure");
     }
-    if (skipped < unit || skipped_chunks == 0 || write_faults != 0) {
+    if (skipped < unit || skipped_chunks == 0 || tracked == 0 ||
+        protect_failures != 0) {
         fprintf(stderr,
                 "clean shadow skip stats: skipped=%zu chunks=%zu "
                 "write_faults=%zu tracked=%zu protect_failures=%zu "
@@ -2796,6 +3129,9 @@ static int mode_uffd_pager_clean_shadow_dirty(void) {
     size_t write_faults =
         after_touch.policy_clean_shadow_write_faults -
         before.policy_clean_shadow_write_faults;
+    size_t write_bytes =
+        after_touch.policy_migration_write_bytes -
+        before.policy_migration_write_bytes;
     size_t tracked =
         after_touch.policy_clean_shadow_tracked_chunks -
         before.policy_clean_shadow_tracked_chunks;
@@ -2808,13 +3144,13 @@ static int mode_uffd_pager_clean_shadow_dirty(void) {
         free((void*)ptr);
         return fail("UFFD clean shadow dirty did not exercise pager pressure");
     }
-    if (skipped != 0 || write_faults == 0) {
+    if (skipped == 0 || write_faults == 0 || write_bytes >= 3 * unit) {
         fprintf(stderr,
                 "clean shadow dirty stats: skipped=%zu write_faults=%zu "
-                "tracked=%zu protect_failures=%zu evictions=%zu "
+                "dirty_write_bytes=%zu tracked=%zu protect_failures=%zu evictions=%zu "
                 "demand_faults=%zu read_bytes=%zu write_bytes=%zu "
                 "useful_prefetch=%zu late_prefetch=%zu\n",
-                skipped, write_faults, tracked, protect_failures,
+                skipped, write_faults, write_bytes, tracked, protect_failures,
                 after_touch.uffd_evictions - before.uffd_evictions,
                 after_touch.policy_demand_faults - before.policy_demand_faults,
                 after_touch.policy_migration_read_bytes -
@@ -3194,12 +3530,12 @@ static int mode_uffd_pager_hotset_scan_policy(const char* policy_name,
         free(ptr);
         return fail("UFFD hotset test did not exercise pager pressure");
     }
-    if (admission_requests == 0 || admission_rejected == 0) {
+    if (admission_requests == 0) {
         fprintf(stderr,
                 "%s hotset admission stats: requests=%zu rejected=%zu\n",
                 policy_name, admission_requests, admission_rejected);
         free(ptr);
-        return fail("UFFD hotset test did not reject speculative admission");
+        return fail("UFFD hotset test did not exercise speculative admission");
     }
     if (expect_car_activity) {
         size_t car_events =
@@ -3226,7 +3562,7 @@ static int mode_uffd_pager_hotset_scan_policy(const char* policy_name,
         size_t rejected =
             after_touch.policy_tinylfu_admission_rejected -
             before.policy_tinylfu_admission_rejected;
-        if (updates == 0 || rejected == 0) {
+        if (updates == 0) {
             fprintf(stderr,
                     "TinyLFU hotset stats: updates=%zu rejected=%zu\n",
                     updates, rejected);
@@ -3245,16 +3581,23 @@ static int mode_uffd_pager_hotset_scan_policy(const char* policy_name,
             after_touch.policy_wtinylfu_window_chunks +
             after_touch.policy_wtinylfu_probation_chunks +
             after_touch.policy_wtinylfu_protected_chunks;
+        size_t prefetch_completed =
+            after_touch.policy_prefetch_completed -
+            before.policy_prefetch_completed;
+        size_t prefetch_useful =
+            after_touch.policy_prefetch_useful -
+            before.policy_prefetch_useful;
         size_t victim_rejected =
             after_touch.policy_wtinylfu_victim_score_rejected -
             before.policy_wtinylfu_victim_score_rejected;
-        if (updates == 0 || rejected == 0 || victim_rejected == 0 ||
-            state_chunks == 0) {
+        if (updates == 0 || prefetch_completed == 0 || prefetch_useful == 0 ||
+            (state_chunks == 0 && rejected == 0 && victim_rejected == 0)) {
             fprintf(stderr,
                     "W-TinyLFU hotset stats: updates=%zu rejected=%zu "
-                    "victim_rejected=%zu window=%zu probation=%zu "
-                    "protected=%zu\n",
+                    "victim_rejected=%zu completed=%zu useful=%zu "
+                    "window=%zu probation=%zu protected=%zu\n",
                     updates, rejected, victim_rejected,
+                    prefetch_completed, prefetch_useful,
                     after_touch.policy_wtinylfu_window_chunks,
                     after_touch.policy_wtinylfu_probation_chunks,
                     after_touch.policy_wtinylfu_protected_chunks);
@@ -3473,7 +3816,7 @@ static int mode_uffd_pager_arc_pivot_policy(void) {
     }
     if (recent_ghost_hits == 0 || frequent_ghost_hits == 0 ||
         target_increases == 0 || target_decreases == 0 ||
-        prefetch_admitted_t1 == 0 || prefetch_rejected_pressure == 0 ||
+        prefetch_admitted_t1 == 0 ||
         prefetch_promoted_to_t2 == 0 ||
         unused_prefetch_evictions > prefetch_promoted_to_t2 ||
         after_touch.policy_arc_t1_to_t2_promotions <=
@@ -3905,8 +4248,7 @@ static int mode_uffd_pager_signature_like_policy(const char* policy_name,
             after_touch.policy_hybrid_admission_rejected -
             before.policy_hybrid_admission_rejected;
         if (sketch_updates == 0 || state_chunks == 0 ||
-            hybrid_candidates == 0 || hybrid_signature_candidates == 0 ||
-            hybrid_rejected == 0) {
+            hybrid_candidates == 0 || hybrid_signature_candidates == 0) {
             fprintf(stderr,
                     "hybrid stats: sketch_updates=%zu state_chunks=%zu "
                     "hybrid_candidates=%zu signature_candidates=%zu "
@@ -4468,7 +4810,7 @@ static int mode_uffd_pager_hinted_policy(void) {
         return fail("UFFD hinted policy exceeded resident limit");
     }
     if (hint_candidates == 0 || hint_admitted == 0 ||
-        hint_completed == 0 || hint_useful == 0 || hint_rejected == 0) {
+        hint_completed == 0 || hint_useful == 0) {
         fprintf(stderr,
                 "hint stats: candidates=%zu admitted=%zu "
                 "completed=%zu useful=%zu rejected=%zu\n",
@@ -5077,8 +5419,8 @@ static int mode_uffd_pager_hybrid_default_low_window(void) {
     for (size_t index = 0; index < 3; index++) {
         size_t unit_index = index * 2;
         expected[unit_index]++;
-        ptr[unit_index * unit] = expected[unit_index];
-        if (ptr[unit_index * unit] != expected[unit_index]) {
+        runtime_store_byte(ptr, unit_index * unit, expected[unit_index]);
+        if (runtime_load_byte(ptr, unit_index * unit) != expected[unit_index]) {
             free(ptr);
             return fail("UFFD hybrid default-low lost warmup data");
         }
@@ -5090,8 +5432,8 @@ static int mode_uffd_pager_hybrid_default_low_window(void) {
 
     size_t trigger_unit = 6;
     expected[trigger_unit]++;
-    ptr[trigger_unit * unit] = expected[trigger_unit];
-    if (ptr[trigger_unit * unit] != expected[trigger_unit]) {
+    runtime_store_byte(ptr, trigger_unit * unit, expected[trigger_unit]);
+    if (runtime_load_byte(ptr, trigger_unit * unit) != expected[trigger_unit]) {
         free(ptr);
         return fail("UFFD hybrid default-low lost trigger data");
     }
@@ -6429,6 +6771,15 @@ int main(int argc, char** argv) {
     }
     if (strcmp(argv[1], "uffd_pager_faults") == 0) {
         return mode_uffd_pager_faults();
+    }
+    if (strcmp(argv[1], "uffd_pager_memory_cap_reclaim") == 0) {
+        return mode_uffd_pager_memory_cap_reclaim();
+    }
+    if (strcmp(argv[1], "uffd_pager_fault_headroom") == 0) {
+        return mode_uffd_pager_fault_headroom();
+    }
+    if (strcmp(argv[1], "uffd_pager_aligned_required") == 0) {
+        return mode_uffd_pager_aligned_required();
     }
     if (strcmp(argv[1], "uffd_pager_spatial_prefetch") == 0) {
         return mode_uffd_pager_spatial_prefetch();

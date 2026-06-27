@@ -43,6 +43,59 @@ if(BUILD_TESTING)
     )
 
     add_test(
+        NAME mai_submatrix_stream_pipeline_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_SUBMATRIX_SIZE=2M"
+            "MAI_BENCH_SUBMATRIX_CYCLES=5"
+            "MAI_BENCH_SUBMATRIX_GROUP_ITERATIONS=1"
+            "MAI_BENCH_SUBMATRIX_ORDER=hotset"
+            "MAI_BENCH_SUBMATRIX_HOT_GROUPS=1"
+            "MAI_BENCH_SUBMATRIX_HOT_PROBABILITY=0.75"
+            "MAI_BENCH_SUBMATRIX_SEED=3"
+            "MAI_BENCH_SUBMATRIX_INIT_ALL=1"
+            "MAI_BENCH_STREAM_TILE=1M"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            submatrix_stream_pipeline
+            24M
+    )
+    set_tests_properties(mai_submatrix_stream_pipeline_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=submatrix_stream_pipeline .*logical_mib=100\\.000 .*stream_pipeline_groups=4 .*stream_pipeline_total_matrix_bytes=25165824 .*stream_pipeline_order=submatrix_hotset .*stream_pipeline_prediction=submatrix_hot_cold"
+    )
+
+    add_test(
+        NAME mai_multi_alloc_matrix_pipeline_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_BENCH_MATRIX_ALLOC_SIZE=2M"
+            "MAI_BENCH_SUBMATRIX_CYCLES=5"
+            "MAI_BENCH_SUBMATRIX_GROUP_ITERATIONS=1"
+            "MAI_BENCH_SUBMATRIX_ORDER=sequential"
+            "MAI_BENCH_SUBMATRIX_INIT_ALL=1"
+            "MAI_BENCH_STREAM_TILE=1M"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            multi_alloc_matrix_pipeline
+            24M
+    )
+    set_tests_properties(mai_multi_alloc_matrix_pipeline_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=multi_alloc_matrix_pipeline .*logical_mib=100\\.000 .*stream_mapping_kind=multi_malloc .*stream_pipeline_groups=4 .*stream_pipeline_total_matrix_bytes=25165824 .*stream_pipeline_order=submatrix_sequential"
+    )
+
+    add_test(
+        NAME mai_pure_workload_disables_active_api_smoke
+        COMMAND ${CMAKE_COMMAND} -E env
+            "MAI_BENCH_PURE_WORKLOAD=1"
+            "MAI_ACCESS_EXPECT_MANAGED=0"
+            "MAI_ACCESS_STRIDE_PAGES=16"
+            $<TARGET_FILE:mai_access_pattern_benchmark>
+            sparse
+            16M
+    )
+    set_tests_properties(mai_pure_workload_disables_active_api_smoke PROPERTIES
+        PASS_REGULAR_EXPRESSION "mode=sparse .*touches=512"
+    )
+
+    add_test(
         NAME mai_policy_multistream_stride_smoke
         COMMAND ${CMAKE_COMMAND} -E env
             "MAI_ACCESS_EXPECT_MANAGED=0"

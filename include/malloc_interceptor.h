@@ -257,6 +257,10 @@ typedef struct {
     size_t policy_irr_pressure_rejected;
     size_t policy_irr_immature_rejected;
     size_t policy_irr_max_interval_epochs;
+    size_t uffd_background_reclaim_wakeups;
+    size_t uffd_background_reclaim_calls;
+    size_t uffd_background_reclaim_bytes;
+    size_t uffd_background_reclaim_failures;
 } MaiStats;
 
 /**
