@@ -613,6 +613,72 @@ add_test(
 set_tests_properties(mai_uffd_pager_faults PROPERTIES SKIP_RETURN_CODE 77)
 
 add_test(
+    NAME mai_uffd_pager_memory_cap_reclaim
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=128M"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=96M"
+        "MAI_AUTO_LARGE_ALLOC_CAP_PERCENT=1"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "MAI_UFFD_RESIDENT_LIMIT=192M"
+        "MAI_UFFD_RESIDENT_LOW_LIMIT=192M"
+        "MAI_MIGRATION_CHUNK=2M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_memory_cap_reclaim
+)
+set_tests_properties(mai_uffd_pager_memory_cap_reclaim
+    PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
+    NAME mai_uffd_pager_fault_headroom
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=64M"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=48M"
+        "MAI_AUTO_LARGE_ALLOC_CAP_PERCENT=1"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "MAI_UFFD_RESIDENT_LIMIT=32M"
+        "MAI_UFFD_RESIDENT_LOW_LIMIT=16M"
+        "MAI_UFFD_PREFETCH_CHUNKS=1"
+        "MAI_MIGRATION_CHUNK=8M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_fault_headroom
+)
+set_tests_properties(mai_uffd_pager_fault_headroom
+    PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
+    NAME mai_uffd_pager_aligned_required
+    COMMAND ${CMAKE_COMMAND} -E env
+        "MAI_ENABLE=1"
+        "MAI_PATH=${MAI_TEST_SCRATCH}"
+        "MAI_THRESHOLD=4K"
+        "MAI_ARENA_SIZE=32M"
+        "MAI_BACKEND=auto"
+        "MAI_MAX_RSS=16M"
+        "MAI_UFFD_PAGER=required"
+        "MAI_UFFD_ALLOW_SKIP=1"
+        "MAI_UFFD_RESIDENT_LIMIT=8M"
+        "MAI_UFFD_RESIDENT_LOW_LIMIT=4M"
+        "MAI_MIGRATION_CHUNK=2M"
+        "LD_PRELOAD=$<TARGET_FILE:mai>"
+        $<TARGET_FILE:mai_runtime_test>
+        uffd_pager_aligned_required
+)
+set_tests_properties(mai_uffd_pager_aligned_required
+    PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(
     NAME mai_uffd_pager_record_protect_pressure
     COMMAND ${CMAKE_COMMAND} -E env
         "MAI_ENABLE=1"
@@ -1558,6 +1624,7 @@ add_test(
         "MAI_ARENA_SIZE=128M"
         "MAI_BACKEND=auto"
         "MAI_MAX_RSS=96M"
+        "MAI_AUTO_LARGE_ALLOC_CAP_PERCENT=1"
         "MAI_UFFD_PAGER=required"
         "MAI_UFFD_ALLOW_SKIP=1"
         "MAI_UFFD_RESIDENT_LIMIT=64M"
@@ -1682,6 +1749,7 @@ add_test(
         "MAI_ARENA_SIZE=128M"
         "MAI_BACKEND=auto"
         "MAI_MAX_RSS=96M"
+        "MAI_AUTO_LARGE_ALLOC_CAP_PERCENT=1"
         "MAI_UFFD_PAGER=required"
         "MAI_UFFD_ALLOW_SKIP=1"
         "MAI_UFFD_RESIDENT_LIMIT=64M"
